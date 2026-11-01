@@ -2,8 +2,8 @@
 # rustup picks the host from its own default, which differs per machine. Windows needs the GNU
 # host because build scripts are built for the host, and zig cannot stand in for MSVC.
 rust = [
-    { version = "1.99", os = ["linux", "macos"] },
-    { version = "1.99-x86_64-pc-windows-gnu", os = ["windows"] },
+    { version = "1.99", os = ["linux", "macos"], targets = "{{ vars.release_targets }}" },
+    { version = "1.99-x86_64-pc-windows-gnu", os = ["windows"], targets = "{{ vars.release_targets }}" },
 ]
 # tree-sitter's wasm feature runs cmake in wasmtime-c-api-impl's build script.
 cmake = "4"
@@ -21,6 +21,9 @@ target = """\
     {% elif os() == 'macos' %}{% if arch() == 'arm64' %}aarch64{% else %}x86_64{% endif %}-apple-darwin\
     {% else %}{% if arch() == 'arm64' %}aarch64{% else %}x86_64{% endif %}-unknown-linux-gnu\
     {% endif %}"""
+
+# The platforms the release task builds for, comma-separated (mise vars are strings).
+release_targets = "x86_64-pc-windows-gnu,aarch64-pc-windows-gnullvm,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu"
 
 [tasks.setup]
 description = "Fetch the brokk Kotlin grammar submodule"
@@ -53,3 +56,12 @@ depends = ["fmt-check", "lint", "test"]
 [tasks.snap]
 description = "Review pending insta snapshots"
 run = "cargo insta review"
+
+[tasks.release]
+description = "Build release tarballs for every platform as target/edo-<target>.tar.gz"
+# xtask writes the tarballs so the binaries get mode 0755 whatever the host file system is.
+run = """\
+    {% set targets = vars.release_targets | split(pat=',') %}\
+    cargo-zigbuild zigbuild --release --locked{% for t in targets %} --target {{ t }}{% endfor %} \
+    && cargo-zigbuild run --quiet --locked --target {{ vars.target }} -p xtask -- package \
+    {% for t in targets %} {{ t }}{% endfor %}"""

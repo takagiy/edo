@@ -33,4 +33,4 @@ ureq = "3.5.0"
 insta = "1.49.0"
 
 [workspace]
-members = ["crates/edo-tree-sitter-kotlin"]
+members = ["crates/edo-tree-sitter-kotlin", "crates/xtask"]

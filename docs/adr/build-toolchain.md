@@ -10,14 +10,16 @@ cc クレートは Rust のターゲット名（`x86_64-pc-windows-gnu`）を `-
 
 ## 決定
 
-`mise.toml` で Rust、cmake、zig、cargo-zigbuild を揃え、ビルドするタスク（build / test / lint / install / mcp）はすべての OS で `cargo-zigbuild … --target {{vars.target}}` を通す。`vars.target` はホストの OS と CPU から決まるターゲット名で、OS による違いはこの値だけに置く。
+`mise.toml` で Rust、cmake、zig、cargo-zigbuild を揃え、ビルドするタスク（build / test / lint）はすべての OS で `cargo-zigbuild … --target {{vars.target}}` を通す。`vars.target` はホストの OS と CPU から決まるターゲット名で、OS による違いはこの値だけに置く。
+
+release タスクは、`vars.release_targets` に並べた 6 つのターゲット（Windows / macOS / Linux の x86_64 と aarch64）を同じ cargo-zigbuild でクロスビルドし、`crates/xtask` が `target/edo-<ターゲット>.tar.gz` を作る。tarball を `tar` コマンドで作らないのは、Windows のファイルシステムに実行ビットがなく、bsdtar には権限を指定するオプションもないため。xtask は権限を 0755 と明示して書き込む。
 
 Rust は、Windows だけ `1.99-x86_64-pc-windows-gnu` に固定する。ビルドスクリプトはホスト向けにコンパイルされるので、ホストが msvc だと MSVC のリンカーが要るため。
 
 ## 結果
 
-- 得たもの: `mise install` だけで、Windows でも MinGW や Visual Studio なしでビルドとテストが通る。タスクに OS ごとの分岐がない。
-- 失ったもの: Linux と macOS でも C とリンクが zig 経由に変わり、この変更は Windows でしか確かめていない。macOS では、フレームワークを使う依存があると SDK が要る可能性がある。ターゲットを明示するので、ビルド結果は `target/<ターゲット名>/` に出る。mise を通さない素の `cargo` は、Windows ではこれまでどおり MinGW を要する。
+- 得たもの: `mise install` だけで、Windows でも MinGW や Visual Studio なしでビルドとテストが通る。タスクに OS ごとの分岐がない。どの OS からでも、6 つのプラットフォーム向けのリリースを作れる。
+- 失ったもの: Linux と macOS でも C とリンクが zig 経由に変わり、この変更は Windows でしか確かめていない。リリースのバイナリも、Windows x86_64 版しか実際に起動して確かめていない。macOS では、フレームワークを使う依存があると SDK が要る可能性がある。ターゲットを明示するので、ビルド結果は `target/<ターゲット名>/` に出る。mise を通さない素の `cargo` は、Windows ではこれまでどおり MinGW を要する。
 
 ## 採らなかった案
 

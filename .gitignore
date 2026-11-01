@@ -1,1 +1,3 @@
 /target
+# An empty file zig can leave in a crate directory while cc probes it during cross builds.
+a.o
