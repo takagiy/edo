@@ -64,18 +64,13 @@ fn lang(cmd: LangCmd) -> (String, i32) {
     let store = install::store_dir();
     let (out, ok) = match cmd {
         LangCmd::Install { specs } => {
-            let fetch = |registry: &str| {
-                // Unpacked archives live until the process exits; the OS cleans its temp directory.
-                let tmp = tempfile::tempdir().map_err(|e| crate::Error::new("io", e.to_string()))?.keep();
-                install::fetch_github(registry, &tmp)
-            };
-            let reports = install::install_all(&store, &specs, &fetch);
+            let reports = install::install_all(&store, &specs, &install::fetch_github);
             let ok = reports.iter().all(|r| r["ok"] == true);
             (serde_json::Value::from(reports), ok)
         }
         LangCmd::List => match install::list(&store) {
             Ok(v) => (v, true),
-            Err(e) => (json!({"ok": false, "error": e.code, "message": e.message}), false),
+            Err(e) => (e.to_json(), false),
         },
         LangCmd::Remove { spec } => {
             let r = install::remove(&store, &spec);
@@ -103,7 +98,7 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages)
             let (path, scope) = split_target(&target);
             match command::read(&langs, path, scope) {
                 Ok(text) => (text, 0),
-                Err(e) => (json!({"ok": false, "error": e.code, "message": e.message}).to_string(), 1),
+                Err(e) => (e.to_json().to_string(), 1),
             }
         }
         Cmd::Write { insert_after, insert_before, all_matches, target, texts } => {
@@ -113,15 +108,20 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages)
                 [before, after] => (Some(before.clone()), after.clone()),
                 _ => return usage("expected [BEFORE] <AFTER>".into()),
             };
+            let mut stdin = || Some(stdin()).filter(|s| !s.is_empty());
             let (before, after) = match (before, after.as_str()) {
                 (None, "-") => {
-                    let input = stdin();
+                    // An empty stdin is a forgotten pipe, not a request to delete everything.
+                    let Some(input) = stdin() else { return usage("stdin is empty".into()) };
                     match split_conflict(&input) {
                         Some((b, a)) => (Some(b), a),
                         None => (None, input),
                     }
                 }
-                (before, "-") => (before, stdin()),
+                (before, "-") => match stdin() {
+                    Some(input) => (before, input),
+                    None => return usage("stdin is empty".into()),
+                },
                 (before, _) => (before, after),
             };
             let place = match (insert_after, insert_before) {
@@ -133,10 +133,10 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages)
             let req = WriteRequest { path, scope, before: before.as_deref(), after: &after, all_matches, place };
             match command::write(&langs, &req) {
                 Ok(reports) => {
-                    let code = if reports.iter().all(|r| r["ok"] == true) { 0 } else { 1 };
+                    let code = if reports.iter().any(|r| r["ok"] == false) { 1 } else { 0 };
                     (serde_json::Value::from(reports).to_string(), code)
                 }
-                Err(e) => (json!({"ok": false, "error": e.code, "message": e.message}).to_string(), 1),
+                Err(e) => (e.to_json().to_string(), 1),
             }
         }
     }
@@ -192,6 +192,20 @@ mod tests {
         let args: Vec<String> = std::iter::once("edo").chain(args.iter().copied()).map(String::from).collect();
         let stdin = stdin.to_string();
         run(&args, &mut || stdin.clone(), Languages::builtin())
+    }
+
+    #[test]
+    fn report_without_false_ok_exits_zero() {
+        // Given: 呼び出しのある Rust のファイルと JSON のファイル
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() { x(); }\n").unwrap();
+        std::fs::write(dir.path().join("b.json"), "{}").unwrap();
+        let glob = format!("{}/*", dir.path().to_string_lossy().replace('\\', "/"));
+        // When: 両方に一致する glob で書き、ok を持たない skipped の要素が報告に付く
+        let (out, code) = edo(&["write", &glob, "x();", "y();"], "");
+        // Then: ok が false の要素がないので終了コードは 0
+        assert!(out.contains("skipped"), "{out}");
+        assert_eq!(code, 0);
     }
 
     fn file(text: &str) -> (tempfile::TempDir, String) {
@@ -265,5 +279,16 @@ mod tests {
         let (out, code) = edo(&["write", "a.rs", "b.rs", "x", "y"], "");
         // Then: usage エラーになる
         assert!(out.contains("\"usage\"") && code != 0, "{out}");
+    }
+
+    #[test]
+    fn dash_after_with_empty_stdin_is_usage_error() {
+        // Given: 関数のあるファイル
+        let (_dir, path) = file("fn a() {}\n");
+        // When: after に - を渡し、標準入力に何も流さない
+        let (out, code) = edo(&["write", &path, "-"], "");
+        // Then: usage エラーになり、ファイルは変わらない
+        assert!(out.contains("\"usage\"") && code != 0, "{out}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {}\n");
     }
 }

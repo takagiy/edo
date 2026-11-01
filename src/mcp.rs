@@ -86,8 +86,9 @@ impl Server {
         sharing a line with other code is shown as `...`. Docs and signatures stay visible. Pass `scope` to see more: \
         an identifier such as `Foo.bar` or `Foo::bar` (a function shows its full body; a class shows its members with \
         their bodies elided), or a line range `N` / `N-M` (shown in full). `path` may be a glob such as \
-        `src/**/*.kt`; each file then starts with its path on its own line. Files without a language package are \
-        rejected.")]
+        `src/**/*.kt`; each file then starts with its path on its own line, and files without a language package \
+        are skipped and counted by extension on a last `{\"skipped\":...}` line. A single file without a \
+        language package is an `unsupported_language` error.")]
     fn read(&self, Parameters(p): Parameters<ReadParams>) -> CallToolResult {
         match command::read(&self.langs, &p.path, p.scope.as_deref()) {
             Ok(text) => {
@@ -131,7 +132,7 @@ impl Server {
                     }
                     self.remember(r["file"].as_str().unwrap_or_default());
                 }
-                let ok = reports.iter().all(|r| r["ok"] == true);
+                let ok = !reports.iter().any(|r| r["ok"] == false);
                 let text = vec![ContentBlock::text(serde_json::Value::from(reports).to_string())];
                 if ok { CallToolResult::success(text) } else { CallToolResult::error(text) }
             }
@@ -141,7 +142,7 @@ impl Server {
 }
 
 fn error(e: crate::Error) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(json!({"ok": false, "error": e.code, "message": e.message}).to_string())])
+    CallToolResult::error(vec![ContentBlock::text(e.to_json().to_string())])
 }
 
 #[tool_handler]

@@ -1,5 +1,5 @@
-use std::cell::Cell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use streaming_iterator::StreamingIterator;
@@ -95,7 +95,7 @@ pub fn find(src: &str, leaves: &[Leaf], scope: Range<usize>, before: &str) -> Re
     optional.sort();
     optional.dedup();
     let leaves: Vec<&Leaf> = leaves.iter().filter(|l| scope.start <= l.range.start && l.range.end <= scope.end).collect();
-    let m = Matcher { src, leaves: &leaves, before, optional, start: Cell::new(0), best: Cell::new(None) };
+    let m = Matcher { src, leaves: &leaves, before, optional, start: Cell::new(0), best: Cell::new(None), failed: Default::default() };
     let mut found: Vec<Range<usize>> = vec![];
     for (i, leaf) in leaves.iter().enumerate() {
         if found.last().is_some_and(|f| leaf.range.start < f.end) {
@@ -170,6 +170,7 @@ struct Matcher<'a> {
     /// Start of the current attempt and the furthest failed attempt so far.
     start: Cell<usize>,
     best: Cell<Option<Progress>>,
+    failed: RefCell<HashSet<(usize, usize)>>,
 }
 
 impl Matcher<'_> {
@@ -199,6 +200,20 @@ impl Matcher<'_> {
     /// Matches the rest of `before` from byte `b` against leaves from index `i`.
     /// `end` is where the match so far ends in the file; returns the final end.
     fn at(&self, i: usize, b: usize, end: Option<usize>) -> Option<usize> {
+        // Once started, whether the rest matches depends only on (leaf, position in before);
+        // optional leaves reach the same state by several paths, so remember the dead ends.
+        let state = (i, b);
+        if end.is_some() && self.failed.borrow().contains(&state) {
+            return None;
+        }
+        let found = self.at_uncached(i, b, end);
+        if found.is_none() && end.is_some() {
+            self.failed.borrow_mut().insert(state);
+        }
+        found
+    }
+
+    fn at_uncached(&self, i: usize, b: usize, end: Option<usize>) -> Option<usize> {
         let rest = self.before[b..].trim_start();
         let spaced = rest.len() < self.before.len() - b;
         let b = self.before.len() - rest.len();
@@ -450,5 +465,21 @@ mod tests {
         assert_eq!(src[..closest.mismatch].lines().count(), 2);
         assert_eq!(closest.expected, "hoge(42);");
         assert_eq!(closest.found, "hoge(1);");
+    }
+
+    #[test]
+    fn many_optional_leaves_do_not_slow_down_failed_match() {
+        // Given: ; を省略可能にする query と、; で終わる文が 18 個並ぶファイル
+        let lang = js("\";\" @match.optional");
+        let src: String = (0..18).map(|i| format!("x{i}();\n")).collect();
+        let tree = lang.parser().parse(&src, None).unwrap();
+        let leaves = leaves(&lang, &tree, &src);
+        // When: 最後の文だけが違う before で照合する
+        let before: String = (0..17).map(|i| format!("x{i}();\n")).collect::<String>() + "nope();";
+        let start = std::time::Instant::now();
+        let found = find(&src, &leaves, 0..src.len(), &before);
+        // Then: すぐに一致なしで終わる
+        assert!(found.is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1), "took {:?}", start.elapsed());
     }
 }

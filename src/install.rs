@@ -46,6 +46,8 @@ pub struct Fetched {
     pub dir: PathBuf,
     /// Where it came from, such as `github.com/owner/repo@<commit>`.
     pub source: String,
+    /// The download's temporary directory; dropping it deletes the checkout.
+    pub tmp: Option<tempfile::TempDir>,
 }
 
 /// `<config>/edo/packages`, where packages are installed.
@@ -53,9 +55,11 @@ pub fn store_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("edo").join("packages")
 }
 
-/// Downloads a GitHub registry's default branch as a tarball and unpacks it into `tmp`.
+/// Downloads a GitHub registry's default branch as a tarball and unpacks it into a temporary directory.
 /// shortcut: only github.com registries can be fetched; add other hosts' archive URLs when someone needs them.
-pub fn fetch_github(registry: &str, tmp: &Path) -> Result<Fetched, Error> {
+pub fn fetch_github(registry: &str) -> Result<Fetched, Error> {
+    let dir = tempfile::tempdir().map_err(|e| Error::new("io", e.to_string()))?;
+    let tmp = dir.path();
     let repo = registry
         .strip_prefix("github.com/")
         .ok_or_else(|| Error::new("unsupported_registry", format!("{registry}: only github.com registries are supported")))?;
@@ -73,7 +77,7 @@ pub fn fetch_github(registry: &str, tmp: &Path) -> Result<Fetched, Error> {
         .find(|e| e.path().is_dir())
         .ok_or_else(|| Error::new("io", format!("{registry}: empty archive")))?;
     let commit = top.file_name().to_string_lossy().rsplit('-').next().unwrap_or_default().to_string();
-    Ok(Fetched { dir: top.path(), source: format!("{registry}@{commit}") })
+    Ok(Fetched { dir: top.path(), source: format!("{registry}@{commit}"), tmp: Some(dir) })
 }
 
 /// Installs one package into `store` (`<config>/edo/packages`) and reports the outcome.
@@ -87,7 +91,15 @@ fn try_install(store: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched,
     let packages = packages_in(&fetched.dir)?;
     let (name, dir) = match &spec.name {
         Some(n) => packages.into_iter().find(|(p, _)| p == n),
-        None => packages.into_iter().next(),
+        // Without a name, only a registry whose root is itself a package is unambiguous.
+        None => match packages.as_slice() {
+            [(_, dir)] if *dir == fetched.dir => packages.into_iter().next(),
+            _ => {
+                let names: Vec<&str> = packages.iter().map(|(p, _)| p.as_str()).collect();
+                let message = format!("{} has several packages; name one of: {}", spec.registry, names.join(", "));
+                return Err(Error::new("name_required", message));
+            }
+        },
     }
     .ok_or_else(|| Error::new("not_found", format!("no such package in {}", spec.registry)))?;
     let target = store.join(&spec.registry).join(&name);
@@ -311,7 +323,7 @@ mod tests {
         let repos: Vec<(String, PathBuf)> = repos.into_iter().map(|(id, d)| (id.to_string(), d.path().to_path_buf())).collect();
         move |id: &str| {
             let (_, dir) = repos.iter().find(|(r, _)| r == id).ok_or_else(|| Error::new("not_found", id))?;
-            Ok(Fetched { dir: dir.clone(), source: format!("{id}@abc") })
+            Ok(Fetched { dir: dir.clone(), source: format!("{id}@abc"), tmp: None })
         }
     }
 
@@ -356,7 +368,7 @@ mod tests {
         let store = tempfile::tempdir().unwrap();
         install(store.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
         // When: 新しいコミットから同じパッケージを入れる
-        let newer = |id: &str| Ok(Fetched { dir: repo.path().to_path_buf(), source: format!("{id}@def") });
+        let newer = |id: &str| Ok(Fetched { dir: repo.path().to_path_buf(), source: format!("{id}@def"), tmp: None });
         let report = install(store.path(), "foo/langs:myrust", &newer);
         // Then: 上書きされ、前の入手元が報告される
         assert_eq!(report["replaced_source"], "github.com/foo/langs@abc");
@@ -461,5 +473,36 @@ mod tests {
         let langs = languages(store.path());
         // Then: .myrs のファイルにそのパッケージが選ばれる
         assert_eq!(langs.for_path(Path::new("a.myrs")).map(|l| l.name.as_str()), Some("myrust"));
+    }
+
+    #[test]
+    fn registry_without_name_is_error() {
+        // Given: 2 つのパッケージを持つ [registry] のレジストリ
+        let repo = langs_repo();
+        let store = tempfile::tempdir().unwrap();
+        // When: 名前なしでインストールする
+        let report = install(store.path(), "foo/langs", &local(vec![("github.com/foo/langs", &repo)]));
+        // Then: エラーになり、何も入らない
+        assert_eq!(report["error"], "name_required", "{report}");
+        assert!(installed(store.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fetched_temporary_directory_is_removed_after_install() {
+        // Given: レジストリを一時ディレクトリに取得する fetcher
+        let store = tempfile::tempdir().unwrap();
+        let fetched_at = std::cell::RefCell::new(PathBuf::new());
+        let fetch = |id: &str| {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("edo-package.toml"), package("myrust", "myrs")).unwrap();
+            std::fs::write(tmp.path().join("edo.scm"), "").unwrap();
+            *fetched_at.borrow_mut() = tmp.path().to_path_buf();
+            Ok(Fetched { dir: tmp.path().to_path_buf(), source: format!("{id}@abc"), tmp: Some(tmp) })
+        };
+        // When: インストールする
+        let report = install(store.path(), "foo/myrust", &fetch);
+        // Then: インストールは成功し、一時ディレクトリは消える
+        assert_eq!(report["ok"], true, "{report}");
+        assert!(!fetched_at.borrow().exists());
     }
 }

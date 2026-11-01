@@ -21,7 +21,7 @@ pub struct Outcome {
     pub new_syntax_errors: Vec<SyntaxError>,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SyntaxError {
     pub line: usize,
     pub text: String,
@@ -98,7 +98,11 @@ fn apply(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Pl
     };
     let unit = indent_unit(&indents(src.lines()));
     let after = after.replace("\r\n", "\n");
-    let wrap = |s: String| format!("{prefix}{}{suffix}", s.replace('\n', nl));
+    // A leading blank line stays blank instead of carrying the indentation.
+    let wrap = |s: String| {
+        let prefix = if s.starts_with('\n') { prefix.trim_end_matches([' ', '\t']) } else { &prefix };
+        format!("{prefix}{}{suffix}", s.replace('\n', nl))
+    };
     let splice = |after: &str| format!("{}{}{}", &src[..range.start], after, &src[range.end..]);
     // Embed once with plain reindenting, then parse the whole file to find lines inside literals.
     let draft = wrap(reindent(&after, base, unit.clone(), &[]));
@@ -188,7 +192,7 @@ fn indent_unit(indents: &[&str]) -> Option<String> {
 /// converting `after`'s indent unit to the file's.
 /// Lines listed in `protected` (by index in `after`) are kept as written.
 fn reindent(after: &str, base: &str, file_unit: Option<String>, protected: &[usize]) -> String {
-    let mut lines = after.trim_start().split('\n');
+    let mut lines = after.trim_start_matches([' ', '\t']).split('\n');
     let first = lines.next().unwrap_or("");
     let rest: Vec<&str> = lines.collect();
     let free = rest.iter().enumerate().filter(|(k, _)| !protected.contains(&(k + 1))).map(|(_, l)| *l);
@@ -367,6 +371,16 @@ mod tests {
         let out = insert(src, "fn a() {\n        x();\n    }", "fn b() {\n    y();\n}", Place::InsertAfter);
         // Then: 挿入した行は a の先頭行と同じ深さになる
         assert_eq!(out, "impl A {\n    fn a() {\n        x();\n    }\n    fn b() {\n        y();\n    }\n}\n");
+    }
+
+    #[test]
+    fn leading_blank_line_of_after_is_kept() {
+        // Given: impl の中のインデントされた関数
+        let src = "impl A {\n    fn a() {}\n}\n";
+        // When: 空行から始まる after を a の後ろに挿入する
+        let out = insert(src, "fn a() {}", "\nfn b() {}", Place::InsertAfter);
+        // Then: 空行が残り、関数は a と同じ深さになる
+        assert_eq!(out, "impl A {\n    fn a() {}\n\n    fn b() {}\n}\n");
     }
 
     fn outcome(src: &str, target: &str, after: &str) -> Outcome {

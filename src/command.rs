@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::Error;
+use crate::{Error, Skipped};
 use crate::language::{Language, Languages};
 use crate::outline::{Definition, outline};
 use crate::edit::{self, Place};
@@ -64,16 +64,52 @@ fn expand(pattern: &str) -> Result<Vec<String>, Error> {
     Ok(out)
 }
 
+/// Splits glob matches into files with a language and counts of the rest by extension;
+/// a broad glob such as `**/*` also picks up files edo has no language for.
+fn supported(langs: &Languages, files: Vec<String>) -> (Vec<String>, Skipped) {
+    let mut skipped = Skipped::new();
+    let files = files
+        .into_iter()
+        .filter(|f| {
+            let ok = langs.for_path(Path::new(f)).is_some();
+            if !ok {
+                let ext = Path::new(f).extension().map_or(String::new(), |e| e.to_string_lossy().into_owned());
+                *skipped.entry(ext).or_default() += 1;
+            }
+            ok
+        })
+        .collect();
+    (files, skipped)
+}
+
 /// Reads a file (or glob) as an outline, or the definitions/lines selected by `scope`.
 pub fn read(langs: &Languages, path: &str, scope: Option<&str>) -> Result<String, Error> {
     if !is_glob(path) {
         return read_one(langs, path, scope);
     }
+    let files = expand(path)?;
+    if files.is_empty() {
+        return Err(Error::new("not_found", "no file matched"));
+    }
+    let (files, skipped) = supported(langs, files);
+    if files.is_empty() {
+        let mut err = Error::new("unsupported_language", "no matched file has a language package");
+        err.skipped = skipped;
+        return Err(err);
+    }
     let mut out = String::new();
-    for file in expand(path)? {
+    for file in files {
         out.push_str(&format!("{file}\n{}", read_one(langs, &file, scope)?));
     }
+    if !skipped.is_empty() {
+        out.push_str(&format!("{}\n", skipped_line(&skipped)));
+    }
     Ok(out)
+}
+
+/// `{"skipped":{...}}`, the note a glob ends with when it skipped files.
+fn skipped_line(skipped: &Skipped) -> Value {
+    json!({"skipped": crate::skipped_json(skipped)})
 }
 
 #[derive(Debug, Default)]
@@ -91,13 +127,19 @@ pub fn write(langs: &Languages, req: &WriteRequest) -> Result<Vec<Value>, Error>
     if !is_glob(req.path) {
         return Ok(vec![write_one(langs, req.path, req)?]);
     }
-    let reports: Vec<Value> = expand(req.path)?
+    let (files, skipped) = supported(langs, expand(req.path)?);
+    let mut reports: Vec<Value> = files
         .iter()
         .map(|f| write_one(langs, f, req).unwrap_or_else(|e| json!({"ok": false, "file": f, "error": e.code, "message": e.message})))
         .filter(|r| r["error"] != "not_found")
         .collect();
     if reports.is_empty() {
-        return Ok(vec![json!({"ok": false, "error": "not_found", "message": "no file matched"})]);
+        let mut err = Error::new("not_found", "no file matched");
+        err.skipped = skipped;
+        return Ok(vec![err.to_json()]);
+    }
+    if !skipped.is_empty() {
+        reports.push(skipped_line(&skipped));
     }
     Ok(reports)
 }
@@ -425,5 +467,81 @@ mod tests {
         // Then: 除外されたファイルは含まれない
         assert!(!out.contains("b.rs"), "{out}");
         assert!(out.contains("a.rs"));
+    }
+
+    #[test]
+    fn glob_read_skips_files_without_language_package() {
+        // Given: Rust のファイルと JSON のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.json", "{}")]);
+        // When: 両方に一致する glob で読む
+        let out = read(&Languages::builtin(), &at(&dir, "*"), None).unwrap();
+        // Then: 言語パッケージのない JSON は飛ばされ、Rust のファイルは読める
+        assert!(out.starts_with(&format!("{}\n1\tfn a() {{}}\n", at(&dir, "a.rs"))), "{out}");
+        assert!(!out.contains("b.json"), "{out}");
+    }
+
+    #[test]
+    fn glob_read_matching_no_file_is_not_found() {
+        // Given: Rust のファイルだけがあるディレクトリ
+        let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
+        // When: どのファイルにも一致しない glob で読む
+        let err = read(&Languages::builtin(), &at(&dir, "*.kt"), None).unwrap_err();
+        // Then: not_found になる
+        assert_eq!(err.code, "not_found");
+    }
+
+    #[test]
+    fn glob_read_of_only_unsupported_files_is_unsupported_language_with_counts() {
+        // Given: 言語パッケージのないファイルだけがあるディレクトリ
+        let dir = dir_with(&[("a.json", "{}"), ("b.json", "{}"), ("c.yaml", "a: 1\n")]);
+        // When: glob で読む
+        let err = read(&Languages::builtin(), &at(&dir, "*"), None).unwrap_err();
+        // Then: unsupported_language になり、飛ばした拡張子ごとの件数を持つ
+        assert_eq!(err.code, "unsupported_language");
+        assert_eq!(err.to_json()["skipped"], serde_json::json!({"reason": "unsupported_language", "extensions": {"json": 2, "yaml": 1}}));
+    }
+
+    #[test]
+    fn glob_read_skipping_some_files_ends_with_counts_as_json_line() {
+        // Given: Rust のファイルと JSON のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.json", "{}")]);
+        // When: glob で読む
+        let out = read(&Languages::builtin(), &at(&dir, "*"), None).unwrap();
+        // Then: 出力の最後の行に、飛ばした拡張子ごとの件数が JSON で付く
+        let last = serde_json::json!({"skipped": {"reason": "unsupported_language", "extensions": {"json": 1}}});
+        assert_eq!(out, format!("{}\n1\tfn a() {{}}\n{last}\n", at(&dir, "a.rs")));
+    }
+
+    #[test]
+    fn glob_write_leaves_unsupported_files_out_of_report() {
+        // Given: 呼び出しのある Rust のファイルと JSON のファイル
+        let dir = dir_with(&[("a.rs", "fn a() { x(); }\n"), ("b.json", "{}")]);
+        // When: 両方に一致する glob で書く
+        let reports = write_in(&dir, WriteRequest { path: &at(&dir, "*"), before: Some("x();"), after: "y();", ..Default::default() });
+        // Then: JSON のファイルは報告に含まれない
+        let files: Vec<_> = reports.iter().filter_map(|r| r["file"].as_str()).map(String::from).collect();
+        assert_eq!(files, [at(&dir, "a.rs")]);
+    }
+
+    #[test]
+    fn glob_write_matching_no_file_reports_skipped_counts_with_not_found() {
+        // Given: 呼び出しのない Rust のファイルと JSON のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.json", "{}")]);
+        // When: 両方に一致する glob で書く
+        let reports = write_in(&dir, WriteRequest { path: &at(&dir, "*"), before: Some("x();"), after: "y();", ..Default::default() });
+        // Then: not_found に飛ばした拡張子ごとの件数が付く
+        assert_eq!(reports[0]["error"], "not_found");
+        assert_eq!(reports[0]["skipped"], serde_json::json!({"reason": "unsupported_language", "extensions": {"json": 1}}));
+    }
+
+    #[test]
+    fn glob_write_skipping_some_files_ends_report_with_counts() {
+        // Given: 呼び出しのある Rust のファイルと JSON のファイル
+        let dir = dir_with(&[("a.rs", "fn a() { x(); }\n"), ("b.json", "{}")]);
+        // When: 両方に一致する glob で書く
+        let reports = write_in(&dir, WriteRequest { path: &at(&dir, "*"), before: Some("x();"), after: "y();", ..Default::default() });
+        // Then: 報告の最後に、飛ばした拡張子ごとの件数が付く
+        let last = serde_json::json!({"skipped": {"reason": "unsupported_language", "extensions": {"json": 1}}});
+        assert_eq!(reports.last(), Some(&last));
     }
 }
