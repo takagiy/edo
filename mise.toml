@@ -1,0 +1,58 @@
+[tools]
+# rustup picks the host from its own default, which differs per machine. Windows needs the GNU
+# host because build scripts are built for the host, and zig cannot stand in for MSVC.
+rust = [
+    { version = "1.99", os = ["linux", "macos"] },
+    { version = "1.99-x86_64-pc-windows-gnu", os = ["windows"] },
+]
+# tree-sitter's wasm feature runs cmake in wasmtime-c-api-impl's build script.
+cmake = "4"
+# Every cargo task goes through cargo-zigbuild, so the C in the tree-sitter grammars and the
+# linker come from zig on every OS (on Windows this also stands in for MinGW and dlltool).
+zig = "0.17.0"
+"cargo:cargo-zigbuild" = "0.24.0"
+"cargo:cargo-insta" = "latest"
+
+[vars]
+# cargo-zigbuild only uses zig when given a target; this is the host's.
+target = "{% if os() == 'windows' %}x86_64-pc-windows-gnu{% elif os() == 'macos' %}{% if arch() == 'arm64' %}aarch64{% else %}x86_64{% endif %}-apple-darwin{% else %}{% if arch() == 'arm64' %}aarch64{% else %}x86_64{% endif %}-unknown-linux-gnu{% endif %}"
+
+[tasks.setup]
+description = "Fetch the brokk Kotlin grammar submodule"
+run = "git submodule update --init --recursive"
+
+[tasks.build]
+description = "Build the workspace"
+run = "cargo-zigbuild zigbuild --workspace --target {{vars.target}}"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo-zigbuild test --workspace --target {{vars.target}}"
+
+[tasks.lint]
+description = "Run clippy, failing on warnings"
+run = "cargo-zigbuild clippy --workspace --all-targets --target {{vars.target}} -- -D warnings"
+
+[tasks.fmt]
+description = "Format the code"
+run = "cargo fmt --all"
+
+[tasks.fmt-check]
+description = "Check formatting"
+run = "cargo fmt --all --check"
+
+[tasks.check]
+description = "Everything CI should run: formatting, lint and tests"
+depends = ["fmt-check", "lint", "test"]
+
+[tasks.snap]
+description = "Review pending insta snapshots"
+run = "cargo insta review"
+
+[tasks.install]
+description = "Install the edo binary from this checkout"
+run = "cargo-zigbuild install --path . --locked --target {{vars.target}}"
+
+[tasks.mcp]
+description = "Run the MCP server over stdio"
+run = "cargo-zigbuild run --quiet --target {{vars.target}} -- mcp"
