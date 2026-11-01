@@ -1,0 +1,4 @@
+[package]
+name = "python"
+extensions = ["py", "pyi"]
+grammar = "builtin:python"

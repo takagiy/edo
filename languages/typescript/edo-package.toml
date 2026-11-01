@@ -1,0 +1,4 @@
+[package]
+name = "typescript"
+extensions = ["ts", "mts", "cts"]
+grammar = "builtin:typescript"

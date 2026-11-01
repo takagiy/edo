@@ -1,0 +1,4 @@
+[package]
+name = "kotlin"
+extensions = ["kt", "kts"]
+grammar = "builtin:kotlin"

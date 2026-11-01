@@ -1,0 +1,15 @@
+---
+source: src/view.rs
+assertion_line: 279
+expression: "builtin_outline(\"tests/fixtures/outline/sample.md\")"
+---
+1	Intro text.
+2	
+3	# Title
+4	
+10	## Install
+11	
+18	## Usage
+19	
+22	# v1.0
+23

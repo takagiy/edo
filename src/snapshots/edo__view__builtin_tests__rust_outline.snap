@@ -1,0 +1,39 @@
+---
+source: src/view.rs
+assertion_line: 231
+expression: "builtin_outline(\"tests/fixtures/outline/sample.rs\")"
+---
+1	use std::fmt;
+2	
+3	/// A point.
+4	#[derive(Debug)]
+5	pub struct Point {
+6	    x: i32,
+7	}
+8	
+9	// Not a doc: separated by a blank line.
+10	
+11	impl Point {
+12	    /// Creates a point.
+13	    pub fn new(x: i32) -> Self {
+15	    }
+16	
+17	    fn get(&self) -> i32 { ... }
+18	}
+19	
+20	pub trait Shape {
+21	    fn area(&self) -> f64;
+22	    fn name(&self) -> String {
+24	    }
+25	}
+26	
+27	mod inner {
+28	    pub enum Kind {
+29	        A,
+30	    }
+31	
+32	    pub fn run() {
+37	    }
+38	}
+39	
+40	const MAX: usize = 10;

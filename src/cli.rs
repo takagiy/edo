@@ -1,0 +1,269 @@
+use clap::{Parser, Subcommand};
+use serde_json::json;
+
+use crate::command::{self, WriteRequest};
+use crate::edit::Place;
+use crate::install;
+use crate::language::Languages;
+
+#[derive(Parser)]
+#[command(name = "edo", version, about = "AST-aware headless code editor for agents")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Print a file with line numbers and function bodies elided, or the definitions/lines selected by a scope.
+    ///
+    /// <TARGET> is <file>, <file>:<identifier> (Foo.bar or Foo::bar), <file>:<N> or <file>:<N-M>. <file> may be a glob.
+    Read { target: String },
+    /// Replace <BEFORE> with <AFTER>, ignoring indentation and code style differences.
+    ///
+    /// Without <BEFORE>, the whole target is replaced. Pass - as <AFTER> to read stdin; stdin with
+    /// <<<<<<< before / ======= / >>>>>>> after markers gives both.
+    Write {
+        /// Insert <AFTER> on the lines after the target instead of replacing it.
+        #[arg(long)]
+        insert_after: bool,
+        /// Insert <AFTER> on the lines before the target instead of replacing it.
+        #[arg(long)]
+        insert_before: bool,
+        /// Replace every match instead of failing as ambiguous.
+        #[arg(long)]
+        all_matches: bool,
+        target: String,
+        /// [BEFORE] <AFTER>
+        #[arg(num_args = 1..)]
+        texts: Vec<String>,
+    },
+    /// Serve the read and write tools over MCP (stdio).
+    Mcp,
+    /// Manage language packages.
+    Lang {
+        #[command(subcommand)]
+        cmd: LangCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum LangCmd {
+    /// Install packages given as <name> (default registry), <repo>:<name>, or <repo> whose root is a package.
+    Install {
+        #[arg(required = true)]
+        specs: Vec<String>,
+    },
+    /// List builtin and installed packages.
+    List,
+    /// Remove an installed package given as <name> or <repo>:<name>.
+    Remove { spec: String },
+}
+
+fn lang(cmd: LangCmd) -> (String, i32) {
+    let store = install::store_dir();
+    let (out, ok) = match cmd {
+        LangCmd::Install { specs } => {
+            let fetch = |registry: &str| {
+                // Unpacked archives live until the process exits; the OS cleans its temp directory.
+                let tmp = tempfile::tempdir().map_err(|e| crate::Error::new("io", e.to_string()))?.keep();
+                install::fetch_github(registry, &tmp)
+            };
+            let reports = install::install_all(&store, &specs, &fetch);
+            let ok = reports.iter().all(|r| r["ok"] == true);
+            (serde_json::Value::from(reports), ok)
+        }
+        LangCmd::List => match install::list(&store) {
+            Ok(v) => (v, true),
+            Err(e) => (json!({"ok": false, "error": e.code, "message": e.message}), false),
+        },
+        LangCmd::Remove { spec } => {
+            let r = install::remove(&store, &spec);
+            let ok = r["ok"] == true;
+            (r, ok)
+        }
+    };
+    (out.to_string(), if ok { 0 } else { 1 })
+}
+
+/// Runs the CLI and returns what to print and the exit code.
+pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages) -> (String, i32) {
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(e) if !e.use_stderr() => return (e.to_string(), 0),
+        Err(e) => return usage(e.to_string()),
+    };
+    match cli.cmd {
+        Cmd::Lang { cmd } => lang(cmd),
+        Cmd::Mcp => match crate::mcp::serve(langs) {
+            Ok(()) => (String::new(), 0),
+            Err(e) => (json!({"ok": false, "error": "io", "message": e.to_string()}).to_string(), 1),
+        },
+        Cmd::Read { target } => {
+            let (path, scope) = split_target(&target);
+            match command::read(&langs, path, scope) {
+                Ok(text) => (text, 0),
+                Err(e) => (json!({"ok": false, "error": e.code, "message": e.message}).to_string(), 1),
+            }
+        }
+        Cmd::Write { insert_after, insert_before, all_matches, target, texts } => {
+            let (path, scope) = split_target(&target);
+            let (before, after) = match texts.as_slice() {
+                [after] => (None, after.clone()),
+                [before, after] => (Some(before.clone()), after.clone()),
+                _ => return usage("expected [BEFORE] <AFTER>".into()),
+            };
+            let (before, after) = match (before, after.as_str()) {
+                (None, "-") => {
+                    let input = stdin();
+                    match split_conflict(&input) {
+                        Some((b, a)) => (Some(b), a),
+                        None => (None, input),
+                    }
+                }
+                (before, "-") => (before, stdin()),
+                (before, _) => (before, after),
+            };
+            let place = match (insert_after, insert_before) {
+                (true, true) => return usage("--insert-after and --insert-before cannot be used together".into()),
+                (true, false) => Place::InsertAfter,
+                (false, true) => Place::InsertBefore,
+                (false, false) => Place::Replace,
+            };
+            let req = WriteRequest { path, scope, before: before.as_deref(), after: &after, all_matches, place };
+            match command::write(&langs, &req) {
+                Ok(reports) => {
+                    let code = if reports.iter().all(|r| r["ok"] == true) { 0 } else { 1 };
+                    (serde_json::Value::from(reports).to_string(), code)
+                }
+                Err(e) => (json!({"ok": false, "error": e.code, "message": e.message}).to_string(), 1),
+            }
+        }
+    }
+}
+
+/// Splits `<<<<<<< before` / `=======` / `>>>>>>> after` blocks; markers count only as whole lines.
+fn split_conflict(input: &str) -> Option<(String, String)> {
+    let lines: Vec<&str> = input.lines().collect();
+    let open = lines.iter().position(|l| l.trim_end() == "<<<<<<< before")?;
+    let mid = open + lines[open..].iter().position(|l| l.trim_end() == "=======")?;
+    let close = mid + lines[mid..].iter().position(|l| l.trim_end() == ">>>>>>> after")?;
+    Some((lines[open + 1..mid].join("\n"), lines[mid + 1..close].join("\n")))
+}
+
+fn usage(message: String) -> (String, i32) {
+    (json!({"ok": false, "error": "usage", "message": message}).to_string(), 2)
+}
+
+/// Splits `<file>:<scope>` at the first `:`, except a drive letter's `:` in `C:/...`.
+pub fn split_target(arg: &str) -> (&str, Option<&str>) {
+    let b = arg.as_bytes();
+    let skip = if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/' { 2 } else { 0 };
+    match arg[skip..].find(':') {
+        Some(i) => (&arg[..skip + i], Some(&arg[skip + i + 1..])),
+        None => (arg, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_splits_at_first_colon_into_file_and_scope() {
+        // Given / When: <file>:<scope> を分ける / Then: 最初の : でファイルとスコープになる
+        assert_eq!(split_target("src/a.kt:Foo.bar"), ("src/a.kt", Some("Foo.bar")));
+    }
+
+    #[test]
+    fn scope_with_double_colon_still_splits_at_first_colon() {
+        // Given / When: スコープに :: を含む引数を分ける / Then: 最初の : で分かれる
+        assert_eq!(split_target("src/lib.rs:Foo::bar"), ("src/lib.rs", Some("Foo::bar")));
+    }
+
+    #[test]
+    fn drive_letter_colon_is_not_a_separator() {
+        // Given / When: 英字1文字:/ で始まる引数を分ける / Then: ドライブレターの : では分かれない
+        assert_eq!(split_target("C:/src/a.rs:Foo"), ("C:/src/a.rs", Some("Foo")));
+        assert_eq!(split_target("C:/src/a.rs"), ("C:/src/a.rs", None));
+    }
+
+    fn edo(args: &[&str], stdin: &str) -> (String, i32) {
+        let args: Vec<String> = std::iter::once("edo").chain(args.iter().copied()).map(String::from).collect();
+        let stdin = stdin.to_string();
+        run(&args, &mut || stdin.clone(), Languages::builtin())
+    }
+
+    fn file(text: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, text).unwrap();
+        (dir, path.to_string_lossy().replace('\\', "/"))
+    }
+
+    #[test]
+    fn dash_after_reads_after_from_stdin() {
+        // Given: 呼び出しのある関数
+        let (_dir, path) = file("fn a() {\n    x();\n}\n");
+        // When: after に - を渡し、標準入力に after を流す
+        edo(&["write", &path, "x();", "-"], "y();");
+        // Then: 標準入力の内容が after になる
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    y();\n}\n");
+    }
+
+    #[test]
+    fn stdin_with_conflict_markers_gives_before_and_after() {
+        // Given: 呼び出しのある関数
+        let (_dir, path) = file("fn a() {\n    x();\n}\n");
+        // When: - だけを渡し、コンフリクトマーカーで before と after を書いた標準入力を流す
+        edo(&["write", &path, "-"], "<<<<<<< before\nx();\n=======\ny();\nz();\n>>>>>>> after\n");
+        // Then: マーカーで分けた before が after に置き換わる
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    y();\n    z();\n}\n");
+    }
+
+    #[test]
+    fn successful_read_prints_text_and_exits_zero() {
+        // Given: 関数のあるファイル
+        let (_dir, path) = file("fn a() {}\n");
+        // When: 読む
+        let (out, code) = edo(&["read", &path], "");
+        // Then: テキストが出力され、終了コードは 0
+        assert_eq!((out.as_str(), code), ("1\tfn a() {}\n", 0));
+    }
+
+    #[test]
+    fn write_report_is_printed_as_json_array() {
+        // Given: 呼び出しのある関数
+        let (_dir, path) = file("fn a() { x(); }\n");
+        // When: 書く
+        let (out, _) = edo(&["write", &path, "x();", "y();"], "");
+        // Then: 報告が JSON の配列で出力される
+        assert_eq!(out, serde_json::json!([{"ok": true, "file": path, "replaced": [[1, 1]]}]).to_string());
+    }
+
+    #[test]
+    fn report_with_failure_exits_one() {
+        // Given: 呼び出しのない関数
+        let (_dir, path) = file("fn a() {}\n");
+        // When: 一致しない before で書く
+        let (_, code) = edo(&["write", &path, "x();", "y();"], "");
+        // Then: 終了コードは 1
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn both_insert_flags_are_usage_error() {
+        // Given / When: --insert-after と --insert-before を同時に指定する
+        let (out, code) = edo(&["write", "--insert-after", "--insert-before", "a.rs", "x"], "");
+        // Then: usage エラーになる
+        assert!(out.contains("\"usage\"") && code != 0, "{out}");
+    }
+
+    #[test]
+    fn too_many_positional_arguments_are_usage_error() {
+        // Given / When: 位置引数を 4 つ渡す
+        let (out, code) = edo(&["write", "a.rs", "b.rs", "x", "y"], "");
+        // Then: usage エラーになる
+        assert!(out.contains("\"usage\"") && code != 0, "{out}");
+    }
+}

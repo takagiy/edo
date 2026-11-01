@@ -1,0 +1,26 @@
+---
+source: src/view.rs
+assertion_line: 261
+expression: "builtin_outline(\"tests/fixtures/outline/sample.go\")"
+---
+1	package main
+2	
+3	import "fmt"
+4	
+5	// Point is a point.
+6	type Point struct {
+7		X int
+8	}
+9	
+10	type Shape interface {
+11		Area() float64
+12	}
+13	
+14	// Norm returns the norm.
+15	func (p *Point) Norm() int {
+17	}
+18	
+19	func main() {
+21	}
+22	
+23	func one() int { ... }

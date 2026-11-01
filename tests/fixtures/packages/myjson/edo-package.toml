@@ -1,0 +1,5 @@
+[package]
+name = "myjson"
+extensions = ["myjson"]
+grammar = "grammar.wasm"
+grammar_symbol = "json"

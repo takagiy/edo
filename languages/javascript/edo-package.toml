@@ -1,0 +1,4 @@
+[package]
+name = "javascript"
+extensions = ["js", "mjs", "cjs", "jsx"]
+grammar = "builtin:javascript"

@@ -1,0 +1,4 @@
+[package]
+name = "go"
+extensions = ["go"]
+grammar = "builtin:go"

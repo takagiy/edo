@@ -1,0 +1,4 @@
+[package]
+name = "rust"
+extensions = ["rs"]
+grammar = "builtin:rust"

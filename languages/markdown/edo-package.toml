@@ -1,0 +1,4 @@
+[package]
+name = "markdown"
+extensions = ["md", "markdown"]
+grammar = "builtin:markdown"

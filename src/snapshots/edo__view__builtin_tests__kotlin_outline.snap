@@ -1,0 +1,34 @@
+---
+source: src/view.rs
+assertion_line: 273
+expression: "builtin_outline(\"tests/fixtures/outline/sample.kt\")"
+---
+1	package demo
+2	
+3	import kotlin.math.sqrt
+4	
+5	/** A data object. */
+6	data object Foo {
+7	  fun hoge() = ...
+8	  fun fuga() {
+10	  }
+11	}
+12	
+13	@JvmInline
+14	value class Id(val raw: String)
+15	
+16	interface Shape {
+17	  fun area(): Double
+18	}
+19	
+20	class Circle(private val r: Double) : Shape {
+21	  // Area of the circle.
+22	  override fun area(): Double {
+24	  }
+25	
+26	  companion object {
+27	    fun unit() = ...
+28	  }
+29	}
+30	
+31	typealias Name = String

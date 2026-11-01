@@ -1,0 +1,15 @@
+---
+source: src/view.rs
+assertion_line: 243
+expression: "builtin_outline(\"tests/fixtures/outline/sample.tsx\")"
+---
+1	import React from "react";
+2	
+3	type Props = { name: string };
+4	
+5	/** Greets. */
+6	export function Hello({ name }: Props) {
+8	}
+9	
+10	export const App = () => {
+16	};

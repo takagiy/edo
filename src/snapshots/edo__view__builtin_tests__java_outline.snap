@@ -1,0 +1,32 @@
+---
+source: src/view.rs
+assertion_line: 267
+expression: "builtin_outline(\"tests/fixtures/outline/sample.java\")"
+---
+1	package demo;
+2	
+3	import java.util.List;
+4	
+5	/** A shape. */
+6	public interface Shape {
+7	    double area();
+8	}
+9	
+10	@Deprecated
+11	public class Circle implements Shape {
+12	    private final double r;
+13	
+14	    /** Creates a circle. */
+15	    public Circle(double r) {
+17	    }
+18	
+19	    @Override
+20	    public double area() {
+22	    }
+23	
+24	    static class Inner {
+25	        void run() { ... }
+26	    }
+27	
+28	    enum Kind { A, B }
+29	}

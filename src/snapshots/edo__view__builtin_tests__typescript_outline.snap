@@ -1,0 +1,31 @@
+---
+source: src/view.rs
+assertion_line: 237
+expression: "builtin_outline(\"tests/fixtures/outline/sample.ts\")"
+---
+1	import { readFile } from "fs";
+2	
+3	/** A shape. */
+4	export interface Shape {
+5	  area(): number;
+6	}
+7	
+8	export type Id = string;
+9	
+10	enum Color {
+11	  Red,
+12	}
+13	
+14	export abstract class Base implements Shape {
+15	  abstract area(): number;
+16	
+17	  /** Describes. */
+18	  describe(): string {
+20	  }
+21	}
+22	
+23	export function make(id: Id): Base | undefined {
+27	}
+28	
+29	export const handler = async (id: Id): Promise<void> => {
+31	};

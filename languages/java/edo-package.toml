@@ -1,0 +1,4 @@
+[package]
+name = "java"
+extensions = ["java"]
+grammar = "builtin:java"
