@@ -71,7 +71,8 @@ fn builtin_grammar(name: &str) -> Option<tree_sitter::Language> {
 
 impl Language {
     pub fn load_dir(dir: &Path) -> Result<Language, String> {
-        let read = |f: &str| std::fs::read_to_string(dir.join(f)).map_err(|e| format!("{}: {e}", dir.join(f).display()));
+        let read =
+            |f: &str| std::fs::read_to_string(dir.join(f)).map_err(|e| format!("{}: {e}", dir.join(f).display()));
         Language::load(&read("edo-package.toml")?, &read("edo.scm")?, Some(dir))
     }
 
@@ -197,7 +198,10 @@ grammar = \"builtin:rust\"
         // When: Rust のコードをパースする
         let tree = lang.parser().parse("fn a() {}", None).unwrap();
         // Then: Rust の grammar の構文木になる
-        assert_eq!(tree.root_node().to_sexp(), "(source_file (function_item name: (identifier) parameters: (parameters) body: (block)))");
+        assert_eq!(
+            tree.root_node().to_sexp(),
+            "(source_file (function_item name: (identifier) parameters: (parameters) body: (block)))"
+        );
     }
 
     #[test]

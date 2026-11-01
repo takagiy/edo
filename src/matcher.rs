@@ -67,9 +67,11 @@ fn rules(lang: &Language, tree: &tree_sitter::Tree, src: &str) -> HashMap<usize,
     while let Some(m) = matches.next() {
         for c in m.captures() {
             let alt = || {
-                let prop = lang.query.property_settings(m.pattern_index).iter().find(|p| {
-                    &*p.key == "alt" && p.capture_id.is_none_or(|id| id == c.index as usize)
-                });
+                let prop = lang
+                    .query
+                    .property_settings(m.pattern_index)
+                    .iter()
+                    .find(|p| &*p.key == "alt" && p.capture_id.is_none_or(|id| id == c.index as usize));
                 let alt = prop.and_then(|p| p.value.as_deref()).unwrap_or("\" '");
                 alt.split_whitespace().map(String::from).collect()
             };
@@ -111,11 +113,21 @@ pub struct Found {
 
 /// Finds every non-overlapping match of `before` inside `scope`.
 pub fn find(src: &str, leaves: &[Leaf], scope: Range<usize>, before: &str) -> Found {
-    let mut optional: Vec<&str> = leaves.iter().filter(|l| l.skip == Skip::Always).map(|l| &src[l.range.clone()]).collect();
+    let mut optional: Vec<&str> =
+        leaves.iter().filter(|l| l.skip == Skip::Always).map(|l| &src[l.range.clone()]).collect();
     optional.sort();
     optional.dedup();
-    let leaves: Vec<&Leaf> = leaves.iter().filter(|l| scope.start <= l.range.start && l.range.end <= scope.end).collect();
-    let m = Matcher { src, leaves: &leaves, before, optional, start: Cell::new(0), best: Cell::new(None), failed: Default::default() };
+    let leaves: Vec<&Leaf> =
+        leaves.iter().filter(|l| scope.start <= l.range.start && l.range.end <= scope.end).collect();
+    let m = Matcher {
+        src,
+        leaves: &leaves,
+        before,
+        optional,
+        start: Cell::new(0),
+        best: Cell::new(None),
+        failed: Default::default(),
+    };
     let mut found: Vec<Range<usize>> = vec![];
     for (i, leaf) in leaves.iter().enumerate() {
         if found.last().is_some_and(|f| leaf.range.start < f.end) {
@@ -242,11 +254,13 @@ impl Matcher<'_> {
             let extra = self.optional.iter().find(|t| rest.starts_with(**t))?;
             end.and_then(|_| self.at(i, b + extra.len(), end))
         });
-        if found.is_none() && let Some(matched_end) = end
+        if found.is_none()
+            && let Some(matched_end) = end
             && self.best.get().is_none_or(|p| b > p.consumed)
         {
             let leaf = self.leaves.get(i).map_or(matched_end..matched_end, |l| l.range.clone());
-            let progress = Progress { consumed: b, start: self.start.get(), mismatch: leaf.start, matched_end: leaf.end };
+            let progress =
+                Progress { consumed: b, start: self.start.get(), mismatch: leaf.start, matched_end: leaf.end };
             self.best.set(Some(progress));
         }
         found
@@ -261,7 +275,9 @@ impl Matcher<'_> {
         let consumed = match &leaf.compare {
             Compare::Exact => rest.starts_with(text).then_some(text.len()),
             Compare::Collapse => collapsed_prefix(text, rest),
-            Compare::AnyOf(alt) => alt.iter().map(String::as_str).chain([text]).find(|q| rest.starts_with(q)).map(str::len),
+            Compare::AnyOf(alt) => {
+                alt.iter().map(String::as_str).chain([text]).find(|q| rest.starts_with(q)).map(str::len)
+            }
         };
         let skippable = match leaf.skip {
             Skip::Never => false,

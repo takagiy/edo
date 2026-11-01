@@ -102,7 +102,9 @@ pub fn outline(lang: &Language, tree: &tree_sitter::Tree, src: &str) -> Vec<Defi
 fn inner_range(node: tree_sitter::Node) -> Range<usize> {
     let n = node.child_count();
     match (node.child(0), n.checked_sub(1).and_then(|i| node.child(i))) {
-        (Some(first), Some(last)) if n >= 2 && !first.is_named() && !last.is_named() => first.end_byte()..last.start_byte(),
+        (Some(first), Some(last)) if n >= 2 && !first.is_named() && !last.is_named() => {
+            first.end_byte()..last.start_byte()
+        }
         _ => node.byte_range(),
     }
 }

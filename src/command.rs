@@ -1,11 +1,11 @@
 use std::path::Path;
 
-use crate::{Error, Skipped};
-use crate::language::{Language, Languages};
-use crate::outline::{Definition, outline};
 use crate::edit::{self, Place};
+use crate::language::{Language, Languages};
 use crate::matcher;
+use crate::outline::{Definition, outline};
 use crate::scope::Hit;
+use crate::{Error, Skipped};
 use crate::{scope, view};
 use serde_json::{Value, json};
 
@@ -161,7 +161,10 @@ pub fn write(langs: &Languages, req: &WriteRequest) -> Result<Vec<Value>, Error>
     let (files, skipped) = supported(langs, expand(req.path)?);
     let mut reports: Vec<Value> = files
         .iter()
-        .map(|f| write_one(langs, f, req).unwrap_or_else(|e| json!({"ok": false, "file": f, "error": e.code, "message": e.message})))
+        .map(|f| {
+            write_one(langs, f, req)
+                .unwrap_or_else(|e| json!({"ok": false, "file": f, "error": e.code, "message": e.message}))
+        })
         .filter(|r| r["error"] != "not_found")
         .collect();
     if reports.is_empty() {
@@ -205,7 +208,8 @@ fn write_one(langs: &Languages, path: &str, req: &WriteRequest) -> Result<Value,
         if let Some(c) = closest {
             let t = &src.text;
             let mismatch = json!({"line": line_of(t, c.mismatch), "expected": c.expected, "found": c.found});
-            report["closest"] = json!({"range": [line_of(t, c.range.start), line_of(t, c.range.end)], "mismatch": mismatch});
+            report["closest"] =
+                json!({"range": [line_of(t, c.range.start), line_of(t, c.range.end)], "mismatch": mismatch});
         }
         return Ok(report);
     }
@@ -262,7 +266,10 @@ fn candidate(src: &Source, target: &Hit) -> Value {
         }
         None => {
             let enclosing = src.defs.iter().filter(|d| d.node.start <= range.start && range.end <= d.node.end);
-            (enclosing.map(|d| d.header(text)).collect(), text[range.clone()].lines().next().unwrap_or("").trim().to_string())
+            (
+                enclosing.map(|d| d.header(text)).collect(),
+                text[range.clone()].lines().next().unwrap_or("").trim().to_string(),
+            )
         }
     };
     let last = line_of(text, range.end.max(range.start + 1) - 1);
@@ -313,7 +320,10 @@ mod tests {
         // When: glob で読む
         let out = read(&Languages::builtin(), &at(&dir, "src/*.rs"), None).unwrap();
         // Then: ファイルごとにパスの行が前に付く
-        assert_eq!(out, format!("{}\n1\tfn a() {{}}\n{}\n1\tfn b() {{}}\n", at(&dir, "src/a.rs"), at(&dir, "src/b.rs")));
+        assert_eq!(
+            out,
+            format!("{}\n1\tfn a() {{}}\n{}\n1\tfn b() {{}}\n", at(&dir, "src/a.rs"), at(&dir, "src/b.rs"))
+        );
     }
 
     fn read_error(files: &[(&str, &[u8])], name: &str) -> &'static str {
@@ -378,7 +388,10 @@ mod tests {
         let src = "fn a() {\n    x();\n    x();\n}\n";
         let dir = dir_with(&[("a.rs", src)]);
         // When: その呼び出しを before にして書く
-        let reports = write_in(&dir, WriteRequest { path: &at(&dir, "a.rs"), before: Some("x();"), after: "y();", ..Default::default() });
+        let reports = write_in(
+            &dir,
+            WriteRequest { path: &at(&dir, "a.rs"), before: Some("x();"), after: "y();", ..Default::default() },
+        );
         // Then: ambiguous が報告され、ファイルは変わらない
         assert_eq!(reports[0]["error"], "ambiguous");
         assert_eq!(content(&dir, "a.rs"), src);
@@ -390,12 +403,18 @@ mod tests {
         let src = "data object Foo {\n  companion object {\n    fun bar(x: Int) {\n      x()\n    }\n  }\n}\nclass Bar {\n  fun bar(s: String) {\n  }\n}\n";
         let dir = dir_with(&[("a.kt", src)]);
         // When: スコープ bar に before なしで書く
-        let reports = write_in(&dir, WriteRequest { path: &at(&dir, "a.kt"), scope: Some("bar"), after: "fun bar() {}", ..Default::default() });
+        let reports = write_in(
+            &dir,
+            WriteRequest { path: &at(&dir, "a.kt"), scope: Some("bar"), after: "fun bar() {}", ..Default::default() },
+        );
         // Then: 候補ごとに範囲と親と見出しが報告される
-        assert_eq!(reports[0]["matches"], serde_json::json!([
-            {"range": [3, 5], "parents": ["data object Foo", "companion object"], "signature": "fun bar(x: Int)"},
-            {"range": [9, 10], "parents": ["class Bar"], "signature": "fun bar(s: String)"},
-        ]));
+        assert_eq!(
+            reports[0]["matches"],
+            serde_json::json!([
+                {"range": [3, 5], "parents": ["data object Foo", "companion object"], "signature": "fun bar(x: Int)"},
+                {"range": [9, 10], "parents": ["class Bar"], "signature": "fun bar(s: String)"},
+            ])
+        );
     }
 
     #[test]
@@ -403,10 +422,21 @@ mod tests {
         // Given: 引数が 1 の呼び出しがある関数
         let dir = dir_with(&[("a.rs", "fn a() {\n    hoge(1);\n}\n")]);
         // When: 引数の違う before で書く
-        let reports = write_in(&dir, WriteRequest { path: &at(&dir, "a.rs"), before: Some("fn a() {\n hoge(42);"), after: "x", ..Default::default() });
+        let reports = write_in(
+            &dir,
+            WriteRequest {
+                path: &at(&dir, "a.rs"),
+                before: Some("fn a() {\n hoge(42);"),
+                after: "x",
+                ..Default::default()
+            },
+        );
         // Then: not_found と最も近い候補が報告される
         assert_eq!(reports[0]["error"], "not_found");
-        assert_eq!(reports[0]["closest"], serde_json::json!({"range": [1, 2], "mismatch": {"line": 2, "expected": "hoge(42);", "found": "hoge(1);"}}));
+        assert_eq!(
+            reports[0]["closest"],
+            serde_json::json!({"range": [1, 2], "mismatch": {"line": 2, "expected": "hoge(42);", "found": "hoge(1);"}})
+        );
     }
 
     #[test]
@@ -414,7 +444,13 @@ mod tests {
         // Given: 同じ呼び出しが 2 つある関数
         let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n    x();\n}\n")]);
         // When: all_matches を付けて、2 行の after で書く
-        let req = WriteRequest { path: &at(&dir, "a.rs"), before: Some("x();"), after: "y();\nz();", all_matches: true, ..Default::default() };
+        let req = WriteRequest {
+            path: &at(&dir, "a.rs"),
+            before: Some("x();"),
+            after: "y();\nz();",
+            all_matches: true,
+            ..Default::default()
+        };
         let reports = write_in(&dir, req);
         // Then: どちらも置き換わり、書き換えた後の行がそれぞれ報告される
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    y();\n    z();\n    y();\n    z();\n}\n");
@@ -426,7 +462,10 @@ mod tests {
         // Given: 正しい関数
         let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n}\n")]);
         // When: 閉じ括弧の足りない after で書く
-        let reports = write_in(&dir, WriteRequest { path: &at(&dir, "a.rs"), before: Some("x();"), after: "y(;", ..Default::default() });
+        let reports = write_in(
+            &dir,
+            WriteRequest { path: &at(&dir, "a.rs"), before: Some("x();"), after: "y(;", ..Default::default() },
+        );
         // Then: 書き込まれ、構文エラーが警告として報告される
         assert_eq!(reports[0]["ok"], true);
         assert_eq!(reports[0]["warnings"], serde_json::json!({"new_syntax_errors": [{"line": 2, "text": "y(;"}]}));
@@ -437,7 +476,10 @@ mod tests {
         // Given: 関数が 2 つあるファイル
         let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n}\nfn b() {}\n")]);
         // When: スコープ a に before なしで書く
-        write_in(&dir, WriteRequest { path: &at(&dir, "a.rs"), scope: Some("a"), after: "fn a() {}", ..Default::default() });
+        write_in(
+            &dir,
+            WriteRequest { path: &at(&dir, "a.rs"), scope: Some("a"), after: "fn a() {}", ..Default::default() },
+        );
         // Then: 関数 a 全体が置き換わる
         assert_eq!(content(&dir, "a.rs"), "fn a() {}\nfn b() {}\n");
     }
@@ -467,7 +509,10 @@ mod tests {
         // Given: 呼び出しのあるファイルとないファイル
         let dir = dir_with(&[("a.rs", "fn a() { x(); }\n"), ("b.rs", "fn b() {}\n")]);
         // When: glob で書く
-        let reports = write_in(&dir, WriteRequest { path: &at(&dir, "*.rs"), before: Some("x();"), after: "y();", ..Default::default() });
+        let reports = write_in(
+            &dir,
+            WriteRequest { path: &at(&dir, "*.rs"), before: Some("x();"), after: "y();", ..Default::default() },
+        );
         // Then: 一致したファイルだけが報告される
         let files: Vec<_> = reports.iter().map(|r| r["file"].as_str().unwrap().to_string()).collect();
         assert_eq!(files, [at(&dir, "a.rs")]);
@@ -478,7 +523,10 @@ mod tests {
         // Given: 呼び出しのないファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
         // When: glob で書く
-        let reports = write_in(&dir, WriteRequest { path: &at(&dir, "*.rs"), before: Some("x();"), after: "y();", ..Default::default() });
+        let reports = write_in(
+            &dir,
+            WriteRequest { path: &at(&dir, "*.rs"), before: Some("x();"), after: "y();", ..Default::default() },
+        );
         // Then: not_found になる
         assert_eq!(reports, [serde_json::json!({"ok": false, "error": "not_found", "message": "no file matched"})]);
     }
@@ -523,7 +571,10 @@ mod tests {
         let err = read(&Languages::builtin(), &at(&dir, "*"), None).unwrap_err();
         // Then: unsupported_language になり、飛ばした拡張子ごとの件数を持つ
         assert_eq!(err.code, "unsupported_language");
-        assert_eq!(err.to_json()["skipped"], serde_json::json!({"reason": "unsupported_language", "extensions": {"json": 2, "yaml": 1}}));
+        assert_eq!(
+            err.to_json()["skipped"],
+            serde_json::json!({"reason": "unsupported_language", "extensions": {"json": 2, "yaml": 1}})
+        );
     }
 
     #[test]
@@ -542,7 +593,10 @@ mod tests {
         // Given: 呼び出しのある Rust のファイルと JSON のファイル
         let dir = dir_with(&[("a.rs", "fn a() { x(); }\n"), ("b.json", "{}")]);
         // When: 両方に一致する glob で書く
-        let reports = write_in(&dir, WriteRequest { path: &at(&dir, "*"), before: Some("x();"), after: "y();", ..Default::default() });
+        let reports = write_in(
+            &dir,
+            WriteRequest { path: &at(&dir, "*"), before: Some("x();"), after: "y();", ..Default::default() },
+        );
         // Then: JSON のファイルは報告に含まれない
         let files: Vec<_> = reports.iter().filter_map(|r| r["file"].as_str()).map(String::from).collect();
         assert_eq!(files, [at(&dir, "a.rs")]);
@@ -553,10 +607,16 @@ mod tests {
         // Given: 呼び出しのない Rust のファイルと JSON のファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.json", "{}")]);
         // When: 両方に一致する glob で書く
-        let reports = write_in(&dir, WriteRequest { path: &at(&dir, "*"), before: Some("x();"), after: "y();", ..Default::default() });
+        let reports = write_in(
+            &dir,
+            WriteRequest { path: &at(&dir, "*"), before: Some("x();"), after: "y();", ..Default::default() },
+        );
         // Then: not_found に飛ばした拡張子ごとの件数が付く
         assert_eq!(reports[0]["error"], "not_found");
-        assert_eq!(reports[0]["skipped"], serde_json::json!({"reason": "unsupported_language", "extensions": {"json": 1}}));
+        assert_eq!(
+            reports[0]["skipped"],
+            serde_json::json!({"reason": "unsupported_language", "extensions": {"json": 1}})
+        );
     }
 
     #[test]
@@ -564,7 +624,10 @@ mod tests {
         // Given: 呼び出しのある Rust のファイルと JSON のファイル
         let dir = dir_with(&[("a.rs", "fn a() { x(); }\n"), ("b.json", "{}")]);
         // When: 両方に一致する glob で書く
-        let reports = write_in(&dir, WriteRequest { path: &at(&dir, "*"), before: Some("x();"), after: "y();", ..Default::default() });
+        let reports = write_in(
+            &dir,
+            WriteRequest { path: &at(&dir, "*"), before: Some("x();"), after: "y();", ..Default::default() },
+        );
         // Then: 報告の最後に、飛ばした拡張子ごとの件数が付く
         let last = serde_json::json!({"skipped": {"reason": "unsupported_language", "extensions": {"json": 1}}});
         assert_eq!(reports.last(), Some(&last));

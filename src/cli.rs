@@ -121,7 +121,8 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages)
                 [before, after] => (Some(before.clone()), after.clone()),
                 _ => return usage("expected [BEFORE] <AFTER>".into()),
             };
-            let req = WriteRequest { path, scope, before: before.as_deref(), after: &after, all_matches, place: mode.into() };
+            let req =
+                WriteRequest { path, scope, before: before.as_deref(), after: &after, all_matches, place: mode.into() };
             match command::write(&langs, &req) {
                 Ok(reports) => {
                     let code = if reports.iter().any(|r| r["ok"] == false) { 1 } else { 0 };

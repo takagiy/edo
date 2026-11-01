@@ -40,10 +40,7 @@ pub fn parse_lines(spec: &str) -> Option<(usize, usize)> {
 pub fn line_span(src: &str, first: usize, last: usize) -> Option<Range<usize>> {
     let mut starts = std::iter::once(0).chain(src.match_indices('\n').map(|(i, _)| i + 1));
     let start = starts.nth(first.checked_sub(1)?)?;
-    let end = src[start..]
-        .match_indices('\n')
-        .nth(last.checked_sub(first)?)
-        .map_or(src.len(), |(i, _)| start + i);
+    let end = src[start..].match_indices('\n').nth(last.checked_sub(first)?).map_or(src.len(), |(i, _)| start + i);
     let end = if src[..end].ends_with('\r') { end - 1 } else { end };
     Some(start..end)
 }

@@ -186,7 +186,11 @@ mod tests {
         (dir, path.to_string_lossy().replace('\\', "/"))
     }
 
-    async fn tool(client: &rmcp::service::RunningService<rmcp::RoleClient, Client>, name: &str, args: Value) -> (String, bool) {
+    async fn tool(
+        client: &rmcp::service::RunningService<rmcp::RoleClient, Client>,
+        name: &str,
+        args: Value,
+    ) -> (String, bool) {
         let params = CallToolRequestParams::new(name.to_string()).with_arguments(args.as_object().unwrap().clone());
         let result = client.call_tool(params).await.unwrap();
         let text = result.content.first().and_then(|c| c.as_text()).map(|t| t.text.clone()).unwrap_or_default();

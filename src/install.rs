@@ -29,10 +29,12 @@ pub fn packages_in(root: &Path) -> Result<Vec<(String, PathBuf)>, Error> {
     for entry in ignore::WalkBuilder::new(root).hidden(false).build().filter_map(Result::ok) {
         let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
         let rel = rel.to_string_lossy().replace('\\', "/");
-        if entry.path().join("edo-package.toml").is_file() && globs.is_match(&rel)
-            && let Some(p) = manifest(entry.path())?.package {
-                out.push((p.name, entry.path().to_path_buf()));
-            }
+        if entry.path().join("edo-package.toml").is_file()
+            && globs.is_match(&rel)
+            && let Some(p) = manifest(entry.path())?.package
+        {
+            out.push((p.name, entry.path().to_path_buf()));
+        }
     }
     out.sort();
     Ok(out)
@@ -60,9 +62,9 @@ pub fn store_dir() -> PathBuf {
 pub fn fetch_github(registry: &str) -> Result<Fetched, Error> {
     let dir = tempfile::tempdir().map_err(|e| Error::new("io", e.to_string()))?;
     let tmp = dir.path();
-    let repo = registry
-        .strip_prefix("github.com/")
-        .ok_or_else(|| Error::new("unsupported_registry", format!("{registry}: only github.com registries are supported")))?;
+    let repo = registry.strip_prefix("github.com/").ok_or_else(|| {
+        Error::new("unsupported_registry", format!("{registry}: only github.com registries are supported"))
+    })?;
     let net = |e: ureq::Error| Error::new("network", format!("{registry}: {e}"));
     let response = ureq::get(&format!("https://api.github.com/repos/{repo}/tarball"))
         .header("User-Agent", "edo")
@@ -82,7 +84,8 @@ pub fn fetch_github(registry: &str) -> Result<Fetched, Error> {
 
 /// Installs one package into `store` (`<config>/edo/packages`) and reports the outcome.
 pub fn install(store: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched, Error>) -> Value {
-    try_install(store, spec, fetch).unwrap_or_else(|e| json!({"ok": false, "spec": spec, "error": e.code, "message": e.message}))
+    try_install(store, spec, fetch)
+        .unwrap_or_else(|e| json!({"ok": false, "spec": spec, "error": e.code, "message": e.message}))
 }
 
 fn try_install(store: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched, Error>) -> Result<Value, Error> {
@@ -135,7 +138,10 @@ pub fn remove(store: &Path, spec: &str) -> Value {
     let parsed = parse_spec(spec);
     let name = parsed.name.as_deref().unwrap_or("");
     let found: Vec<Installed> = match installed(store) {
-        Ok(all) => all.into_iter().filter(|p| p.name == name && parsed.registry.as_ref().is_none_or(|r| *r == p.registry)).collect(),
+        Ok(all) => all
+            .into_iter()
+            .filter(|p| p.name == name && parsed.registry.as_ref().is_none_or(|r| *r == p.registry))
+            .collect(),
         Err(e) => return json!({"ok": false, "spec": spec, "error": e.code, "message": e.message}),
     };
     match found.as_slice() {
@@ -328,7 +334,8 @@ mod tests {
 
     /// A fetcher that serves registries from local directories.
     fn local(repos: Vec<(&'static str, &tempfile::TempDir)>) -> impl Fn(&str) -> Result<Fetched, Error> {
-        let repos: Vec<(String, PathBuf)> = repos.into_iter().map(|(id, d)| (id.to_string(), d.path().to_path_buf())).collect();
+        let repos: Vec<(String, PathBuf)> =
+            repos.into_iter().map(|(id, d)| (id.to_string(), d.path().to_path_buf())).collect();
         move |id: &str| {
             let (_, dir) = repos.iter().find(|(r, _)| r == id).ok_or_else(|| Error::new("not_found", id))?;
             Ok(Fetched { dir: dir.clone(), source: format!("{id}@abc"), tmp: None })

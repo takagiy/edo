@@ -1,13 +1,13 @@
+pub mod cli;
+pub mod command;
+pub mod edit;
+pub mod install;
 pub mod language;
+pub mod matcher;
+pub mod mcp;
 pub mod outline;
 pub mod scope;
 pub mod view;
-pub mod matcher;
-pub mod edit;
-pub mod command;
-pub mod cli;
-pub mod mcp;
-pub mod install;
 
 use std::collections::BTreeMap;
 
