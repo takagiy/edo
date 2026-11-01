@@ -52,10 +52,6 @@ fn stamp(path: &str) -> Option<Stamp> {
     Some((meta.modified().ok(), meta.len()))
 }
 
-fn is_line_range(scope: &str) -> bool {
-    !scope.is_empty() && scope.chars().all(|c| c.is_ascii_digit() || c == '-')
-}
-
 #[derive(Clone)]
 pub struct Server {
     langs: Arc<Languages>,
@@ -123,7 +119,7 @@ impl Server {
             all_matches: p.all_matches,
             place,
         };
-        let stale = p.scope.as_deref().is_some_and(is_line_range) && self.is_stale(&p.path);
+        let stale = p.scope.as_deref().and_then(crate::scope::parse_lines).is_some() && self.is_stale(&p.path);
         match command::write(&self.langs, &req) {
             Ok(mut reports) => {
                 for r in reports.iter_mut().filter(|r| r["ok"] == true) {

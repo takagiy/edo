@@ -103,26 +103,27 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages)
         }
         Cmd::Write { insert_after, insert_before, all_matches, target, texts } => {
             let (path, scope) = split_target(&target);
-            let (before, after) = match texts.as_slice() {
+            // `-` stands for stdin, which holds one text, or two when it has conflict markers.
+            let mut expanded = vec![];
+            for text in texts {
+                if text != "-" {
+                    expanded.push(text);
+                    continue;
+                }
+                let input = stdin();
+                // An empty stdin is a forgotten pipe, not a request to delete everything.
+                if input.is_empty() {
+                    return usage("stdin is empty".into());
+                }
+                match split_conflict(&input) {
+                    Some((b, a)) => expanded.extend([b, a]),
+                    None => expanded.push(input),
+                }
+            }
+            let (before, after) = match expanded.as_slice() {
                 [after] => (None, after.clone()),
                 [before, after] => (Some(before.clone()), after.clone()),
                 _ => return usage("expected [BEFORE] <AFTER>".into()),
-            };
-            let mut stdin = || Some(stdin()).filter(|s| !s.is_empty());
-            let (before, after) = match (before, after.as_str()) {
-                (None, "-") => {
-                    // An empty stdin is a forgotten pipe, not a request to delete everything.
-                    let Some(input) = stdin() else { return usage("stdin is empty".into()) };
-                    match split_conflict(&input) {
-                        Some((b, a)) => (Some(b), a),
-                        None => (None, input),
-                    }
-                }
-                (before, "-") => match stdin() {
-                    Some(input) => (before, input),
-                    None => return usage("stdin is empty".into()),
-                },
-                (before, _) => (before, after),
             };
             let place = match (insert_after, insert_before) {
                 (true, true) => return usage("--insert-after and --insert-before cannot be used together".into()),
@@ -279,6 +280,17 @@ mod tests {
         let (out, code) = edo(&["write", "a.rs", "b.rs", "x", "y"], "");
         // Then: usage エラーになる
         assert!(out.contains("\"usage\"") && code != 0, "{out}");
+    }
+
+    #[test]
+    fn before_with_conflict_marker_stdin_is_usage_error() {
+        // Given: 呼び出しのある関数
+        let (_dir, path) = file("fn a() {\n    x();\n}\n");
+        // When: before を渡したうえで、コンフリクトマーカー付きの標準入力を流す
+        let (out, code) = edo(&["write", &path, "x();", "-"], "<<<<<<< before\nx();\n=======\ny();\n>>>>>>> after\n");
+        // Then: usage エラーになり、ファイルは変わらない
+        assert!(out.contains("\"usage\"") && code != 0, "{out}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    x();\n}\n");
     }
 
     #[test]

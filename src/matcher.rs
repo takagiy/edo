@@ -6,25 +6,33 @@ use streaming_iterator::StreamingIterator;
 
 use crate::language::Language;
 
-/// How a leaf of the file may differ from `before`, declared with `@match.*` captures.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Rule {
+/// How a leaf's text compares with `before` (`@match.collapse`, `@match.quote`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Compare {
+    #[default]
     Exact,
     /// Whitespace runs inside the leaf compare as one.
     Collapse,
-    /// The leaf may be missing from `before`.
-    Optional,
-    /// The leaf may be missing from `before` when a closing bracket follows it.
-    Trailing,
     /// The leaf may be any of these quotes in `before`.
-    Quote(Vec<String>),
+    AnyOf(Vec<String>),
+}
+
+/// When a leaf may be missing from `before` (`@match.optional`, `@match.trailing`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Skip {
+    #[default]
+    Never,
+    Always,
+    /// Only when a closing bracket follows it.
+    BeforeClose,
 }
 
 /// A token of the file that `before` is matched against.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Leaf {
     pub range: Range<usize>,
-    pub rule: Rule,
+    pub compare: Compare,
+    pub skip: Skip,
 }
 
 /// Lists the file's tokens in order. A node captured by `@match.*` is one token even if it has children.
@@ -37,7 +45,7 @@ pub fn leaves(lang: &Language, tree: &tree_sitter::Tree, src: &str) -> Vec<Leaf>
         let rule = rules.get(&node.id());
         if rule.is_some() || node.child_count() == 0 {
             if !node.byte_range().is_empty() {
-                out.push(Leaf { range: node.byte_range(), rule: rule.cloned().unwrap_or(Rule::Exact) });
+                out.push(Leaf { range: node.byte_range(), ..rule.cloned().unwrap_or_default() });
             }
         } else if cursor.goto_first_child() {
             continue;
@@ -50,7 +58,8 @@ pub fn leaves(lang: &Language, tree: &tree_sitter::Tree, src: &str) -> Vec<Leaf>
     }
 }
 
-fn rules(lang: &Language, tree: &tree_sitter::Tree, src: &str) -> HashMap<usize, Rule> {
+/// The rules for each captured node, as a `Leaf` without its range; captures on one node combine.
+fn rules(lang: &Language, tree: &tree_sitter::Tree, src: &str) -> HashMap<usize, Leaf> {
     let names = lang.query.capture_names();
     let mut out = HashMap::new();
     let mut cursor = tree_sitter::QueryCursor::new();
@@ -64,14 +73,18 @@ fn rules(lang: &Language, tree: &tree_sitter::Tree, src: &str) -> HashMap<usize,
                 let alt = prop.and_then(|p| p.value.as_deref()).unwrap_or("\" '");
                 alt.split_whitespace().map(String::from).collect()
             };
-            let rule = match names[c.index as usize] {
-                "match.quote" => Rule::Quote(alt()),
-                "match.collapse" => Rule::Collapse,
-                "match.optional" => Rule::Optional,
-                "match.trailing" => Rule::Trailing,
-                _ => continue,
-            };
-            out.insert(c.node.id(), rule);
+            let name = names[c.index as usize];
+            if !name.starts_with("match.") {
+                continue;
+            }
+            let rule: &mut Leaf = out.entry(c.node.id()).or_default();
+            match name {
+                "match.quote" => rule.compare = Compare::AnyOf(alt()),
+                "match.collapse" => rule.compare = Compare::Collapse,
+                "match.optional" => rule.skip = Skip::Always,
+                "match.trailing" => rule.skip = Skip::BeforeClose,
+                _ => {}
+            }
         }
     }
     out
@@ -89,9 +102,16 @@ pub struct Closest {
     pub found: String,
 }
 
+/// Every non-overlapping match, and where `before` came closest when there is none.
+#[derive(Debug, Default)]
+pub struct Found {
+    pub matches: Vec<Range<usize>>,
+    pub closest: Option<Closest>,
+}
+
 /// Finds every non-overlapping match of `before` inside `scope`.
-pub fn find(src: &str, leaves: &[Leaf], scope: Range<usize>, before: &str) -> Result<Vec<Range<usize>>, Option<Closest>> {
-    let mut optional: Vec<&str> = leaves.iter().filter(|l| l.rule == Rule::Optional).map(|l| &src[l.range.clone()]).collect();
+pub fn find(src: &str, leaves: &[Leaf], scope: Range<usize>, before: &str) -> Found {
+    let mut optional: Vec<&str> = leaves.iter().filter(|l| l.skip == Skip::Always).map(|l| &src[l.range.clone()]).collect();
     optional.sort();
     optional.dedup();
     let leaves: Vec<&Leaf> = leaves.iter().filter(|l| scope.start <= l.range.start && l.range.end <= scope.end).collect();
@@ -106,15 +126,13 @@ pub fn find(src: &str, leaves: &[Leaf], scope: Range<usize>, before: &str) -> Re
             found.push(range);
         }
     }
-    if !found.is_empty() {
-        return Ok(found);
-    }
-    Err(m.best.get().map(|p| Closest {
+    let closest = m.best.get().filter(|_| found.is_empty()).map(|p| Closest {
         range: p.start..p.matched_end,
         mismatch: p.mismatch,
         expected: line_at(before, p.consumed).to_string(),
         found: line_at(src, p.mismatch).to_string(),
-    }))
+    });
+    Found { matches: found, closest }
 }
 
 fn line_at(text: &str, byte: usize) -> &str {
@@ -240,15 +258,15 @@ impl Matcher<'_> {
         if end.is_some() && !spaced && ends_with_word(self.text(i - 1)) && starts_with_word(text) {
             return None;
         }
-        let consumed = match leaf.rule {
-            Rule::Exact | Rule::Optional | Rule::Trailing => rest.starts_with(text).then_some(text.len()),
-            Rule::Collapse => collapsed_prefix(text, rest),
-            Rule::Quote(ref alt) => alt.iter().chain([&text.to_string()]).find(|q| rest.starts_with(q.as_str())).map(|q| q.len()),
+        let consumed = match &leaf.compare {
+            Compare::Exact => rest.starts_with(text).then_some(text.len()),
+            Compare::Collapse => collapsed_prefix(text, rest),
+            Compare::AnyOf(alt) => alt.iter().map(String::as_str).chain([text]).find(|q| rest.starts_with(q)).map(str::len),
         };
-        let skippable = match leaf.rule {
-            Rule::Optional => true,
-            Rule::Trailing => self.leaves.get(i + 1).is_some_and(|_| matches!(self.text(i + 1), ")" | "]" | "}")),
-            _ => false,
+        let skippable = match leaf.skip {
+            Skip::Never => false,
+            Skip::Always => true,
+            Skip::BeforeClose => self.leaves.get(i + 1).is_some_and(|_| matches!(self.text(i + 1), ")" | "]" | "}")),
         };
         consumed
             .and_then(|n| self.at(i + 1, b + n, Some(leaf.range.end)))
@@ -271,7 +289,7 @@ mod tests {
     fn find_in(lang: &Language, src: &str, before: &str) -> Vec<String> {
         let tree = lang.parser().parse(src, None).unwrap();
         let leaves = leaves(lang, &tree, src);
-        find(src, &leaves, 0..src.len(), before).unwrap_or_default().iter().map(|r| src[r.clone()].to_string()).collect()
+        find(src, &leaves, 0..src.len(), before).matches.iter().map(|r| src[r.clone()].to_string()).collect()
     }
 
     #[test]
@@ -423,7 +441,7 @@ mod tests {
         let tree = lang.parser().parse(src, None).unwrap();
         let leaves = leaves(&lang, &tree, src);
         // When: 2 つ目の関数の範囲をスコープにして照合する
-        let found = find(src, &leaves, 16..src.len(), "x();").unwrap();
+        let found = find(src, &leaves, 16..src.len(), "x();").matches;
         // Then: スコープの中の一致だけが返る
         assert_eq!(found, vec![25..29]);
     }
@@ -442,7 +460,7 @@ mod tests {
         let lang = rust("");
         let tree = lang.parser().parse(src, None).unwrap();
         let leaves = leaves(&lang, &tree, src);
-        find(src, &leaves, 0..src.len(), before).unwrap_err().unwrap()
+        find(src, &leaves, 0..src.len(), before).closest.unwrap()
     }
 
     #[test]
@@ -479,7 +497,7 @@ mod tests {
         let start = std::time::Instant::now();
         let found = find(&src, &leaves, 0..src.len(), &before);
         // Then: すぐに一致なしで終わる
-        assert!(found.is_err());
+        assert!(found.matches.is_empty());
         assert!(start.elapsed() < std::time::Duration::from_secs(1), "took {:?}", start.elapsed());
     }
 }

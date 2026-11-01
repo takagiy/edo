@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use crate::language::Language;
-use crate::matcher::Rule;
+use crate::matcher::{Compare, Skip};
 
 /// Where `after` goes relative to the target range.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -73,44 +73,62 @@ pub fn edit(lang: &Language, src: &str, range: Range<usize>, after: &str, place:
     let written = replaced.start..replaced.start + text.len() + replaced.len() - src.len();
     let first = text[..written.start].matches('\n').count() + 1;
     let last = text[..written.end].trim_end_matches(['\n', '\r']).matches('\n').count() + 1;
-    let lines =if written.is_empty() { (first, first - 1) } else { (first, last.max(first)) };
+    let lines = if written.is_empty() { (first, first - 1) } else { (first, last.max(first)) };
     Outcome { text, lines, new_syntax_errors }
 }
 
+/// Number of lines that end at or before byte `pos`, which is a line boundary or the end of `src`.
+fn lines_before(src: &str, pos: usize) -> usize {
+    src[..pos].split_inclusive('\n').count()
+}
+
 /// Returns the edited text and the range of `src` that it replaced.
+///
+/// A target covering whole lines (and every insertion) is edited as lines: the file is its lines plus
+/// whether it ends with a newline, and `after` becomes zero or more lines, so deleting, inserting and
+/// replacing are the same splice. Any other target is a span of text inside a line.
 fn apply(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Place) -> (String, Range<usize>) {
-    if place == Place::Replace && after.trim().is_empty() && let Some(lines) = whole_lines(src, &range) {
-        return (format!("{}{}", &src[..lines.start], &src[lines.end..]), lines);
-    }
     let base = indent_of_line_at(src, range.start);
     let nl = if src.contains("\r\n") { "\r\n" } else { "\n" };
-    // An insertion is whole lines next to the target, starting at the target's indentation.
-    let (range, prefix, suffix) = match place {
-        Place::Replace => (range, String::new(), ""),
-        Place::InsertBefore => {
-            let pos = src[..range.start].rfind('\n').map_or(0, |i| i + 1);
-            (pos..pos, base.to_string(), nl)
-        }
-        Place::InsertAfter => match src[range.end..].find('\n') {
-            Some(i) => (range.end + i + 1..range.end + i + 1, base.to_string(), nl),
-            None => (src.len()..src.len(), format!("{nl}{base}"), ""),
-        },
-    };
     let unit = indent_unit(&indents(src.lines()));
     let after = after.replace("\r\n", "\n");
-    // A leading blank line stays blank instead of carrying the indentation.
-    let wrap = |s: String| {
-        let prefix = if s.starts_with('\n') { prefix.trim_end_matches([' ', '\t']) } else { &prefix };
-        format!("{prefix}{}{suffix}", s.replace('\n', nl))
+    let line_start = |b: usize| src[..b].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = |b: usize| src[b..].find('\n').map_or(src.len(), |i| b + i + 1);
+    let lines = match place {
+        Place::InsertBefore => Some(line_start(range.start)..line_start(range.start)),
+        Place::InsertAfter => Some(line_end(range.end)..line_end(range.end)),
+        Place::Replace => whole_lines(src, &range),
     };
-    let splice = |after: &str| format!("{}{}{}", &src[..range.start], after, &src[range.end..]);
+    // Builds the text with `after` reindented (keeping `protected` lines) and where `after` landed in it.
+    let build = |protected: &[usize]| -> (String, Range<usize>) {
+        let body = reindent(&after, base, unit.clone(), protected);
+        let Some(span) = &lines else {
+            let start = range.start;
+            let body = body.replace('\n', nl);
+            return (format!("{}{body}{}", &src[..start], &src[range.end..]), start..start + body.len());
+        };
+        let mut new: Vec<String> = if after.is_empty() { vec![] } else { body.split('\n').map(String::from).collect() };
+        if after.ends_with('\n') {
+            new.pop();
+        }
+        if let Some(first) = new.first_mut().filter(|l| !l.is_empty()) {
+            first.insert_str(0, base);
+        }
+        let mut all: Vec<String> = src.lines().map(String::from).collect();
+        let (a, b) = (lines_before(src, span.start), lines_before(src, span.end));
+        let start: usize = all[..a].iter().map(|l| l.len() + nl.len()).sum();
+        let len = new.join(nl).len();
+        all.splice(a..b, new);
+        let ends_with_newline = src.is_empty() || src.ends_with('\n');
+        let tail = if ends_with_newline && !all.is_empty() { nl } else { "" };
+        (all.join(nl) + tail, start..start + len)
+    };
     // Embed once with plain reindenting, then parse the whole file to find lines inside literals.
-    let draft = wrap(reindent(&after, base, unit.clone(), &[]));
-    let first = range.start + prefix.len();
-    let protected = literal_lines(lang, &splice(&draft), first, draft.split('\n').count());
-    let after = wrap(reindent(&after, base, unit, &protected));
-    let text = drop_seam_duplicates(lang, splice(&after), range.start..range.start + after.len());
-    (text, range)
+    let (draft, at) = build(&[]);
+    let protected = literal_lines(lang, &draft, at.start, draft[at.clone()].split('\n').count());
+    let (text, at) = build(&protected);
+    let replaced = lines.unwrap_or(range);
+    (drop_seam_duplicates(lang, text, at), replaced)
 }
 
 /// Removes the file's copy of an optional leaf (such as `;`) that `after` already brings to a seam.
@@ -119,8 +137,8 @@ fn drop_seam_duplicates(lang: &Language, mut text: String, inserted: Range<usize
     let leaves = crate::matcher::leaves(lang, &tree, &text);
     let inside = |l: &&crate::matcher::Leaf| inserted.start <= l.range.start && l.range.end <= inserted.end;
     let twins = |a: &crate::matcher::Leaf, b: &crate::matcher::Leaf| {
-        a.rule == Rule::Optional
-            && b.rule == Rule::Optional
+        a.skip == Skip::Always
+            && b.skip == Skip::Always
             && text[a.range.clone()] == text[b.range.clone()]
             && text[a.range.end..b.range.start].trim().is_empty()
     };
@@ -155,7 +173,7 @@ fn literal_lines(lang: &Language, text: &str, start: usize, lines: usize) -> Vec
     let mut out = vec![];
     for k in 1..lines {
         pos += text[pos..].find('\n').map_or(0, |i| i + 1);
-        let inside = leaves.iter().any(|l| l.range.start < pos && pos < l.range.end && l.rule != Rule::Collapse);
+        let inside = leaves.iter().any(|l| l.range.start < pos && pos < l.range.end && l.compare != Compare::Collapse);
         if inside {
             out.push(k);
         }
@@ -371,6 +389,16 @@ mod tests {
         let out = insert(src, "fn a() {\n        x();\n    }", "fn b() {\n    y();\n}", Place::InsertAfter);
         // Then: 挿入した行は a の先頭行と同じ深さになる
         assert_eq!(out, "impl A {\n    fn a() {\n        x();\n    }\n    fn b() {\n        y();\n    }\n}\n");
+    }
+
+    #[test]
+    fn insert_after_last_line_without_newline() {
+        // Given: 最後の行に改行がないファイル
+        let src = "fn a() {}\nfn b() {}";
+        // When: 最後の関数の後ろに挿入する
+        let out = insert(src, "fn b() {}", "fn c() {}", Place::InsertAfter);
+        // Then: 次の行に入り、ファイル末尾に改行がない状態は保たれる
+        assert_eq!(out, "fn a() {}\nfn b() {}\nfn c() {}");
     }
 
     #[test]

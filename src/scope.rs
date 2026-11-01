@@ -28,7 +28,8 @@ pub fn resolve(spec: &str, defs: &[Definition], src: &str) -> Result<Vec<Hit>, E
     Ok(found.into_iter().map(|i| Hit { range: defs[i].range.clone(), def: Some(i) }).collect())
 }
 
-fn parse_lines(spec: &str) -> Option<(usize, usize)> {
+/// `N` or `N-M`, the scopes that name lines rather than definitions.
+pub fn parse_lines(spec: &str) -> Option<(usize, usize)> {
     match spec.split_once('-') {
         Some((n, m)) => Some((n.parse().ok()?, m.parse().ok()?)),
         None => spec.parse().ok().map(|n| (n, n)),

@@ -16,12 +16,20 @@ struct Source<'a> {
     defs: Vec<Definition>,
 }
 
+fn language<'a>(langs: &'a Languages, path: &Path) -> Result<&'a Language, Error> {
+    langs.for_path(path).ok_or_else(|| Error::new("unsupported_language", path.display().to_string()))
+}
+
+impl<'a> Source<'a> {
+    fn new(lang: &'a Language, text: String) -> Self {
+        let tree = lang.parser().parse(&text, None).expect("parse");
+        let defs = outline(lang, &tree, &text);
+        Source { lang, text, defs }
+    }
+}
+
 fn open<'a>(langs: &'a Languages, path: &Path) -> Result<Source<'a>, Error> {
-    let lang = langs.for_path(path).ok_or_else(|| Error::new("unsupported_language", path.display().to_string()))?;
-    let text = read_text(path)?;
-    let tree = lang.parser().parse(&text, None).expect("parse");
-    let defs = outline(lang, &tree, &text);
-    Ok(Source { lang, text, defs })
+    Ok(Source::new(language(langs, path)?, read_text(path)?))
 }
 
 /// Reads a UTF-8 text file; rewriting anything else could corrupt it.
@@ -146,16 +154,10 @@ pub fn write(langs: &Languages, req: &WriteRequest) -> Result<Vec<Value>, Error>
 
 fn write_one(langs: &Languages, path: &str, req: &WriteRequest) -> Result<Value, Error> {
     let file = Path::new(path);
-    if !file.exists() && req.scope.is_none() && req.before.is_none() {
-        langs.for_path(file).ok_or_else(|| Error::new("unsupported_language", path))?;
-        let io = |e: std::io::Error| Error::new("io", format!("{path}: {e}"));
-        if let Some(dir) = file.parent() {
-            std::fs::create_dir_all(dir).map_err(io)?;
-        }
-        std::fs::write(file, req.after).map_err(io)?;
-        return Ok(json!({"ok": true, "file": path, "replaced": [[1, req.after.lines().count()]]}));
-    }
-    let src = open(langs, file)?;
+    // Writing a whole file that does not exist yet is writing over an empty one.
+    let creating = !file.exists() && req.scope.is_none() && req.before.is_none();
+    let lang = language(langs, file)?;
+    let src = Source::new(lang, if creating { String::new() } else { read_text(file)? });
     let tree = src.lang.parser().parse(&src.text, None).expect("parse");
     let leaves = matcher::leaves(src.lang, &tree, &src.text);
     let regions = match req.scope {
@@ -166,12 +168,10 @@ fn write_one(langs: &Languages, path: &str, req: &WriteRequest) -> Result<Value,
     let targets: Vec<Hit> = match req.before {
         Some(before) => regions
             .iter()
-            .flat_map(|r| match matcher::find(&src.text, &leaves, r.range.clone(), before) {
-                Ok(found) => found,
-                Err(c) => {
-                    closest = closest.take().or(c);
-                    vec![]
-                }
+            .flat_map(|r| {
+                let found = matcher::find(&src.text, &leaves, r.range.clone(), before);
+                closest = closest.take().or(found.closest);
+                found.matches
             })
             .map(|range| Hit { range, def: None })
             .collect(),
@@ -209,7 +209,9 @@ fn write_one(langs: &Languages, path: &str, req: &WriteRequest) -> Result<Value,
         errors.extend(out.new_syntax_errors.into_iter().map(|e| json!({"line": at(e.line), "text": e.text})));
         shift += grown;
     }
-    std::fs::write(path, &text).map_err(|e| Error::new("io", format!("{path}: {e}")))?;
+    let io = |e: std::io::Error| Error::new("io", format!("{path}: {e}"));
+    std::fs::create_dir_all(file.parent().unwrap_or(Path::new("."))).map_err(io)?;
+    std::fs::write(path, &text).map_err(io)?;
     let mut report = json!({"ok": true, "file": path, "replaced": replaced});
     if !errors.is_empty() {
         report["warnings"] = json!({"new_syntax_errors": errors});

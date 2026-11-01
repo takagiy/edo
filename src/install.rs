@@ -87,7 +87,8 @@ pub fn install(store: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched,
 
 fn try_install(store: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched, Error>) -> Result<Value, Error> {
     let spec = parse_spec(spec);
-    let fetched = fetch(&spec.registry)?;
+    let registry = spec.registry.as_deref().unwrap_or(DEFAULT_REGISTRY);
+    let fetched = fetch(registry)?;
     let packages = packages_in(&fetched.dir)?;
     let (name, dir) = match &spec.name {
         Some(n) => packages.into_iter().find(|(p, _)| p == n),
@@ -96,13 +97,13 @@ fn try_install(store: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched,
             [(_, dir)] if *dir == fetched.dir => packages.into_iter().next(),
             _ => {
                 let names: Vec<&str> = packages.iter().map(|(p, _)| p.as_str()).collect();
-                let message = format!("{} has several packages; name one of: {}", spec.registry, names.join(", "));
+                let message = format!("{registry} has several packages; name one of: {}", names.join(", "));
                 return Err(Error::new("name_required", message));
             }
         },
     }
-    .ok_or_else(|| Error::new("not_found", format!("no such package in {}", spec.registry)))?;
-    let target = store.join(&spec.registry).join(&name);
+    .ok_or_else(|| Error::new("not_found", format!("no such package in {registry}")))?;
+    let target = store.join(registry).join(&name);
     let extensions = manifest(&dir)?.package.map(|p| p.extensions).unwrap_or_default();
     for other in installed(store)?.iter().filter(|p| p.dir != target) {
         if let Some(ext) = other.extensions.iter().find(|e| extensions.contains(e)) {
@@ -118,7 +119,7 @@ fn try_install(store: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched,
     }
     copy_dir(&dir, &target).map_err(io)?;
     std::fs::write(&source_file, &fetched.source).map_err(io)?;
-    let mut report = json!({"ok": true, "name": name, "registry": spec.registry, "source": fetched.source});
+    let mut report = json!({"ok": true, "name": name, "registry": registry, "source": fetched.source});
     if let Some(previous) = previous {
         report["replaced_source"] = json!(previous);
     }
@@ -134,7 +135,7 @@ pub fn remove(store: &Path, spec: &str) -> Value {
     let parsed = parse_spec(spec);
     let name = parsed.name.as_deref().unwrap_or("");
     let found: Vec<Installed> = match installed(store) {
-        Ok(all) => all.into_iter().filter(|p| p.name == name && (!spec.contains('/') || p.registry == parsed.registry)).collect(),
+        Ok(all) => all.into_iter().filter(|p| p.name == name && parsed.registry.as_ref().is_none_or(|r| *r == p.registry)).collect(),
         Err(e) => return json!({"ok": false, "spec": spec, "error": e.code, "message": e.message}),
     };
     match found.as_slice() {
@@ -217,16 +218,17 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 /// The registry that `edo lang install <name>` looks in.
 pub const DEFAULT_REGISTRY: &str = "github.com/takagiy/edo";
 
-/// A package request: the registry id (such as `github.com/owner/repo`) and the package name if given.
+/// A package request: the registry id (such as `github.com/owner/repo`) if given, and the package name if given.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spec {
-    pub registry: String,
+    /// `None` when only a name was given: install looks in the default registry, remove in any.
+    pub registry: Option<String>,
     pub name: Option<String>,
 }
 
 pub fn parse_spec(spec: &str) -> Spec {
     if !spec.contains('/') {
-        return Spec { registry: DEFAULT_REGISTRY.into(), name: Some(spec.into()) };
+        return Spec { registry: None, name: Some(spec.into()) };
     }
     // The name follows the last `:`, unless that `:` belongs to the URL scheme.
     let (repo, name) = match spec.rsplit_once(':') {
@@ -236,7 +238,7 @@ pub fn parse_spec(spec: &str) -> Spec {
     let repo = repo.split_once("://").map_or(repo, |(_, rest)| rest).trim_end_matches('/').trim_end_matches(".git");
     let host = repo.split('/').next().unwrap_or("");
     let registry = if host.contains('.') { repo.to_string() } else { format!("github.com/{repo}") };
-    Spec { registry, name }
+    Spec { registry: Some(registry), name }
 }
 
 #[cfg(test)]
@@ -244,13 +246,19 @@ mod tests {
     use super::*;
 
     fn spec(registry: &str, name: Option<&str>) -> Spec {
-        Spec { registry: registry.into(), name: name.map(String::from) }
+        Spec { registry: Some(registry.into()), name: name.map(String::from) }
     }
 
     #[test]
     fn bare_name_looks_in_default_registry() {
-        // Given / When: 名前だけを解析する / Then: デフォルトのレジストリの、その名前のパッケージになる
-        assert_eq!(parse_spec("kotlin"), spec(DEFAULT_REGISTRY, Some("kotlin")));
+        // Given: デフォルトのレジストリにあるパッケージ
+        let repo = langs_repo();
+        let store = tempfile::tempdir().unwrap();
+        // When: 名前だけを指定してインストールする
+        let report = install(store.path(), "myrust", &local(vec![(DEFAULT_REGISTRY, &repo)]));
+        // Then: デフォルトのレジストリから探して入る
+        assert_eq!(report["ok"], true, "{report}");
+        assert!(store.path().join(DEFAULT_REGISTRY).join("myrust/edo-package.toml").is_file());
     }
 
     #[test]
