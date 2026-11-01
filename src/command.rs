@@ -124,12 +124,12 @@ fn skipped_line(skipped: &Skipped) -> Value {
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
-    /// Replace each match with <AFTER>.
+    /// Replace each match with `after`.
     #[default]
     ReplaceMatches,
-    /// Put <AFTER> on new lines before each match.
+    /// Put `after` on new lines before each match.
     InsertBeforeMatches,
-    /// Put <AFTER> on new lines after each match.
+    /// Put `after` on new lines after each match.
     InsertAfterMatches,
 }
 

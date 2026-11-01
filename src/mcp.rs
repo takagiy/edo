@@ -25,14 +25,14 @@ pub struct WriteParams {
     pub path: String,
     /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M).
     pub scope: Option<String>,
-    /// Code to find; omit to target the whole scope (or the whole file).
+    /// Code to find. Omit to target the whole `scope` (or the whole file).
     pub before: Option<String>,
-    /// Replacement code. Empty deletes.
+    /// Code to write. Empty deletes the target.
     pub after: String,
-    /// Replace every match instead of failing as ambiguous.
+    /// Edit every match instead of failing as ambiguous.
     #[serde(default)]
     pub all_matches: bool,
-    /// What to do with each match (or the whole target without `before`). Defaults to replace-matches.
+    /// What to do with each match (or with the whole target when `before` is omitted).
     #[serde(default)]
     pub mode: Mode,
 }
@@ -71,13 +71,9 @@ impl Server {
     }
 
     #[tool(description = "Read a source file with line numbers (`N<TAB>line`). Function and method bodies are \
-        elided to save tokens: lines fully inside a body are omitted (watch for gaps in the line numbers) and a body \
-        sharing a line with other code is shown as `...`. Docs and signatures stay visible. Pass `scope` to see more: \
-        an identifier such as `Foo.bar` or `Foo::bar` (a function shows its full body; a class shows its members with \
-        their bodies elided), or a line range `N` / `N-M` (shown in full). `path` may be a glob such as \
-        `src/**/*.kt`; each file then starts with its path on its own line, and files without a language package \
-        are skipped and counted by extension on a last `{\"skipped\":...}` line. A single file without a \
-        language package is an `unsupported_language` error.")]
+        hidden: they leave gaps in the line numbers, or show as `...` when they share a line with other code.\n\n\
+        To see more, pass `scope`: an identifier such as `Foo.bar` or `Foo::bar` (a function shows in full; a class \
+        shows its members with bodies hidden), or a line range `N` or `N-M` (shown in full). `path` may be a glob.")]
     fn read(&self, Parameters(p): Parameters<ReadParams>) -> CallToolResult {
         match command::read(&self.langs, &p.path, p.scope.as_deref()) {
             Ok(text) => {
@@ -88,17 +84,14 @@ impl Server {
         }
     }
 
-    #[tool(description = "Edit a source file. `before` is matched against the file's syntax tree, ignoring \
-        indentation, line breaks and spacing (and, per language, quote style, optional semicolons and trailing commas); \
-        it may start or end in the middle of a token. It must match exactly once in `scope` unless `all_matches` is \
-        set. `after` is re-indented to fit where it lands, so its indentation does not need to match the file. Without \
-        `before`, the whole `scope` (a definition with its docs, or a line range) is replaced; without both, the whole \
-        file is written (a missing file is created). An empty `after` deletes. `mode` \
-        `insert-before-matches` / `insert-after-matches` puts `after` on new lines before/after each match \
-        instead of replacing it. Returns a JSON array with one report per file: \
-        `{\"ok\":true,\"replaced\":[[first,last]]}`, or `ambiguous` with candidates (re-run with a candidate's line \
-        range as `scope`), or `not_found` with the closest candidate. `warnings` reports syntax errors the edit \
-        introduced and line-range edits of files changed since your last read.")]
+    #[tool(description = "Edit a source file: find `before` and replace it with `after`, or insert `after` next \
+        to it (see `mode`).\n\n\
+        `before` is matched ignoring indentation, line breaks and spacing, and must match exactly once in `scope` \
+        unless `all_matches` is set; if it is ambiguous, re-run with a candidate's line range as `scope`. Without \
+        `before`, the target is the whole `scope` (a definition with its docs, or a line range), or the whole file \
+        without `scope` (created if missing).\n\n\
+        `after` is re-indented to fit, so its indentation does not need to match the file. An empty `after` deletes \
+        the target.")]
     fn write(&self, Parameters(p): Parameters<WriteParams>) -> CallToolResult {
         let req = WriteRequest {
             path: &p.path,
