@@ -11,7 +11,8 @@ cmake = "4"
 # linker come from zig on every OS (on Windows this also stands in for MinGW and dlltool).
 zig = "0.17.0"
 "cargo:cargo-zigbuild" = "0.24.0"
-"cargo:cargo-insta" = "latest"
+# Keep in step with the insta dev-dependency in Cargo.toml.
+"cargo:cargo-insta" = "1.49.0"
 
 [vars]
 # cargo-zigbuild only uses zig when given a target; this is the host's.
@@ -52,11 +53,3 @@ depends = ["fmt-check", "lint", "test"]
 [tasks.snap]
 description = "Review pending insta snapshots"
 run = "cargo insta review"
-
-[tasks.install]
-description = "Install the edo binary from this checkout"
-run = "cargo-zigbuild install --path . --locked --target {{vars.target}}"
-
-[tasks.mcp]
-description = "Run the MCP server over stdio"
-run = "cargo-zigbuild run --quiet --target {{vars.target}} -- mcp"
