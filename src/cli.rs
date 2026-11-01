@@ -1,8 +1,7 @@
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
-use crate::command::{self, WriteRequest};
-use crate::edit::Place;
+use crate::command::{self, Mode, WriteRequest};
 use crate::install;
 use crate::language::Languages;
 
@@ -24,12 +23,9 @@ enum Cmd {
     /// Without <BEFORE>, the whole target is replaced. Pass - as <AFTER> to read stdin; stdin with
     /// <<<<<<< before / ======= / >>>>>>> after markers gives both.
     Write {
-        /// Insert <AFTER> on the lines after the target instead of replacing it.
-        #[arg(long)]
-        insert_after: bool,
-        /// Insert <AFTER> on the lines before the target instead of replacing it.
-        #[arg(long)]
-        insert_before: bool,
+        /// What to do with each match (or the whole target without <BEFORE>).
+        #[arg(long, value_enum, default_value_t = Mode::ReplaceMatches)]
+        mode: Mode,
         /// Replace every match instead of failing as ambiguous.
         #[arg(long)]
         all_matches: bool,
@@ -101,7 +97,7 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages)
                 Err(e) => (e.to_json().to_string(), 1),
             }
         }
-        Cmd::Write { insert_after, insert_before, all_matches, target, texts } => {
+        Cmd::Write { mode, all_matches, target, texts } => {
             let (path, scope) = split_target(&target);
             // `-` stands for stdin, which holds one text, or two when it has conflict markers.
             let mut expanded = vec![];
@@ -125,13 +121,7 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages)
                 [before, after] => (Some(before.clone()), after.clone()),
                 _ => return usage("expected [BEFORE] <AFTER>".into()),
             };
-            let place = match (insert_after, insert_before) {
-                (true, true) => return usage("--insert-after and --insert-before cannot be used together".into()),
-                (true, false) => Place::InsertAfter,
-                (false, true) => Place::InsertBefore,
-                (false, false) => Place::Replace,
-            };
-            let req = WriteRequest { path, scope, before: before.as_deref(), after: &after, all_matches, place };
+            let req = WriteRequest { path, scope, before: before.as_deref(), after: &after, all_matches, place: mode.into() };
             match command::write(&langs, &req) {
                 Ok(reports) => {
                     let code = if reports.iter().any(|r| r["ok"] == false) { 1 } else { 0 };
@@ -266,10 +256,37 @@ mod tests {
         assert_eq!(code, 1);
     }
 
+    fn written(args: &[&str]) -> String {
+        let (_dir, path) = file("fn a() {\n    x();\n}\n");
+        let args: Vec<&str> = args.iter().map(|a| if *a == "FILE" { path.as_str() } else { a }).collect();
+        edo(&args, "");
+        std::fs::read_to_string(&path).unwrap()
+    }
+
     #[test]
-    fn both_insert_flags_are_usage_error() {
-        // Given / When: --insert-after と --insert-before を同時に指定する
-        let (out, code) = edo(&["write", "--insert-after", "--insert-before", "a.rs", "x"], "");
+    fn omitted_mode_replaces_matches() {
+        // Given / When: --mode なしで書く / Then: 一致が置き換わる
+        assert_eq!(written(&["write", "FILE", "x();", "y();"]), "fn a() {\n    y();\n}\n");
+    }
+
+    #[test]
+    fn insert_after_matches_mode_inserts_after_match() {
+        // Given / When: --mode insert-after-matches で書く / Then: 一致の後ろの行に入る
+        let out = written(&["write", "--mode", "insert-after-matches", "FILE", "x();", "y();"]);
+        assert_eq!(out, "fn a() {\n    x();\n    y();\n}\n");
+    }
+
+    #[test]
+    fn insert_before_matches_mode_inserts_before_match() {
+        // Given / When: --mode insert-before-matches で書く / Then: 一致の前の行に入る
+        let out = written(&["write", "--mode", "insert-before-matches", "FILE", "x();", "y();"]);
+        assert_eq!(out, "fn a() {\n    y();\n    x();\n}\n");
+    }
+
+    #[test]
+    fn unknown_mode_is_usage_error() {
+        // Given / When: --mode に未知の値を渡す
+        let (out, code) = edo(&["write", "--mode", "append", "a.rs", "x"], "");
         // Then: usage エラーになる
         assert!(out.contains("\"usage\"") && code != 0, "{out}");
     }

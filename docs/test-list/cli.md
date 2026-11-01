@@ -8,7 +8,10 @@
 - [x] read が成功するとテキストが出力され、終了コードは 0 になる
 - [x] write の報告は JSON の配列で出力される
 - [x] 報告に失敗が含まれると終了コードは 1 になる
-- [x] `--insert-after` と `--insert-before` を同時に指定すると usage エラーになる
+- [x] `--mode` を省くと一致を置き換える
+- [x] `--mode insert-after-matches` は一致の後ろの行に挿入する
+- [x] `--mode insert-before-matches` は一致の前の行に挿入する
+- [x] `--mode` に未知の値を渡すと usage エラーになる
 - [x] 位置引数が多すぎると usage エラーになる
 - [x] after に `-` を渡して標準入力が空なら usage エラーになる
 - [x] `ok` が `false` でない要素だけの報告は終了コード 0 になる

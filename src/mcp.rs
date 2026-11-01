@@ -8,8 +8,7 @@ use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router}
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::command::{self, WriteRequest};
-use crate::edit::Place;
+use crate::command::{self, Mode, WriteRequest};
 use crate::language::Languages;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -33,15 +32,9 @@ pub struct WriteParams {
     /// Replace every match instead of failing as ambiguous.
     #[serde(default)]
     pub all_matches: bool,
-    /// Put `after` on new lines before or after the target instead of replacing it.
-    pub insert: Option<Insert>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Insert {
-    Before,
-    After,
+    /// What to do with each match (or the whole target without `before`). Defaults to replace-matches.
+    #[serde(default)]
+    pub mode: Mode,
 }
 
 /// What a file looked like when it was last read or written through this server.
@@ -100,24 +93,20 @@ impl Server {
         it may start or end in the middle of a token. It must match exactly once in `scope` unless `all_matches` is \
         set. `after` is re-indented to fit where it lands, so its indentation does not need to match the file. Without \
         `before`, the whole `scope` (a definition with its docs, or a line range) is replaced; without both, the whole \
-        file is written (a missing file is created). An empty `after` deletes. `insert` puts `after` on new lines \
-        before/after the target instead of replacing it. Returns a JSON array with one report per file: \
+        file is written (a missing file is created). An empty `after` deletes. `mode` \
+        `insert-before-matches` / `insert-after-matches` puts `after` on new lines before/after each match \
+        instead of replacing it. Returns a JSON array with one report per file: \
         `{\"ok\":true,\"replaced\":[[first,last]]}`, or `ambiguous` with candidates (re-run with a candidate's line \
         range as `scope`), or `not_found` with the closest candidate. `warnings` reports syntax errors the edit \
         introduced and line-range edits of files changed since your last read.")]
     fn write(&self, Parameters(p): Parameters<WriteParams>) -> CallToolResult {
-        let place = match p.insert {
-            None => Place::Replace,
-            Some(Insert::Before) => Place::InsertBefore,
-            Some(Insert::After) => Place::InsertAfter,
-        };
         let req = WriteRequest {
             path: &p.path,
             scope: p.scope.as_deref(),
             before: p.before.as_deref(),
             after: &p.after,
             all_matches: p.all_matches,
-            place,
+            place: p.mode.into(),
         };
         let stale = p.scope.as_deref().and_then(crate::scope::parse_lines).is_some() && self.is_stale(&p.path);
         match command::write(&self.langs, &req) {
@@ -220,6 +209,18 @@ mod tests {
         let (text, _) = tool(&client, "read", json!({"path": path, "scope": "a"})).await;
         // Then: その定義のテキストが返る
         assert_eq!(text, "1\tfn a() {\n2\t    x();\n3\t}\n");
+    }
+
+    #[tokio::test]
+    async fn write_tool_mode_inserts_after_match() {
+        // Given: 呼び出しのある関数
+        let (_dir, path) = file("fn a() {\n    x();\n}\n");
+        let client = connect().await;
+        // When: mode に insert-after-matches を渡して write を呼ぶ
+        let args = json!({"path": path, "before": "x();", "after": "y();", "mode": "insert-after-matches"});
+        tool(&client, "write", args).await;
+        // Then: 一致の後ろの行に入る
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    x();\n    y();\n}\n");
     }
 
     #[tokio::test]

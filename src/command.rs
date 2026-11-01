@@ -120,6 +120,29 @@ fn skipped_line(skipped: &Skipped) -> Value {
     json!({"skipped": crate::skipped_json(skipped)})
 }
 
+/// What `write` does with each match (or the whole target without `before`), for both the CLI and MCP.
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    /// Replace each match with <AFTER>.
+    #[default]
+    ReplaceMatches,
+    /// Put <AFTER> on new lines before each match.
+    InsertBeforeMatches,
+    /// Put <AFTER> on new lines after each match.
+    InsertAfterMatches,
+}
+
+impl From<Mode> for Place {
+    fn from(mode: Mode) -> Place {
+        match mode {
+            Mode::ReplaceMatches => Place::Replace,
+            Mode::InsertBeforeMatches => Place::InsertBefore,
+            Mode::InsertAfterMatches => Place::InsertAfter,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct WriteRequest<'a> {
     pub path: &'a str,
