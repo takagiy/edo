@@ -15,7 +15,11 @@ zig = "0.17.0"
 
 [vars]
 # cargo-zigbuild only uses zig when given a target; this is the host's.
-target = "{% if os() == 'windows' %}x86_64-pc-windows-gnu{% elif os() == 'macos' %}{% if arch() == 'arm64' %}aarch64{% else %}x86_64{% endif %}-apple-darwin{% else %}{% if arch() == 'arm64' %}aarch64{% else %}x86_64{% endif %}-unknown-linux-gnu{% endif %}"
+target = """\
+    {% if os() == 'windows' %}x86_64-pc-windows-gnu\
+    {% elif os() == 'macos' %}{% if arch() == 'arm64' %}aarch64{% else %}x86_64{% endif %}-apple-darwin\
+    {% else %}{% if arch() == 'arm64' %}aarch64{% else %}x86_64{% endif %}-unknown-linux-gnu\
+    {% endif %}"""
 
 [tasks.setup]
 description = "Fetch the brokk Kotlin grammar submodule"
