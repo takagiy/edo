@@ -63,7 +63,9 @@ pub fn outline(lang: &Language, tree: &tree_sitter::Tree, src: &str) -> Vec<Defi
         let d = &mut defs[i].1;
         if let Some(c) = caps.iter().find(|c| names[c.index as usize] == "name") {
             d.name = src[c.node.byte_range()].trim().to_string();
-        } else if let Some(v) = lang.query.property_settings(m.pattern_index).iter().find(|p| &*p.key == "name") {
+        } else if d.name.is_empty()
+            && let Some(v) = lang.query.property_settings(m.pattern_index).iter().find(|p| &*p.key == "name")
+        {
             d.name = v.value.as_deref().unwrap_or_default().to_string();
         }
         for c in caps.iter().filter(|c| names[c.index as usize] == "body") {
@@ -298,5 +300,22 @@ pub(crate) mod tests {
         let defs = defs(&lang, "impl Foo {}\n");
         // Then: #set! の値が名前になる
         assert_eq!(defs[0].name, "Impl");
+    }
+
+    #[test]
+    fn name_capture_wins_over_set_property() {
+        // Given: 名前を捕まえるパターンと、同じノードに #set! で既定の名前を付けるパターン
+        for query in [
+            "(impl_item type: (type_identifier) @name) @definition.impl
+             ((impl_item) @definition.impl (#set! name \"Impl\"))",
+            "((impl_item) @definition.impl (#set! name \"Impl\"))
+             (impl_item type: (type_identifier) @name) @definition.impl",
+        ] {
+            let lang = rust(query);
+            // When: impl を抽出する
+            let defs = defs(&lang, "impl Foo {}\n");
+            // Then: パターンの順序によらず、捕まえた名前が使われる
+            assert_eq!(defs[0].name, "Foo", "{query}");
+        }
     }
 }

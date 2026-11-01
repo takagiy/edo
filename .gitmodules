@@ -1,0 +1,4 @@
+[submodule "crates/edo-tree-sitter-kotlin/brokk"]
+	path = crates/edo-tree-sitter-kotlin/brokk
+	url = https://github.com/BrokkAi/tree-sitter-kotlin
+	shallow = true

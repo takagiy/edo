@@ -1,0 +1,14 @@
+[package]
+name = "edo-tree-sitter-kotlin"
+version = "0.4.8"
+edition = "2024"
+license = "MIT"
+description = "The brokk-tree-sitter-kotlin grammar (git submodule brokk/), built against current tree-sitter-language"
+repository = "https://github.com/takagiy/edo"
+include = ["build.rs", "src/**", "brokk/LICENSE", "brokk/src/**"]
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1"

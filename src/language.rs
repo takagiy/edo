@@ -63,7 +63,7 @@ fn builtin_grammar(name: &str) -> Option<tree_sitter::Language> {
         "python" => tree_sitter_python::LANGUAGE.into(),
         "go" => tree_sitter_go::LANGUAGE.into(),
         "java" => tree_sitter_java::LANGUAGE.into(),
-        "kotlin" => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        "kotlin" => edo_tree_sitter_kotlin::LANGUAGE.into(),
         "markdown" => tree_sitter_md::LANGUAGE.into(),
         _ => return None,
     })
@@ -248,5 +248,18 @@ grammar = \"builtin:rust\"
         let result = Language::load(manifest, "(function_item", None);
         // Then: 読み込みエラーになる
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn builtin_kotlin_parses_annotated_data_object() {
+        // Given: 組み込みの Kotlin
+        let langs = Languages::builtin();
+        let lang = langs.for_path(Path::new("a.kt")).unwrap();
+        // When: アノテーション付きの data object をパースする
+        let tree = lang.parser().parse("@Suppress(\"x\")\ndata object Foo {}\n", None).unwrap();
+        // Then: エラーなしで object の宣言になる
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        assert_eq!(root.child(0).unwrap().kind(), "object_declaration");
     }
 }

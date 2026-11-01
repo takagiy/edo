@@ -3,6 +3,7 @@ package demo
 import kotlin.math.sqrt
 
 /** A data object. */
+@Suppress("unused")
 data object Foo {
   fun hoge() = do_hoge(1, 2)
   fun fuga() {

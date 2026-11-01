@@ -17,7 +17,7 @@
 ## 結果
 
 - 得たもの: 拡張の作者が触るのは toml と query だけ。組み込み言語がそのまま拡張のお手本になる。query だけ差し替える拡張も作れる。
-- 失ったもの: wasmtime の分だけバイナリが大きくなる。拡張の作者は `grammar.wasm` をビルドしてコミットする必要がある。組み込みの grammar の不具合はそのまま受け継ぐ（例: tree-sitter-kotlin-ng は `@Ann data object Foo` をパースできない）。
+- 失ったもの: wasmtime の分だけバイナリが大きくなる。拡張の作者は `grammar.wasm` をビルドしてコミットする必要がある。組み込みの grammar の不具合はそのまま受け継ぐ（Kotlin は grammar を選び直した。[Kotlin の grammar](kotlin-grammar.md) を参照）。
 
 ## 採らなかった案
 

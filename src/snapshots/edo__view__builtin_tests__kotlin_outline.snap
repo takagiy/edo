@@ -8,27 +8,28 @@ expression: "builtin_outline(\"tests/fixtures/outline/sample.kt\")"
 3	import kotlin.math.sqrt
 4	
 5	/** A data object. */
-6	data object Foo {
-7	  fun hoge() = ...
-8	  fun fuga() {
-10	  }
-11	}
-12	
-13	@JvmInline
-14	value class Id(val raw: String)
-15	
-16	interface Shape {
-17	  fun area(): Double
-18	}
-19	
-20	class Circle(private val r: Double) : Shape {
-21	  // Area of the circle.
-22	  override fun area(): Double {
-24	  }
-25	
-26	  companion object {
-27	    fun unit() = ...
-28	  }
-29	}
-30	
-31	typealias Name = String
+6	@Suppress("unused")
+7	data object Foo {
+8	  fun hoge() = ...
+9	  fun fuga() {
+11	  }
+12	}
+13	
+14	@JvmInline
+15	value class Id(val raw: String)
+16	
+17	interface Shape {
+18	  fun area(): Double
+19	}
+20	
+21	class Circle(private val r: Double) : Shape {
+22	  // Area of the circle.
+23	  override fun area(): Double {
+25	  }
+26	
+27	  companion object {
+28	    fun unit() = ...
+29	  }
+30	}
+31	
+32	typealias Name = String
