@@ -22,6 +22,9 @@ enum Cmd {
     ///
     /// Without <BEFORE>, the whole target is replaced. Pass - as <AFTER> to read stdin; stdin with
     /// <<<<<<< before / ======= / >>>>>>> after markers gives both.
+    ///
+    /// On success, "replaced" in the JSON report gives the line ranges that now hold <AFTER>; there is no need
+    /// to read the file back.
     Write {
         /// What to do with each match (or the whole target without <BEFORE>).
         #[arg(long, value_enum, default_value_t = Mode::ReplaceMatches)]

@@ -91,7 +91,8 @@ impl Server {
         `before`, the target is the whole `scope` (a definition with its docs, or a line range), or the whole file \
         without `scope` (created if missing).\n\n\
         `after` is re-indented to fit, so its indentation does not need to match the file. An empty `after` deletes \
-        the target.")]
+        the target.\n\n\
+        On success, `replaced` gives the line ranges that now hold `after`; there is no need to read the file back.")]
     fn write(&self, Parameters(p): Parameters<WriteParams>) -> CallToolResult {
         let req = WriteRequest {
             path: &p.path,
