@@ -206,32 +206,44 @@ fn indent_unit(indents: &[&str]) -> Option<String> {
     Some(" ".repeat(step))
 }
 
-/// Puts the first line as is and the later lines at `base` plus their depth relative to the shallowest of them,
-/// converting `after`'s indent unit to the file's.
+/// Puts the first line as is and each later line at `base` plus its depth relative to a reference line,
+/// converting `after`'s indent unit to the file's. The reference is the first line when it is indented;
+/// an unindented first line may have been cut from the middle of a line, so then it is the shallowest
+/// later line. A later line shallower than the reference goes shallower than `base`.
 /// Lines listed in `protected` (by index in `after`) are kept as written.
 fn reindent(after: &str, base: &str, file_unit: Option<String>, protected: &[usize]) -> String {
-    let mut lines = after.trim_start_matches([' ', '\t']).split('\n');
+    let first_indent = leading_ws(after);
+    let mut lines = after[first_indent.len()..].split('\n');
     let first = lines.next().unwrap_or("");
     let rest: Vec<&str> = lines.collect();
     let free = rest.iter().enumerate().filter(|(k, _)| !protected.contains(&(k + 1))).map(|(_, l)| *l);
     let rest_indents = indents(free);
     let shallowest = rest_indents.iter().min_by_key(|i| i.len()).copied().unwrap_or("");
-    let min = shallowest.len();
-    // The shallowest depth is level 0, so a step from it to the first line counts too.
-    let after_unit = indent_unit(&[&[shallowest], &rest_indents[..]].concat());
+    let reference = if first_indent.is_empty() || first.trim().is_empty() { shallowest } else { first_indent };
+    // The reference is level 0, so a step from it to a later line counts too.
+    let after_unit = indent_unit(&[&[reference], &rest_indents[..]].concat());
+    let convert = |n: usize| match (&after_unit, &file_unit) {
+        (Some(a), Some(f)) => Some(format!("{}{}", f.repeat(n / a.len()), " ".repeat(n % a.len()))),
+        _ => None,
+    };
     let mut out = first.to_string();
     for (k, line) in rest.into_iter().enumerate() {
         out.push('\n');
         if protected.contains(&(k + 1)) {
             out.push_str(line);
         } else if !line.trim().is_empty() {
-            let rel = leading_ws(line).len() - min;
-            let depth = match (&after_unit, &file_unit) {
-                (Some(a), Some(f)) => format!("{}{}", f.repeat(rel / a.len()), " ".repeat(rel % a.len())),
-                _ => leading_ws(line)[min..].to_string(),
-            };
-            out.push_str(base);
-            out.push_str(&depth);
+            let indent = leading_ws(line);
+            match indent.len().checked_sub(reference.len()) {
+                Some(n) => {
+                    out.push_str(base);
+                    out.push_str(&convert(n).unwrap_or_else(|| indent[reference.len()..].to_string()));
+                }
+                None => {
+                    let n = reference.len() - indent.len();
+                    let drop = convert(n).map_or(n, |d| d.len());
+                    out.push_str(&base[..base.len().saturating_sub(drop)]);
+                }
+            }
             out.push_str(line.trim_start_matches([' ', '\t']));
         }
     }
@@ -276,6 +288,26 @@ mod tests {
         let out = replace(src, "fn a() {\n        x();\n    }", "fn b() {\n    y();\n}");
         // Then: 最も浅い行が関数の先頭行と同じ深さになり、相対的な深さは保たれる
         assert_eq!(out, "impl A {\n    fn b() {\n        y();\n    }\n}\n");
+    }
+
+    #[test]
+    fn indented_first_line_of_after_sets_depth_of_later_lines() {
+        // Given: 関数の中の if
+        let src = "fn a() {\n    if c {\n        x();\n    }\n}\n";
+        // When: 1 行目もインデントして書いた after で、if の開き括弧の行と中身の行を置き換える
+        let out = replace(src, "if c {\n        x();", "    if d {\n        y();");
+        // Then: 2 行目以降は 1 行目との深さの差を保つ
+        assert_eq!(out, "fn a() {\n    if d {\n        y();\n    }\n}\n");
+    }
+
+    #[test]
+    fn later_line_shallower_than_indented_first_line_goes_shallower_than_target() {
+        // Given: 関数の中の if
+        let src = "fn a() {\n    if c {\n        x();\n    }\n}\n";
+        // When: 1 行目もインデントして書いた after で、if の中身の行と閉じ括弧の行を置き換える
+        let out = replace(src, "x();\n    }", "        y();\n    }");
+        // Then: 1 行目より浅い閉じ括弧は、置換範囲の先頭行より浅くなる
+        assert_eq!(out, "fn a() {\n    if c {\n        y();\n    }\n}\n");
     }
 
     #[test]
