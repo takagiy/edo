@@ -49,7 +49,8 @@ fn stamp(path: &str) -> Option<Stamp> {
 #[derive(Clone)]
 pub struct Server {
     langs: Arc<Languages>,
-    stamps: Arc<Mutex<HashMap<String, Stamp>>>,
+    /// Kept by absolute path, so that two spellings of one file share a stamp.
+    stamps: Arc<Mutex<HashMap<std::path::PathBuf, Stamp>>>,
     /// The language servers started for writes; only `serve` has them, so tests start none.
     lsp: Option<Arc<Mutex<Servers>>>,
     #[allow(dead_code, reason = "used by the tool_handler macro")]
@@ -63,14 +64,15 @@ impl Server {
     }
 
     fn remember(&self, path: &str) {
-        if let Some(s) = stamp(path) {
-            self.stamps.lock().unwrap().insert(path.to_string(), s);
+        if let (Ok(key), Some(s)) = (std::path::absolute(path), stamp(path)) {
+            self.stamps.lock().unwrap().insert(key, s);
         }
     }
 
     /// Line numbers from an earlier read may be wrong if the file changed since.
     fn is_stale(&self, path: &str) -> bool {
-        self.stamps.lock().unwrap().get(path).is_some_and(|s| stamp(path).as_ref() != Some(s))
+        let Ok(key) = std::path::absolute(path) else { return false };
+        self.stamps.lock().unwrap().get(&key).is_some_and(|s| stamp(path).as_ref() != Some(s))
     }
 
     #[tool(description = "Read a source file with line numbers (`N<TAB>line`). Function and method bodies are \
@@ -275,6 +277,20 @@ mod tests {
         std::fs::write(&path, "fn a() {}\nfn b() {}\n").unwrap();
         // When: 行範囲のスコープで書く
         let (text, _) = tool(&client, "write", json!({"path": path, "scope": "2", "after": "fn c() {}"})).await;
+        // Then: stale の警告が付く
+        assert!(text.contains("warnings=(stale=\"modified since last read\")"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn stale_warning_does_not_depend_on_how_path_is_spelled() {
+        // Given: read した後に外で書き換えられたファイル
+        let (dir, path) = file("fn a() {}\n");
+        let client = connect().await;
+        tool(&client, "read", json!({"path": path})).await;
+        std::fs::write(&path, "fn a() {}\nfn b() {}\n").unwrap();
+        // When: 同じファイルを別の書き方のパスで、行範囲のスコープで書く
+        let other = format!("{}/./a.rs", dir.path().to_string_lossy().replace('\\', "/"));
+        let (text, _) = tool(&client, "write", json!({"path": other, "scope": "2", "after": "fn c() {}"})).await;
         // Then: stale の警告が付く
         assert!(text.contains("warnings=(stale=\"modified since last read\")"), "{text}");
     }
