@@ -1,4 +1,6 @@
 [package]
 name = "markdown"
 extensions = ["md", "markdown"]
-grammar = "builtin:markdown"
+
+[package.syntax]
+module = "builtin:markdown"

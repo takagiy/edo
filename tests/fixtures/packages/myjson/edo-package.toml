@@ -1,5 +1,7 @@
 [package]
 name = "myjson"
 extensions = ["myjson"]
-grammar = "grammar.wasm"
-grammar_symbol = "json"
+
+[package.syntax]
+module = "grammar.wasm"
+entrypoint = "tree_sitter_json"

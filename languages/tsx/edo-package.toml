@@ -1,4 +1,6 @@
 [package]
 name = "tsx"
 extensions = ["tsx"]
-grammar = "builtin:tsx"
+
+[package.syntax]
+module = "builtin:tsx"

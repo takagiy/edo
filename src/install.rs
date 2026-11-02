@@ -308,7 +308,7 @@ mod tests {
     }
 
     fn package(name: &str, ext: &str) -> String {
-        format!("[package]\nname = \"{name}\"\nextensions = [\"{ext}\"]\ngrammar = \"builtin:rust\"\n")
+        format!("[package]\nname = \"{name}\"\nextensions = [\"{ext}\"]\n[package.syntax]\nmodule = \"builtin:rust\"\n")
     }
 
     #[test]

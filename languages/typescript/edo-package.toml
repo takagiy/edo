@@ -1,4 +1,6 @@
 [package]
 name = "typescript"
 extensions = ["ts", "mts", "cts"]
-grammar = "builtin:typescript"
+
+[package.syntax]
+module = "builtin:typescript"

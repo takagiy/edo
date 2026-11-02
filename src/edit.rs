@@ -327,7 +327,8 @@ mod tests {
     #[test]
     fn duplicate_optional_leaf_at_seam_removes_file_side() {
         // Given: ; を省略可能にする query と、; で終わる文
-        let manifest = "[package]\nname = \"js\"\nextensions = [\"js\"]\ngrammar = \"builtin:javascript\"\n";
+        let manifest =
+            "[package]\nname = \"js\"\nextensions = [\"js\"]\n[package.syntax]\nmodule = \"builtin:javascript\"\n";
         let lang = Language::load(manifest, "\";\" @match.optional", None).unwrap();
         let src = "x();\nz();\n";
         // When: ; の手前までを、; で終わる after で置き換える

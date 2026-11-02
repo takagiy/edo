@@ -1,4 +1,6 @@
 [package]
 name = "json"
 extensions = ["json"]
-grammar = "grammar.wasm"
+
+[package.syntax]
+module = "grammar.wasm"

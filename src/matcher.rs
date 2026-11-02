@@ -370,7 +370,8 @@ mod tests {
     }
 
     fn js(query: &str) -> Language {
-        let manifest = "[package]\nname = \"js\"\nextensions = [\"js\"]\ngrammar = \"builtin:javascript\"\n";
+        let manifest =
+            "[package]\nname = \"js\"\nextensions = [\"js\"]\n[package.syntax]\nmodule = \"builtin:javascript\"\n";
         Language::load(manifest, query, None).unwrap()
     }
 

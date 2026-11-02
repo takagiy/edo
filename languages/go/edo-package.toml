@@ -1,4 +1,6 @@
 [package]
 name = "go"
 extensions = ["go"]
-grammar = "builtin:go"
+
+[package.syntax]
+module = "builtin:go"

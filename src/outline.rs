@@ -150,7 +150,8 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn rust(query: &str) -> Language {
-        let manifest = "[package]\nname = \"rust\"\nextensions = [\"rs\"]\ngrammar = \"builtin:rust\"\n";
+        let manifest =
+            "[package]\nname = \"rust\"\nextensions = [\"rs\"]\n[package.syntax]\nmodule = \"builtin:rust\"\n";
         Language::load(manifest, query, None).unwrap()
     }
 
@@ -284,7 +285,8 @@ pub(crate) mod tests {
     #[test]
     fn body_followed_only_by_whitespace_extends_to_definition_end() {
         // Given: 段落をボディにする Markdown の query
-        let manifest = "[package]\nname = \"md\"\nextensions = [\"md\"]\ngrammar = \"builtin:markdown\"\n";
+        let manifest =
+            "[package]\nname = \"md\"\nextensions = [\"md\"]\n[package.syntax]\nmodule = \"builtin:markdown\"\n";
         let query = "(section (atx_heading heading_content: (inline) @name) (paragraph) @body) @definition.section";
         let lang = Language::load(manifest, query, None).unwrap();
         // When: 段落の後に空行が続くセクションを抽出する

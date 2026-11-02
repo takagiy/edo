@@ -13,8 +13,13 @@ pub struct Manifest {
 pub struct PackageManifest {
     pub name: String,
     pub extensions: Vec<String>,
-    pub grammar: String,
-    pub grammar_symbol: Option<String>,
+    pub syntax: SyntaxManifest,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SyntaxManifest {
+    pub module: String,
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,14 +84,18 @@ impl Language {
     pub fn load(manifest: &str, query: &str, base: Option<&Path>) -> Result<Language, String> {
         let m: Manifest = toml::from_str(manifest).map_err(|e| e.to_string())?;
         let p = m.package.ok_or("missing [package]")?;
-        let grammar = match p.grammar.strip_prefix("builtin:") {
-            Some(name) => builtin_grammar(name).ok_or(format!("unknown builtin grammar: {name}"))?,
+        let grammar = match p.syntax.module.strip_prefix("builtin:") {
+            Some(name) => builtin_grammar(name).ok_or(format!("unknown builtin module: {name}"))?,
             None => {
-                let path = base.ok_or("wasm grammar needs a package directory")?.join(&p.grammar);
+                let path = base.ok_or("wasm module needs a package directory")?.join(&p.syntax.module);
                 let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-                let symbol = p.grammar_symbol.as_deref().unwrap_or(&p.name);
+                let entrypoint = p.syntax.entrypoint.unwrap_or(format!("tree_sitter_{}", p.name));
+                // tree-sitter takes the name without the prefix and adds it back to find the export.
+                let name = entrypoint
+                    .strip_prefix("tree_sitter_")
+                    .ok_or(format!("entrypoint must start with tree_sitter_: {entrypoint}"))?;
                 let mut store = tree_sitter::WasmStore::new(engine()).map_err(|e| e.to_string())?;
-                store.load_language(symbol, &bytes).map_err(|e| e.to_string())?
+                store.load_language(name, &bytes).map_err(|e| e.to_string())?
             }
         };
         let query = tree_sitter::Query::new(&grammar, query).map_err(|e| format!("edo.scm: {e}"))?;
@@ -177,7 +186,8 @@ mod tests {
         let manifest = "[package]
 name = \"mylang\"
 extensions = [\"my\", \"myl\"]
-grammar = \"builtin:rust\"
+[package.syntax]
+module = \"builtin:rust\"
 ";
         // When: 読み込む
         let lang = Language::load(manifest, "", None).unwrap();
@@ -188,11 +198,12 @@ grammar = \"builtin:rust\"
 
     #[test]
     fn builtin_grammar_reference_points_to_builtin_grammar() {
-        // Given: grammar に builtin:rust を書いたパッケージ
+        // Given: module に builtin:rust を書いたパッケージ
         let manifest = "[package]
 name = \"r\"
 extensions = [\"r\"]
-grammar = \"builtin:rust\"
+[package.syntax]
+module = \"builtin:rust\"
 ";
         let lang = Language::load(manifest, "", None).unwrap();
         // When: Rust のコードをパースする
@@ -206,7 +217,7 @@ grammar = \"builtin:rust\"
 
     #[test]
     fn grammar_file_loads_wasm_grammar() {
-        // Given: grammar に grammar.wasm を書いたパッケージ
+        // Given: module に grammar.wasm を書いたパッケージ
         let lang = Language::load_dir(Path::new("tests/fixtures/packages/json")).unwrap();
         // When: JSON をパースする
         let tree = lang.parser().parse("[1]", None).unwrap();
@@ -215,14 +226,31 @@ grammar = \"builtin:rust\"
     }
 
     #[test]
-    fn grammar_symbol_selects_language_inside_wasm() {
-        // Given: 名前と違う grammar_symbol を書いたパッケージ
+    fn syntax_entrypoint_selects_language_inside_wasm() {
+        // Given: 名前と違う syntax.entrypoint を書いたパッケージ
         let dir = Path::new("tests/fixtures/packages/myjson");
         // When: 読み込む
         let lang = Language::load_dir(dir).unwrap();
-        // Then: WASM の中の grammar_symbol の言語でパースできる
+        // Then: WASM の中の syntax.entrypoint の言語でパースできる
         let tree = lang.parser().parse("{}", None).unwrap();
         assert_eq!(tree.root_node().to_sexp(), "(document (object))");
+    }
+
+    #[test]
+    fn entrypoint_without_tree_sitter_prefix_fails_to_load_package() {
+        // Given: tree_sitter_ で始まらない entrypoint を書いたパッケージ
+        let manifest = "[package]
+name = \"json\"
+extensions = [\"json\"]
+
+[package.syntax]
+module = \"grammar.wasm\"
+entrypoint = \"json\"
+";
+        // When: 読み込む
+        let result = Language::load(manifest, "", Some(Path::new("tests/fixtures/packages/json")));
+        // Then: entrypoint の読み込みエラーになる
+        assert!(result.is_err_and(|e| e.contains("entrypoint")));
     }
 
     #[test]
@@ -231,7 +259,8 @@ grammar = \"builtin:rust\"
         let manifest = "[package]
 name = \"myrust\"
 extensions = [\"rs\"]
-grammar = \"builtin:rust\"
+[package.syntax]
+module = \"builtin:rust\"
 ";
         let langs = Languages::with_installed(vec![Language::load(manifest, "", None).unwrap()]);
         // When: .rs のファイルの言語を選ぶ
@@ -246,7 +275,8 @@ grammar = \"builtin:rust\"
         let manifest = "[package]
 name = \"r\"
 extensions = [\"r\"]
-grammar = \"builtin:rust\"
+[package.syntax]
+module = \"builtin:rust\"
 ";
         // When: 読み込む
         let result = Language::load(manifest, "(function_item", None);

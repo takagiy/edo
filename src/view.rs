@@ -105,7 +105,8 @@ mod tests {
     }
 
     fn python_outline(src: &str) -> String {
-        let manifest = "[package]\nname = \"py\"\nextensions = [\"py\"]\ngrammar = \"builtin:python\"\n";
+        let manifest =
+            "[package]\nname = \"py\"\nextensions = [\"py\"]\n[package.syntax]\nmodule = \"builtin:python\"\n";
         let query = "(function_definition name: (identifier) @name
             body: (block . (expression_statement (string) @doc)?) @body) @definition.function";
         let lang = crate::language::Language::load(manifest, query, None).unwrap();

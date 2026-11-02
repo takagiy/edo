@@ -8,7 +8,7 @@
 
 1 言語 = 1 ディレクトリの言語パッケージにする。
 
-- `edo-package.toml` の `[package]` に `name`、`extensions`、`grammar`（`grammar.wasm` か `builtin:<name>`）、必要なら `grammar_symbol` を書く。
+- `edo-package.toml` の `[package]` に `name` と `extensions` を、`[package.syntax]` に `module`（`grammar.wasm` か `builtin:<name>`）と、必要なら WASM から言語を取り出す関数の名前 `entrypoint`（省略時は `tree_sitter_<name>`）を書く。
 - `edo.scm` に tree-sitter query で定義（`@definition.*`、`@name`）、省略できる場所（`@body`）、定義に紐づく doc（`@doc`）、照合規則（`@match.*`）を書く。
 - 組み込みの 8 言語（Rust、TypeScript と TSX、JavaScript、Python、Go、Java、Kotlin、Markdown の 9 パッケージ）も同じ形式で書き、grammar だけ静的リンクする。
 - レジストリはリポジトリのルートの `edo-package.toml` の `[registry] packages` に glob で並べる。edo 本体のリポジトリがデフォルトのレジストリを兼ねる。

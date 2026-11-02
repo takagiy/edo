@@ -105,7 +105,8 @@ mod tests {
     #[test]
     fn definition_named_by_whole_scope_wins_over_splitting() {
         // Given: 見出し "v1.0" と、見出し "v1" の下の見出し "0" がある Markdown
-        let manifest = "[package]\nname = \"md\"\nextensions = [\"md\"]\ngrammar = \"builtin:markdown\"\n";
+        let manifest =
+            "[package]\nname = \"md\"\nextensions = [\"md\"]\n[package.syntax]\nmodule = \"builtin:markdown\"\n";
         let query = "(section (atx_heading heading_content: (inline) @name)) @definition.section";
         let lang = crate::language::Language::load(manifest, query, None).unwrap();
         let src = "# v1.0\n\ntext\n\n# v1\n\n## 0\n";

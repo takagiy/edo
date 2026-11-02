@@ -1,4 +1,6 @@
 [package]
 name = "rust"
 extensions = ["rs"]
-grammar = "builtin:rust"
+
+[package.syntax]
+module = "builtin:rust"
