@@ -53,17 +53,31 @@ pub fn decide(phase: Phase, call: &Call, langs: &Languages) -> Decision {
     }
 }
 
-/// Commands that print the files they are given.
-const PRINTERS: [&str; 11] = ["cat", "head", "tail", "less", "more", "bat", "nl", "sed", "type", "Get-Content", "gc"];
+/// Commands that print the files they are given, by their leading words. `rtk read` is what rtk's hook turns
+/// cat, head and tail into before edo's hook sees the command.
+const PRINTERS: [&[&str]; 12] = [
+    &["cat"],
+    &["head"],
+    &["tail"],
+    &["less"],
+    &["more"],
+    &["bat"],
+    &["nl"],
+    &["sed"],
+    &["type"],
+    &["Get-Content"],
+    &["gc"],
+    &["rtk", "read"],
+];
 
-/// The files a shell command prints: the arguments of a printing command, up to the first operator.
-// shortcut: reads only the first command and splits on whitespace; a miss only skips advice, so it stays simple.
+/// The files a shell command prints: the arguments of each printing command between operators.
+// shortcut: splits on whitespace, so quoting and operators without spaces around them are missed; a miss only
+// skips advice, so it stays simple.
 pub fn shown_files(command: &str) -> Vec<PathBuf> {
-    let mut words = command.split_whitespace().take_while(|w| !matches!(*w, "|" | "||" | "&&" | ";" | ">" | ">>"));
-    if !words.next().is_some_and(|w| PRINTERS.contains(&w)) {
-        return vec![];
-    }
-    words.filter(|w| !w.starts_with('-')).map(|w| PathBuf::from(w.trim_matches(['"', '\'']))).collect()
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let commands = words.split(|w| matches!(*w, "|" | "||" | "&&" | ";" | ">" | ">>"));
+    let args = commands.filter_map(|c| PRINTERS.iter().find(|p| c.starts_with(p)).map(|p| &c[p.len()..]));
+    args.flatten().filter(|w| !w.starts_with('-')).map(|w| PathBuf::from(w.trim_matches(['"', '\'']))).collect()
 }
 
 /// How one harness's hook input becomes a `Call` and a `Decision` becomes its answer.
@@ -201,6 +215,22 @@ mod tests {
             Decision::Advise(note) => assert!(note.contains("src/a.rs") && note.contains("mcp__edo__read"), "{note}"),
             other => panic!("expected advice, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shell_showing_source_file_through_rtk_read_is_advised_edo() {
+        // Given / When: 実行後に、rtk が cat から書き換えた rtk read の呼び出しを判断する
+        let shell = Call { action: Action::Shell, paths: shown_files("rtk read src/a.rs --head-lines 5") };
+        // Then: edo が使えるという文が添えられる
+        assert!(matches!(decide(Phase::Post, &shell, &langs()), Decision::Advise(_)));
+    }
+
+    #[test]
+    fn shell_showing_source_file_after_cd_is_advised_edo() {
+        // Given / When: 実行後に、cd の後のコマンドで対応言語のファイルを表示した呼び出しを判断する
+        let shell = Call { action: Action::Shell, paths: shown_files("cd x && cat src/a.rs") };
+        // Then: edo が使えるという文が添えられる
+        assert!(matches!(decide(Phase::Post, &shell, &langs()), Decision::Advise(_)));
     }
 
     #[test]
