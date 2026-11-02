@@ -41,7 +41,8 @@ pub struct Client {
     events: Receiver<Event>,
     ready: bool,
     language_id: String,
-    documents: HashMap<Url, Document>,
+    /// Keyed by `key`, since a server may spell a document's URI differently from the client.
+    documents: HashMap<String, Document>,
     /// The server process, killed with the client.
     child: Option<Child>,
 }
@@ -104,10 +105,11 @@ impl Client {
     pub fn diagnostics(&mut self, path: &Path, text: &str, wait: Duration) -> Option<Vec<Diagnostic>> {
         let deadline = Instant::now() + wait;
         let uri = Url::from_file_path(path).ok()?;
+        let key = key(&uri)?;
         while !self.ready {
             self.next(deadline)?;
         }
-        match self.documents.get_mut(&uri) {
+        match self.documents.get_mut(&key) {
             Some(document) if document.text == text => {}
             Some(document) => {
                 document.version += 1;
@@ -124,11 +126,11 @@ impl Client {
                 let item = TextDocumentItem::new(uri.clone(), self.language_id.clone(), 1, text.into());
                 let params = DidOpenTextDocumentParams { text_document: item };
                 send(&self.writer, Notification::new("textDocument/didOpen".into(), params));
-                self.documents.insert(uri.clone(), Document { version: 1, text: text.into(), diagnostics: None });
+                self.documents.insert(key.clone(), Document { version: 1, text: text.into(), diagnostics: None });
             }
         }
         loop {
-            if let Some(diagnostics) = &self.documents[&uri].diagnostics {
+            if let Some(diagnostics) = &self.documents[&key].diagnostics {
                 return Some(diagnostics.clone());
             }
             self.next(deadline)?;
@@ -141,7 +143,7 @@ impl Client {
             Event::Ready => self.ready = true,
             Event::Published(published) => {
                 // Diagnostics for an older version of the text are about a text no longer asked about.
-                if let Some(document) = self.documents.get_mut(&published.uri)
+                if let Some(document) = key(&published.uri).and_then(|k| self.documents.get_mut(&k))
                     && published.version.is_none_or(|v| v == document.version)
                 {
                     document.diagnostics = Some(published.diagnostics);
@@ -162,6 +164,15 @@ impl Drop for Client {
     }
 }
 
+/// A document's identity: its file path with the drive letter lowercased, as Windows rust-analyzer echoes
+/// `file:///C:/...` back as `file:///c:/...`; going through the path also undoes `%3A` for `:`.
+fn key(uri: &Url) -> Option<String> {
+    let path = uri.to_file_path().ok()?.to_string_lossy().into_owned();
+    Some(match path.as_bytes() {
+        [drive, b':', ..] => format!("{}{}", drive.to_ascii_lowercase() as char, &path[1..]),
+        _ => path,
+    })
+}
 /// Reads the server's messages: answers its requests, sends `initialized` after the `initialize` answer,
 /// and passes on readiness and diagnostics.
 fn read(mut reader: impl BufRead, writer: &Writer, events: &Sender<Event>) {
@@ -363,6 +374,28 @@ mod tests {
         }));
         // When / Then: 問い合わせた文書の診断としては返さない
         assert_eq!(messages(client.diagnostics(&doc(), "x", SHORT)), None);
+    }
+
+    #[test]
+    fn diagnostics_for_uri_with_other_drive_letter_case_are_the_documents() {
+        // Given: 開かれた文書の URI のドライブ名を小文字にして診断を送るサーバー（Windows の rust-analyzer と同じ）
+        let (mut client, _) = fake(Box::new(|m| match m {
+            Message::Notification(n) if n.method == "textDocument/didOpen" => {
+                let uri = n.params["textDocument"]["uri"].as_str().unwrap();
+                let lowered = match uri.strip_prefix("file:///") {
+                    Some(rest) if rest.as_bytes().get(1) == Some(&b':') => {
+                        format!("file:///{}{}", rest[..1].to_ascii_lowercase(), &rest[1..])
+                    }
+                    _ => uri.to_string(),
+                };
+                vec![publish(&json!(lowered), &json!("x"))]
+            }
+            _ => initialize_answer(m).into_iter().collect(),
+        }));
+        // When: 診断を問い合わせる
+        let found = messages(client.diagnostics(&doc(), "x", LONG));
+        // Then: その文書の診断として受け取る
+        assert_eq!(found, Some(vec!["x".to_string()]));
     }
 
     #[test]
