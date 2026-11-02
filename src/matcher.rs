@@ -292,7 +292,7 @@ impl Matcher<'_> {
                 let tail = rest.trim_end();
                 let next = text.get(tail.len()..)?.chars().next()?;
                 let splits_word = ends_with_word(tail) && is_word(next);
-                (end.is_some() && text.starts_with(tail) && !splits_word).then_some(leaf.range.start + tail.len())
+                (text.starts_with(tail) && !splits_word).then_some(leaf.range.start + tail.len())
             })
     }
 }
@@ -448,6 +448,28 @@ mod tests {
         let found = find_in(&rust(""), src, "f(\"hello");
         // Then: 文字列の前半まで一致する
         assert_eq!(found, ["f(\"hello"]);
+    }
+
+    #[test]
+    fn comment_line_alone_matches_doc_comment() {
+        // Given: 改行まで葉に含む Rust の doc コメント
+        let lang = rust("(line_comment) @match.collapse");
+        let src = "/// a b.\nfn f() {}\n";
+        // When: その行だけの before で照合する
+        let found = find_in(&lang, src, "/// a b.");
+        // Then: 改行を除いたコメントに一致する
+        assert_eq!(found, ["/// a b."]);
+    }
+
+    #[test]
+    fn before_inside_one_leaf_matches_its_former_part() {
+        // Given: doc コメント
+        let lang = rust("(line_comment) @match.collapse");
+        let src = "/// a b.\nfn f() {}\n";
+        // When: コメントの途中で終わる before で照合する
+        let found = find_in(&lang, src, "/// a");
+        // Then: コメントの前半に一致する
+        assert_eq!(found, ["/// a"]);
     }
 
     #[test]
