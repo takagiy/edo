@@ -9,7 +9,7 @@ edo はハーネスの Read/Write/Edit を置き換えるための道具だが�
 | | MCP の登録 | 実行前に止める | 実行後に文を足す |
 |---|---|---|---|
 | Claude Code | `claude mcp add --scope user`（登録先の `~/.claude.json` は Claude Code が常に書き換える） | `PreToolUse` の `permissionDecision: deny` と理由。`Read`、`Edit`、`Write` は `tool_input.file_path` | `PostToolUse` の `additionalContext`。Bash は `tool_input.command` |
-| Codex | `codex mcp add`（登録先は `~/.codex/config.toml` の `[mcp_servers.<name>]`）。hook は `~/.codex/hooks.json` で、Claude Code の `hooks` と同じ形 | `PreToolUse` で `apply_patch` を止められる。パスはパッチの本文にしかない。読むための専用のツールはなく、シェルで読む | `PostToolUse` の `additionalContext`（文だけを足せるかは未確認）。ユーザーが `/hooks` で信頼するまで hook は動かない |
+| Codex | `codex mcp add`（登録先は `~/.codex/config.toml` の `[mcp_servers.<name>]`）。hook は `~/.codex/hooks.json` で、Claude Code の `hooks` と同じ形 | `PreToolUse` で `apply_patch` を止められる。パスはパッチの本文にしかない。読むための専用のツールはなく、シェルで読む | `PostToolUse` の `additionalContext`（`permissionDecision` なしで文だけを足せる）。ユーザーが `/hooks` で信頼するまで hook は動かない |
 | Cursor | `~/.cursor/mcp.json`（追加・削除の CLI はない） | `~/.cursor/hooks.json` の `preToolUse`（`Read`、`Write`、入力は `tool_input.file_path`）と `agent_message`。hook はグループを作らず `{"matcher","command"}` を並べ、ファイルには `"version": 1` が要る | `postToolUse` の `additional_context`（シェルは `Shell`、`tool_input.command`）。許可のときも正しい JSON を返さないと操作が止まる。既定で `~/.claude/settings.json` の Claude Code の hook も実行する（設定「Include Third-Party Plugins, Skills, and Other Configs」） |
 
 ## 決定
@@ -29,7 +29,7 @@ edo はハーネスの Read/Write/Edit を置き換えるための道具だが�
 ## 結果
 
 - 得たもの: 1 つのコマンドで 3 つのハーネスに入り、外せる。PATH を引き継がない GUI のアプリでも edo が見つかる。止める先を edo が扱えるファイルに限るので、エージェントが行き詰まらない。説明のファイルがない分、毎回のセッションのコンテキストが増えない。
-- 失ったもの: edo を別の場所に入れ直したら、`edo harness init` をもう一度実行する必要がある。Codex ではシェルで読むことを止められず、実行後に勧めるだけになる。Cursor の入力の形と、Codex の `PostToolUse` で文だけを足せるかは、実物で確かめるまで推測が残る。各ハーネスの仕様が変わると、入口と出口を直す必要がある。Codex では、入れた後にユーザーが `/hooks` で信頼する手間がかかる。
+- 失ったもの: edo を別の場所に入れ直したら、`edo harness init` をもう一度実行する必要がある。Codex ではシェルで読むことを止められず、実行後に勧めるだけになる。各ハーネスの仕様が変わると、入口と出口を直す必要がある。Codex では、入れた後にユーザーが `/hooks` で信頼する手間がかかる。
 - 採らなかった案:
   - Claude Code のプラグインとして配る案は、Codex と Cursor には使えず、仕組みが 2 つに分かれるので採らなかった。
   - APM（Microsoft の Agent Package Manager）に任せる案は、使う人に APM のインストールが要り、PC ごとに違う edo の絶対パスを書けず、ユーザー全体の hook の書き込みに不具合の実績があるので採らなかった。
