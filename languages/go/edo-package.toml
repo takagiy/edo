@@ -4,3 +4,11 @@ extensions = ["go"]
 
 [package.syntax]
 module = "builtin:go"
+
+[package.lsp]
+command = ["gopls"]
+root_markers = ["go.mod"]
+
+[package.lsp.distribution]
+type = "mise"
+tools = ["go", "go:golang.org/x/tools/gopls"]

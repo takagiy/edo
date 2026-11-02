@@ -179,7 +179,8 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages,
             };
             let req =
                 WriteRequest { path, scope, before: before.as_deref(), after: &after, all_matches, place: mode.into() };
-            match command::write(&langs, &req) {
+            // The CLI runs no language servers; `edo mcp` keeps them running between writes.
+            match command::write(&langs, &req, &mut |_| serde_json::Map::new()) {
                 Ok(reports) => {
                     let code = if reports.iter().any(|r| r["ok"] == false) { 1 } else { 0 };
                     (serde_json::Value::from(reports).to_string(), code)

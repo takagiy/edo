@@ -7,6 +7,7 @@ edition = "2024"
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
 dirs = "7.0.0"
+edo-lsp-client = { version = "0.1.0", path = "crates/edo-lsp-client" }
 edo-tree-sitter-kotlin = { version = "0.4.8", path = "crates/edo-tree-sitter-kotlin" }
 flate2 = "1.1.10"
 globset = "0.4.21"
@@ -32,6 +33,7 @@ ureq = "3.5.0"
 
 [dev-dependencies]
 insta = "1.49.0"
+lsp-server = "0.10"
 
 [workspace]
-members = ["crates/edo-tree-sitter-kotlin", "crates/xtask"]
+members = ["crates/edo-lsp-client", "crates/edo-tree-sitter-kotlin", "crates/xtask"]

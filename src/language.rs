@@ -3,6 +3,8 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
+use crate::lsp::Lsp;
+
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
     pub package: Option<PackageManifest>,
@@ -14,6 +16,7 @@ pub struct PackageManifest {
     pub name: String,
     pub extensions: Vec<String>,
     pub syntax: SyntaxManifest,
+    pub lsp: Option<Lsp>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +35,7 @@ pub struct Language {
     pub extensions: Vec<String>,
     pub grammar: tree_sitter::Language,
     pub query: tree_sitter::Query,
+    pub lsp: Option<Lsp>,
 }
 
 pub struct Languages {
@@ -99,7 +103,11 @@ impl Language {
             }
         };
         let query = tree_sitter::Query::new(&grammar, query).map_err(|e| format!("edo.scm: {e}"))?;
-        Ok(Language { name: p.name, extensions: p.extensions, grammar, query })
+        let lsp = p.lsp.map(|mut lsp| {
+            lsp.language_id.get_or_insert_with(|| p.name.clone());
+            lsp
+        });
+        Ok(Language { name: p.name, extensions: p.extensions, grammar, query, lsp })
     }
 }
 
@@ -308,5 +316,75 @@ module = \"builtin:rust\"
         let names: Vec<String> = crate::outline::outline(lang, &tree, src).into_iter().map(|d| d.name).collect();
         // Then: 型引数付きの型は型引数を除いた名前になり、それ以外の型はそのままの名前になる
         assert_eq!(names, ["Matcher", "&Bar"]);
+    }
+
+    #[test]
+    fn lsp_section_gives_command_root_markers_and_language_id() {
+        // Given: [package.lsp] を書いたパッケージ
+        let manifest = "[package]
+name = \"ts\"
+extensions = [\"ts\"]
+[package.syntax]
+module = \"builtin:typescript\"
+[package.lsp]
+command = [\"typescript-language-server\", \"--stdio\"]
+root_markers = [\"package.json\"]
+language_id = \"typescript\"
+[package.lsp.distribution]
+type = \"mise\"
+tools = [\"node\", \"npm:typescript-language-server\"]
+";
+        // When: 読み込む
+        let lsp = Language::load(manifest, "", None).unwrap().lsp.unwrap();
+        // Then: command、root_markers、language_id と、mise の tools が読める
+        assert_eq!(lsp.command, ["typescript-language-server", "--stdio"]);
+        assert_eq!(lsp.root_markers, ["package.json"]);
+        assert_eq!(lsp.language_id.as_deref(), Some("typescript"));
+        let tools = vec!["node".to_string(), "npm:typescript-language-server".to_string()];
+        assert_eq!(lsp.distribution, Some(crate::lsp::Distribution::Mise { tools }));
+    }
+
+    #[test]
+    fn omitted_language_id_is_package_name() {
+        // Given: language_id を省いた [package.lsp]
+        let manifest = "[package]
+name = \"rust\"
+extensions = [\"rs\"]
+[package.syntax]
+module = \"builtin:rust\"
+[package.lsp]
+command = [\"rust-analyzer\"]
+";
+        // When: 読み込む
+        let lsp = Language::load(manifest, "", None).unwrap().lsp.unwrap();
+        // Then: language_id は package.name になる
+        assert_eq!(lsp.language_id.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn builtin_languages_have_language_servers() {
+        // Given: 組み込みの言語
+        let langs = Languages::builtin();
+        let server = |file: &str| langs.for_path(Path::new(file)).unwrap().lsp.as_ref().map(|l| l.command[0].clone());
+        // When / Then: Rust、TypeScript、TSX、JavaScript、Python、Go には LSP サーバーの設定がある
+        for (file, command) in [
+            ("a.rs", "rust-analyzer"),
+            ("a.ts", "typescript-language-server"),
+            ("a.tsx", "typescript-language-server"),
+            ("a.js", "typescript-language-server"),
+            ("a.py", "pyright-langserver"),
+            ("a.go", "gopls"),
+        ] {
+            assert_eq!(server(file).as_deref(), Some(command), "{file}");
+        }
+    }
+
+    #[test]
+    fn builtin_tsx_language_id_is_typescriptreact() {
+        // Given / When: 組み込みの TSX の LSP の設定を読む
+        let langs = Languages::builtin();
+        let lsp = langs.for_path(Path::new("a.tsx")).unwrap().lsp.as_ref().unwrap();
+        // Then: language_id は typescriptreact になる
+        assert_eq!(lsp.language_id.as_deref(), Some("typescriptreact"));
     }
 }

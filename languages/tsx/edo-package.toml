@@ -4,3 +4,12 @@ extensions = ["tsx"]
 
 [package.syntax]
 module = "builtin:tsx"
+
+[package.lsp]
+command = ["typescript-language-server", "--stdio"]
+root_markers = ["tsconfig.json", "package.json"]
+language_id = "typescriptreact"
+
+[package.lsp.distribution]
+type = "mise"
+tools = ["node", "npm:typescript-language-server", "npm:typescript"]

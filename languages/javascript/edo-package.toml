@@ -4,3 +4,11 @@ extensions = ["js", "mjs", "cjs", "jsx"]
 
 [package.syntax]
 module = "builtin:javascript"
+
+[package.lsp]
+command = ["typescript-language-server", "--stdio"]
+root_markers = ["jsconfig.json", "package.json"]
+
+[package.lsp.distribution]
+type = "mise"
+tools = ["node", "npm:typescript-language-server", "npm:typescript"]

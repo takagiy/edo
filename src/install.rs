@@ -314,15 +314,24 @@ pub fn languages(home: &Path) -> crate::language::Languages {
     crate::language::Languages::with_installed(loaded)
 }
 
-/// Builtin and installed packages.
+/// Builtin and installed packages, with their language server's status when they have one.
 pub fn list(home: &Path) -> Result<Value, Error> {
+    let with_lsp = |mut entry: Value, lsp: Option<&crate::lsp::Lsp>| {
+        if let Some(lsp) = lsp {
+            entry["lsp"] = lsp.status();
+        }
+        entry
+    };
     let builtin: Vec<Value> = crate::language::Languages::builtin()
         .iter()
-        .map(|l| json!({"name": l.name, "extensions": l.extensions}))
+        .map(|l| with_lsp(json!({"name": l.name, "extensions": l.extensions}), l.lsp.as_ref()))
         .collect();
     let installed: Vec<Value> = installed(home)?
         .into_iter()
-        .map(|p| json!({"registry": p.registry, "name": p.name, "extensions": p.extensions, "source": p.source}))
+        .map(|p| {
+            let entry = json!({"registry": p.registry, "name": p.name, "extensions": p.extensions, "source": p.source});
+            with_lsp(entry, p.lsp.as_ref())
+        })
         .collect();
     Ok(json!({"builtin": builtin, "installed": installed}))
 }
@@ -333,6 +342,7 @@ pub struct Installed {
     pub registry: String,
     pub name: String,
     pub extensions: Vec<String>,
+    pub lsp: Option<crate::lsp::Lsp>,
     pub dir: PathBuf,
     /// `<registry>@<commit>`
     pub source: String,
@@ -343,8 +353,8 @@ pub fn installed(home: &Path) -> Result<Vec<Installed>, Error> {
     let mut out = vec![];
     for p in Cache::load(home)?.packages {
         let dir = package_dir(home, &p.registry, &p.name);
-        let extensions = manifest(&dir)?.package.map(|m| m.extensions).unwrap_or_default();
-        out.push(Installed { source: p.source(), registry: p.registry, name: p.name, extensions, dir });
+        let (extensions, lsp) = manifest(&dir)?.package.map_or((vec![], None), |m| (m.extensions, m.lsp));
+        out.push(Installed { source: p.source(), registry: p.registry, name: p.name, extensions, lsp, dir });
     }
     out.sort_by(|a, b| (&a.registry, &a.name).cmp(&(&b.registry, &b.name)));
     Ok(out)
@@ -615,6 +625,20 @@ mod tests {
             listed["installed"],
             json!([{"registry": "github.com/foo/langs", "name": "myrust", "extensions": ["myrs"], "source": "github.com/foo/langs@abc"}])
         );
+    }
+
+    #[test]
+    fn list_shows_language_server_command_and_whether_it_is_found() {
+        // Given: 何もインストールしていないインストール先
+        let home = tempfile::tempdir().unwrap();
+        // When: 一覧を出す
+        let listed = list(home.path()).unwrap();
+        // Then: LSP の設定がある言語には、そのコマンドと、見つかるかどうかが出る
+        let rust = &listed["builtin"][0]["lsp"];
+        assert_eq!(rust["command"], json!(["rust-analyzer"]));
+        assert!(rust["found"].is_boolean(), "{rust}");
+        let markdown = listed["builtin"].as_array().unwrap().iter().find(|l| l["name"] == "markdown").unwrap();
+        assert!(markdown.get("lsp").is_none(), "{markdown}");
     }
 
     #[test]

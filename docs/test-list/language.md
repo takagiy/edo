@@ -11,3 +11,5 @@
 - [x] 文法の誤った query はパッケージの読み込みエラーになる
 - [x] 組み込みの Kotlin はアノテーション付きの data object をパースできる
 - [x] 組み込みの Rust は、型引数付きの型の impl を型引数を除いた名前にする
+- [x] 組み込みの Rust、TypeScript、TSX、JavaScript、Python、Go には LSP サーバーの設定がある
+- [x] 組み込みの TSX の LSP の language_id は typescriptreact になる

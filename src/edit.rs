@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use crate::diagnostic::{Diagnostic, Hunk};
 use crate::language::Language;
 use crate::matcher::{Compare, Skip};
 
@@ -17,14 +18,8 @@ pub struct Outcome {
     pub text: String,
     /// First and last line (1-based) of the written text; last is first - 1 when nothing was written.
     pub lines: (usize, usize),
-    /// Syntax errors that the edit introduced.
-    pub new_syntax_errors: Vec<SyntaxError>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SyntaxError {
-    pub line: usize,
-    pub text: String,
+    /// The lines the edit replaced and the lines it wrote in their place.
+    pub hunk: Hunk,
 }
 
 /// Start bytes of ERROR and MISSING nodes.
@@ -47,34 +42,33 @@ fn error_starts(lang: &Language, text: &str) -> Vec<usize> {
     }
 }
 
-/// Errors in `new` that were not already in `old` (shifted past the edit) are new.
-fn new_syntax_errors(lang: &Language, old: &str, new: &str, replaced: &Range<usize>) -> Vec<SyntaxError> {
-    let delta = new.len() as isize - old.len() as isize;
-    let before: Vec<usize> = error_starts(lang, old)
-        .into_iter()
-        .filter(|&s| !replaced.contains(&s))
-        .map(|s| if s >= replaced.end { (s as isize + delta) as usize } else { s })
-        .collect();
-    let mut out: Vec<SyntaxError> = vec![];
-    for s in error_starts(lang, new).into_iter().filter(|s| !before.contains(s)) {
-        let line = new[..s].matches('\n').count() + 1;
-        let start = new[..s].rfind('\n').map_or(0, |i| i + 1);
-        let text = new[start..].lines().next().unwrap_or("").trim().to_string();
-        if !out.iter().any(|e| e.line == line) {
-            out.push(SyntaxError { line, text });
-        }
+/// A `syntax error` for each line where an ERROR or MISSING node starts.
+pub fn syntax_errors(lang: &Language, text: &str) -> Vec<Diagnostic> {
+    let mut lines: Vec<usize> =
+        error_starts(lang, text).into_iter().map(|s| text[..s].matches('\n').count() + 1).collect();
+    lines.dedup();
+    lines.into_iter().map(|line| Diagnostic { line, message: "syntax error".into() }).collect()
+}
+
+/// The 1-based lines that bytes `range` of `text` touch, half-open; an empty range at a line start
+/// (an insertion of whole lines) touches none.
+fn lines_of(text: &str, range: &Range<usize>) -> Range<usize> {
+    let first = text[..range.start].matches('\n').count() + 1;
+    if range.is_empty() {
+        let at_line_start = range.start == 0 || text[..range.start].ends_with('\n');
+        return if at_line_start { first..first } else { first..first + 1 };
     }
-    out
+    first..text[..range.end - 1].matches('\n').count() + 2
 }
 
 pub fn edit(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Place) -> Outcome {
     let (text, replaced) = apply(lang, src, range, after, place);
-    let new_syntax_errors = new_syntax_errors(lang, src, &text, &replaced);
     let written = replaced.start..replaced.start + text.len() + replaced.len() - src.len();
     let first = text[..written.start].matches('\n').count() + 1;
     let last = text[..written.end].trim_end_matches(['\n', '\r']).matches('\n').count() + 1;
     let lines = if written.is_empty() { (first, first - 1) } else { (first, last.max(first)) };
-    Outcome { text, lines, new_syntax_errors }
+    let hunk = Hunk { old: lines_of(src, &replaced), new: lines_of(&text, &written) };
+    Outcome { text, lines, hunk }
 }
 
 /// Number of lines that end at or before byte `pos`, which is a line boundary or the end of `src`.
@@ -450,23 +444,23 @@ mod tests {
     }
 
     #[test]
-    fn syntax_error_introduced_by_edit_is_reported() {
-        // Given: 正しい関数
+    fn hunk_has_replaced_lines_before_and_written_lines_after() {
+        // Given: 3 行の関数
         let src = "fn a() {\n    x();\n}\n";
-        // When: 閉じ括弧の足りない after で置き換える
-        let out = outcome(src, "x();", "y(;");
-        // Then: 書き換えた行の構文エラーが報告される
-        assert_eq!(out.new_syntax_errors, [SyntaxError { line: 2, text: "y(;".into() }]);
+        // When: 2 行目を 2 行の after で置き換える
+        let out = outcome(src, "x();", "y();\nz();");
+        // Then: 前の 2 行目が、後の 2〜3 行目になった
+        assert_eq!(out.hunk, Hunk { old: 2..3, new: 2..4 });
     }
 
     #[test]
-    fn syntax_error_present_before_edit_is_not_reported() {
-        // Given: 後ろの関数に構文エラーがあるファイル
-        let src = "fn a() {\n    x();\n}\nfn b( {}\n";
-        // When: 前の関数の中を正しい after で置き換える
-        let out = outcome(src, "x();", "y();\nz();");
-        // Then: もとからあった構文エラーは報告されない
-        assert!(out.new_syntax_errors.is_empty());
+    fn line_with_error_node_is_syntax_error() {
+        // Given: 2 行目に閉じ括弧の足りない呼び出しがある関数
+        let src = "fn a() {\n    y(;\n}\n";
+        // When: 構文エラーを求める
+        let errors = syntax_errors(&rust(""), src);
+        // Then: 2 行目が構文エラーになる
+        assert_eq!(errors, [Diagnostic { line: 2, message: "syntax error".into() }]);
     }
 
     #[test]

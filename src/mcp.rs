@@ -6,10 +6,11 @@ use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Map, json};
 
-use crate::command::{self, Mode, WriteRequest};
+use crate::command::{self, Mode, WriteRequest, Written};
 use crate::language::Languages;
+use crate::lsp::Servers;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadParams {
@@ -49,6 +50,8 @@ fn stamp(path: &str) -> Option<Stamp> {
 pub struct Server {
     langs: Arc<Languages>,
     stamps: Arc<Mutex<HashMap<String, Stamp>>>,
+    /// The language servers started for writes; only `serve` has them, so tests start none.
+    lsp: Option<Arc<Mutex<Servers>>>,
     #[allow(dead_code, reason = "used by the tool_handler macro")]
     tool_router: ToolRouter<Self>,
 }
@@ -56,7 +59,7 @@ pub struct Server {
 #[tool_router]
 impl Server {
     pub fn new(langs: Languages) -> Self {
-        Server { langs: Arc::new(langs), stamps: Default::default(), tool_router: Self::tool_router() }
+        Server { langs: Arc::new(langs), stamps: Default::default(), lsp: None, tool_router: Self::tool_router() }
     }
 
     fn remember(&self, path: &str) {
@@ -103,7 +106,10 @@ impl Server {
             place: p.mode.into(),
         };
         let stale = p.scope.as_deref().and_then(crate::scope::parse_lines).is_some() && self.is_stale(&p.path);
-        match command::write(&self.langs, &req) {
+        // shortcut: waits for diagnostics on the runtime's only thread; fine while one agent writes at a time.
+        let mut check =
+            |written: &Written| self.lsp.as_ref().map_or_else(Map::new, |s| s.lock().unwrap().check(written));
+        match command::write(&self.langs, &req, &mut check) {
             Ok(mut reports) => {
                 for r in reports.iter_mut().filter(|r| r["ok"] == true) {
                     if stale {
@@ -136,7 +142,8 @@ impl ServerHandler for Server {
 pub fn serve(langs: Languages) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
-        let running = Server::new(langs).serve(rmcp::transport::stdio()).await?;
+        let server = Server { lsp: Some(Default::default()), ..Server::new(langs) };
+        let running = server.serve(rmcp::transport::stdio()).await?;
         running.waiting().await?;
         Ok(())
     })

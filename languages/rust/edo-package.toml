@@ -4,3 +4,11 @@ extensions = ["rs"]
 
 [package.syntax]
 module = "builtin:rust"
+
+[package.lsp]
+command = ["rust-analyzer"]
+root_markers = ["Cargo.toml"]
+
+[package.lsp.distribution]
+type = "mise"
+tools = ["rust-analyzer"]

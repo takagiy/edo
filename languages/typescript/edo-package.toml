@@ -4,3 +4,11 @@ extensions = ["ts", "mts", "cts"]
 
 [package.syntax]
 module = "builtin:typescript"
+
+[package.lsp]
+command = ["typescript-language-server", "--stdio"]
+root_markers = ["tsconfig.json", "package.json"]
+
+[package.lsp.distribution]
+type = "mise"
+tools = ["node", "npm:typescript-language-server", "npm:typescript"]

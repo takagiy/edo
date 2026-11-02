@@ -1,11 +1,13 @@
 pub mod cli;
 pub mod command;
+pub mod diagnostic;
 pub mod edit;
 pub mod harness;
 pub mod hook;
 pub mod install;
 pub mod installer;
 pub mod language;
+pub mod lsp;
 pub mod matcher;
 pub mod mcp;
 pub mod outline;

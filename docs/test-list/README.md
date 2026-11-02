@@ -17,3 +17,6 @@
 | インストーラー | [installer.md](installer.md) | 画面、見出し、カーソル、選択 |
 | hook | [hook.md](hook.md) | 呼び出し、対応ファイル、止める、添える、入口、出口 |
 | ハーネスへの組み込み | [harness.md](harness.md) | ハーネス、設定、登録、hook、外す |
+| 書き込みで増えたエラー | [diagnostic.md](diagnostic.md) | 書き換えの対応、前のエラー、後のエラー、移す |
+| LSP クライアント | [lsp-client.md](lsp-client.md) | サーバー、文書、診断、覚え書き |
+| LSP の診断 | [lsp.md](lsp.md) | 言語パッケージ、ルート、MCP の write の報告 |

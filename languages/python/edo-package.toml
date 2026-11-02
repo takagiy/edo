@@ -4,3 +4,11 @@ extensions = ["py", "pyi"]
 
 [package.syntax]
 module = "builtin:python"
+
+[package.lsp]
+command = ["pyright-langserver", "--stdio"]
+root_markers = ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"]
+
+[package.lsp.distribution]
+type = "mise"
+tools = ["node", "npm:pyright"]

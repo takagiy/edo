@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::diagnostic::{Hunk, new_errors};
 use crate::edit::{self, Place};
 use crate::language::{Language, Languages};
 use crate::matcher;
@@ -7,7 +8,7 @@ use crate::outline::{Definition, outline};
 use crate::scope::Hit;
 use crate::{Error, Skipped};
 use crate::{scope, view};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 /// A source file parsed with its language.
 struct Source<'a> {
@@ -163,16 +164,28 @@ pub struct WriteRequest<'a> {
     pub place: Place,
 }
 
-/// Writes `after` into each matched file and reports per file.
-pub fn write(langs: &Languages, req: &WriteRequest) -> Result<Vec<Value>, Error> {
+/// A file as a write changed it, for a check that adds warnings to its report.
+pub struct Written<'a> {
+    pub lang: &'a Language,
+    pub path: &'a Path,
+    pub before: &'a str,
+    pub after: &'a str,
+    pub hunks: &'a [Hunk],
+}
+
+/// Adds warnings to a written file's report, such as the errors a language server found.
+pub type Check<'a> = &'a mut dyn FnMut(&Written) -> Map<String, Value>;
+
+/// Writes `after` into each matched file and reports per file; `check` adds warnings to each file written.
+pub fn write(langs: &Languages, req: &WriteRequest, check: Check) -> Result<Vec<Value>, Error> {
     if !is_glob(req.path) {
-        return Ok(vec![write_one(langs, req.path, req)?]);
+        return Ok(vec![write_one(langs, req.path, req, check)?]);
     }
     let (files, skipped) = supported(langs, expand(req.path)?);
     let mut reports: Vec<Value> = files
         .iter()
         .map(|f| {
-            write_one(langs, f, req)
+            write_one(langs, f, req, check)
                 .unwrap_or_else(|e| json!({"ok": false, "file": f, "error": e.code, "message": e.message}))
         })
         .filter(|r| r["error"] != "not_found")
@@ -188,7 +201,7 @@ pub fn write(langs: &Languages, req: &WriteRequest) -> Result<Vec<Value>, Error>
     Ok(reports)
 }
 
-fn write_one(langs: &Languages, path: &str, req: &WriteRequest) -> Result<Value, Error> {
+fn write_one(langs: &Languages, path: &str, req: &WriteRequest, check: Check) -> Result<Value, Error> {
     let file = Path::new(path);
     // Writing a whole file that does not exist yet is writing over an empty one.
     let creating = !file.exists() && req.scope.is_none() && req.before.is_none();
@@ -237,21 +250,29 @@ fn write_one(langs: &Languages, path: &str, req: &WriteRequest) -> Result<Value,
         done.push((out, grown));
     }
     done.reverse();
+    // Each edit's lines after it are counted in a text without the edits before it, so shift them past those.
     let mut shift = 0;
     let mut replaced = vec![];
-    let mut errors = vec![];
+    let mut hunks = vec![];
     for (out, grown) in done {
         let at = |line: usize| (line as isize + shift) as usize;
         replaced.push(json!([at(out.lines.0), at(out.lines.1)]));
-        errors.extend(out.new_syntax_errors.into_iter().map(|e| json!({"line": at(e.line), "text": e.text})));
+        hunks.push(Hunk { old: out.hunk.old, new: at(out.hunk.new.start)..at(out.hunk.new.end) });
         shift += grown;
     }
+    let syntax = new_errors(&edit::syntax_errors(src.lang, &src.text), edit::syntax_errors(src.lang, &text), &hunks);
+    let line_text = |line: usize| text.lines().nth(line - 1).unwrap_or("").trim().to_string();
+    let errors: Vec<Value> = syntax.iter().map(|e| json!({"line": e.line, "text": line_text(e.line)})).collect();
     let io = |e: std::io::Error| Error::new("io", format!("{path}: {e}"));
     std::fs::create_dir_all(file.parent().unwrap_or(Path::new("."))).map_err(io)?;
     std::fs::write(path, &text).map_err(io)?;
-    let mut report = json!({"ok": true, "file": path, "replaced": replaced});
+    let mut warnings = check(&Written { lang: src.lang, path: file, before: &src.text, after: &text, hunks: &hunks });
     if !errors.is_empty() {
-        report["warnings"] = json!({"new_syntax_errors": errors});
+        warnings.insert("new_syntax_errors".into(), errors.into());
+    }
+    let mut report = json!({"ok": true, "file": path, "replaced": replaced});
+    if !warnings.is_empty() {
+        report["warnings"] = warnings.into();
     }
     Ok(report)
 }
@@ -379,7 +400,7 @@ mod tests {
         let path = at(&dir, "a.rs");
         // When: その呼び出しを before にして書く
         let req = WriteRequest { path: &path, before: Some("x();"), after: "y();", ..Default::default() };
-        let reports = write(&Languages::builtin(), &req).unwrap();
+        let reports = write(&Languages::builtin(), &req, &mut |_| Map::new()).unwrap();
         // Then: 書き込まれ、ok が報告される
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    y();\n}\n");
         assert_eq!(reports, [serde_json::json!({"ok": true, "file": path, "replaced": [[2, 2]]})]);
@@ -389,7 +410,7 @@ mod tests {
         let path = req.path.to_string();
         let req = WriteRequest { path: &path, ..req };
         let _ = dir;
-        write(&Languages::builtin(), &req).unwrap()
+        write(&Languages::builtin(), &req, &mut |_| Map::new()).unwrap()
     }
 
     #[test]
@@ -479,6 +500,39 @@ mod tests {
         // Then: 書き込まれ、構文エラーが警告として報告される
         assert_eq!(reports[0]["ok"], true);
         assert_eq!(reports[0]["warnings"], serde_json::json!({"new_syntax_errors": [{"line": 2, "text": "y(;"}]}));
+    }
+
+    #[test]
+    fn syntax_error_present_before_write_is_not_reported() {
+        // Given: 後ろの関数に構文エラーがあるファイル
+        let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n}\nfn b( {}\n")]);
+        // When: 前の関数の中を、行の増える正しい after で書く
+        let reports = write_in(
+            &dir,
+            WriteRequest { path: &at(&dir, "a.rs"), before: Some("x();"), after: "y();\nz();", ..Default::default() },
+        );
+        // Then: もとからあった構文エラーは報告されない
+        assert!(reports[0].get("warnings").is_none(), "{}", reports[0]);
+    }
+
+    #[test]
+    fn syntax_errors_of_each_match_are_reported_with_lines_after_write() {
+        // Given: 同じ呼び出しが 2 つある関数
+        let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n    w();\n    x();\n}\n")]);
+        // When: 両方を、2 行目の閉じ括弧が足りない 2 行の after で書く
+        let reports = write_in(
+            &dir,
+            WriteRequest {
+                path: &at(&dir, "a.rs"),
+                before: Some("x();"),
+                after: "y();\nz(;",
+                all_matches: true,
+                ..Default::default()
+            },
+        );
+        // Then: 両方の構文エラーが、書き込み後の行で報告される
+        let errors = &reports[0]["warnings"]["new_syntax_errors"];
+        assert_eq!(*errors, serde_json::json!([{"line": 3, "text": "z(;"}, {"line": 6, "text": "z(;"}]));
     }
 
     #[test]
