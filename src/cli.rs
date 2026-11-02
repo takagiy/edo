@@ -17,7 +17,11 @@ enum Cmd {
     /// Print a file with line numbers and function bodies elided, or the definitions/lines selected by a scope.
     ///
     /// <TARGET> is <file>, <file>:<identifier> (Foo.bar or Foo::bar), <file>:<N> or <file>:<N-M>. <file> may be a glob.
-    Read { target: String },
+    /// With several targets, each one's text follows its path.
+    Read {
+        #[arg(required = true)]
+        targets: Vec<String>,
+    },
     /// Replace <BEFORE> with <AFTER>, ignoring indentation and code style differences.
     ///
     /// Without <BEFORE>, the whole target is replaced. Pass - as <AFTER> to read stdin; stdin with
@@ -148,9 +152,13 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages,
             Ok(()) => (String::new(), 0),
             Err(e) => (crate::report(&json!({"ok": false, "error": "io", "message": e.to_string()})), 1),
         },
-        Cmd::Read { target } => {
-            let (path, scope) = split_target(&target);
-            match command::read(&langs, path, scope) {
+        Cmd::Read { targets } => {
+            let items: Vec<command::ReadItem> = targets
+                .iter()
+                .map(|t| split_target(t))
+                .map(|(path, scope)| command::ReadItem { path, scope })
+                .collect();
+            match command::read(&langs, &items) {
                 Ok(text) => (text, 0),
                 Err(e) => (crate::report(&e.to_json()), 1),
             }
@@ -294,6 +302,16 @@ mod tests {
         let (out, code) = edo(&["read", &path], "");
         // Then: テキストが出力され、終了コードは 0
         assert_eq!((out.as_str(), code), ("1\tfn a() {}\n", 0));
+    }
+
+    #[test]
+    fn read_takes_several_targets() {
+        // Given: 関数が 2 つあるファイル
+        let (_dir, path) = file("fn a() {}\nfn b() {}\n");
+        // When: 同じファイルの 2 つの定義を、対象として並べて読む
+        let (out, _) = edo(&["read", &format!("{path}:a"), &format!("{path}:b")], "");
+        // Then: 対象ごとに、パスの行の後にその内容が並ぶ
+        assert_eq!(out, format!("{path}\n1\tfn a() {{}}\n{path}\n2\tfn b() {{}}\n"));
     }
 
     #[test]

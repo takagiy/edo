@@ -15,6 +15,17 @@ use crate::lsp::Servers;
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadParams {
     /// File path or glob.
+    pub path: Option<String>,
+    /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M).
+    pub scope: Option<String>,
+    /// More to read in the same call, after `path`.
+    #[serde(default)]
+    pub reads: Vec<ReadTarget>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadTarget {
+    /// File path or glob.
     pub path: String,
     /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M).
     pub scope: Option<String>,
@@ -78,11 +89,19 @@ impl Server {
     #[tool(description = "Read a source file with line numbers (`N<TAB>line`). Function and method bodies are \
         hidden: they leave gaps in the line numbers, or show as `...` when they share a line with other code.\n\n\
         To see more, pass `scope`: an identifier such as `Foo.bar` or `Foo::bar` (a function shows in full; a class \
-        shows its members with bodies hidden), or a line range `N` or `N-M` (shown in full). `path` may be a glob.")]
+        shows its members with bodies hidden), or a line range `N` or `N-M` (shown in full). `path` may be a glob.\n\n\
+        To read several things in one call, list them in `reads` as `{path, scope}`; each one's text follows its \
+        path.")]
     fn read(&self, Parameters(p): Parameters<ReadParams>) -> CallToolResult {
-        match command::read(&self.langs, &p.path, p.scope.as_deref()) {
+        let first = p.path.as_deref().map(|path| command::ReadItem { path, scope: p.scope.as_deref() });
+        let rest = p.reads.iter().map(|r| command::ReadItem { path: &r.path, scope: r.scope.as_deref() });
+        let items: Vec<command::ReadItem> = first.into_iter().chain(rest).collect();
+        if items.is_empty() {
+            return error(crate::Error::new("usage", "give path, or reads"));
+        }
+        match command::read(&self.langs, &items) {
             Ok(text) => {
-                self.remember(&p.path);
+                items.iter().for_each(|i| self.remember(i.path));
                 CallToolResult::success(vec![ContentBlock::text(text)])
             }
             Err(e) => error(e),
@@ -220,6 +239,18 @@ mod tests {
         let (text, _) = tool(&client, "read", json!({"path": path, "scope": "a"})).await;
         // Then: その定義のテキストが返る
         assert_eq!(text, "1\tfn a() {\n2\t    x();\n3\t}\n");
+    }
+
+    #[tokio::test]
+    async fn read_tool_reads_each_of_reads_after_path() {
+        // Given: 関数が 2 つあるファイル
+        let (_dir, path) = file("fn a() {}\nfn b() {}\n");
+        let client = connect().await;
+        // When: path と scope に加えて、reads にもう 1 つ渡して read を呼ぶ
+        let args = json!({"path": path, "scope": "a", "reads": [{"path": path, "scope": "b"}]});
+        let (text, _) = tool(&client, "read", args).await;
+        // Then: path の分、reads の分の順に、それぞれパスの行の後に並ぶ
+        assert_eq!(text, format!("{path}\n1\tfn a() {{}}\n{path}\n2\tfn b() {{}}\n"));
     }
 
     #[tokio::test]

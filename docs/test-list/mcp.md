@@ -10,3 +10,4 @@
 - [x] edo 自身の write の後に行範囲で書いても、stale の警告は付かない
 - [x] 識別子のスコープで書くときは、stale の警告は付かない
 - [x] write ツールの `mode` で一致の後ろに挿入できる
+- [x] read ツールは path と scope に加えて reads の要素も読み、path の分、reads の分の順に並べる

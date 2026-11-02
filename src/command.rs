@@ -91,9 +91,29 @@ fn supported(langs: &Languages, files: Vec<String>) -> (Vec<String>, Skipped) {
     (files, skipped)
 }
 
-/// `read_files`, with a panic reported as an `internal` error.
-pub fn read(langs: &Languages, path: &str, scope: Option<&str>) -> Result<String, Error> {
-    guarded(|| read_files(langs, path, scope))
+/// One thing to read: a file or glob, and the scope in it if any.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadItem<'a> {
+    pub path: &'a str,
+    pub scope: Option<&'a str>,
+}
+
+/// Reads each item in turn, with a panic reported as an `internal` error. With several items, each one's
+/// text follows its path, as a glob's files do, and the first failure fails the whole read.
+pub fn read(langs: &Languages, items: &[ReadItem]) -> Result<String, Error> {
+    let several = items.len() > 1;
+    guarded(|| {
+        let mut out = String::new();
+        for (i, item) in items.iter().enumerate() {
+            let text =
+                read_files(langs, item.path, item.scope).map_err(|e| Error { item: several.then_some(i + 1), ..e })?;
+            if several && !is_glob(item.path) {
+                out.push_str(&format!("{}\n", item.path));
+            }
+            out.push_str(&text);
+        }
+        Ok(out)
+    })
 }
 
 /// `write_files`, with a panic reported as an `internal` error.
@@ -363,7 +383,7 @@ mod tests {
         // Given: 関数のある Rust のファイル
         let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n}\n")]);
         // When: ファイルを読む
-        let out = read(&Languages::builtin(), &at(&dir, "a.rs"), None).unwrap();
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: None }]).unwrap();
         // Then: ボディを省略したアウトラインが返る
         assert_eq!(out, "1\tfn a() {\n3\t}\n");
     }
@@ -373,7 +393,7 @@ mod tests {
         // Given: 2 つの Rust のファイル
         let dir = dir_with(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
         // When: glob で読む
-        let out = read(&Languages::builtin(), &at(&dir, "src/*.rs"), None).unwrap();
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "src/*.rs"), scope: None }]).unwrap();
         // Then: ファイルごとにパスの行が前に付く
         assert_eq!(
             out,
@@ -381,12 +401,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reading_several_items_puts_each_after_its_path() {
+        // Given: 関数が 2 つある Rust のファイルと、関数が 1 つある Rust のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\nfn b() {}\n"), ("b.rs", "fn c() {}\n")]);
+        let (a, b) = (at(&dir, "a.rs"), at(&dir, "b.rs"));
+        // When: 1 つ目のファイルの定義と、2 つ目のファイル全体を、1 回で読む
+        let out =
+            read(&Languages::builtin(), &[ReadItem { path: &a, scope: Some("b") }, ReadItem { path: &b, scope: None }]);
+        // Then: 要素ごとに、パスの行の後にその内容が並ぶ
+        assert_eq!(out.unwrap(), format!("{a}\n2\tfn b() {{}}\n{b}\n1\tfn c() {{}}\n"));
+    }
+
+    #[test]
+    fn failing_item_fails_whole_read_with_its_number() {
+        // Given: 関数が 1 つある Rust のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
+        let a = at(&dir, "a.rs");
+        // When: ファイル全体と、ない定義を、1 回で読む
+        let err = read(
+            &Languages::builtin(),
+            &[ReadItem { path: &a, scope: None }, ReadItem { path: &a, scope: Some("zzz") }],
+        );
+        // Then: 全体が not_found になり、2 つ目の要素だとわかる
+        let err = err.unwrap_err();
+        assert_eq!((err.code, err.item), ("not_found", Some(2)));
+    }
+
     fn read_error(files: &[(&str, &[u8])], name: &str) -> &'static str {
         let dir = tempfile::tempdir().unwrap();
         for (n, bytes) in files {
             std::fs::write(dir.path().join(n), bytes).unwrap();
         }
-        read(&Languages::builtin(), &at(&dir, name), None).unwrap_err().code
+        read(&Languages::builtin(), &[ReadItem { path: &at(&dir, name), scope: None }]).unwrap_err().code
     }
 
     #[test]
@@ -635,7 +682,7 @@ mod tests {
         // Given: .gitignore で target/ を除外したディレクトリ
         let dir = dir_with(&[(".gitignore", "target/\n"), ("a.rs", "fn a() {}\n"), ("target/b.rs", "fn b() {}\n")]);
         // When: ** の glob で読む
-        let out = read(&Languages::builtin(), &at(&dir, "**/*.rs"), None).unwrap();
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "**/*.rs"), scope: None }]).unwrap();
         // Then: 除外されたファイルは含まれない
         assert!(!out.contains("b.rs"), "{out}");
         assert!(out.contains("a.rs"));
@@ -646,7 +693,7 @@ mod tests {
         // Given: Rust のファイルと JSON のファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.json", "{}")]);
         // When: 両方に一致する glob で読む
-        let out = read(&Languages::builtin(), &at(&dir, "*"), None).unwrap();
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*"), scope: None }]).unwrap();
         // Then: 言語パッケージのない JSON は飛ばされ、Rust のファイルは読める
         assert!(out.starts_with(&format!("{}\n1\tfn a() {{}}\n", at(&dir, "a.rs"))), "{out}");
         assert!(!out.contains("b.json"), "{out}");
@@ -657,7 +704,7 @@ mod tests {
         // Given: Rust のファイルだけがあるディレクトリ
         let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
         // When: どのファイルにも一致しない glob で読む
-        let err = read(&Languages::builtin(), &at(&dir, "*.kt"), None).unwrap_err();
+        let err = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*.kt"), scope: None }]).unwrap_err();
         // Then: not_found になる
         assert_eq!(err.code, "not_found");
     }
@@ -667,7 +714,7 @@ mod tests {
         // Given: 関数 a だけがある Rust のファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
         // When: スコープ b で読む
-        let err = read(&Languages::builtin(), &at(&dir, "a.rs"), Some("b")).unwrap_err();
+        let err = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: Some("b") }]).unwrap_err();
         // Then: スコープの名前を挙げた not_found になる
         assert_eq!(err.code, "not_found");
         assert!(err.message.contains("b"), "{}", err.message);
@@ -678,7 +725,7 @@ mod tests {
         // Given: 関数 a を持つファイルと、関数 b を持つファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")]);
         // When: 両方に一致する glob を、スコープ a で読む
-        let out = read(&Languages::builtin(), &at(&dir, "*.rs"), Some("a")).unwrap();
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*.rs"), scope: Some("a") }]).unwrap();
         // Then: a を持つファイルだけが出る
         assert_eq!(out, format!("{}\n1\tfn a() {{}}\n", at(&dir, "a.rs")));
     }
@@ -688,7 +735,7 @@ mod tests {
         // Given: 関数 a だけを持つファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
         // When: glob を、どのファイルにもないスコープ b で読む
-        let err = read(&Languages::builtin(), &at(&dir, "*.rs"), Some("b")).unwrap_err();
+        let err = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*.rs"), scope: Some("b") }]).unwrap_err();
         // Then: not_found になる
         assert_eq!(err.code, "not_found");
     }
@@ -698,7 +745,7 @@ mod tests {
         // Given: 言語パッケージのないファイルだけがあるディレクトリ
         let dir = dir_with(&[("a.json", "{}"), ("b.json", "{}"), ("c.yaml", "a: 1\n")]);
         // When: glob で読む
-        let err = read(&Languages::builtin(), &at(&dir, "*"), None).unwrap_err();
+        let err = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*"), scope: None }]).unwrap_err();
         // Then: unsupported_language になり、飛ばした拡張子ごとの件数を持つ
         assert_eq!(err.code, "unsupported_language");
         assert_eq!(
@@ -712,7 +759,7 @@ mod tests {
         // Given: Rust のファイルと JSON のファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.json", "{}")]);
         // When: glob で読む
-        let out = read(&Languages::builtin(), &at(&dir, "*"), None).unwrap();
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*"), scope: None }]).unwrap();
         // Then: 出力の最後の行に、飛ばした拡張子ごとの件数が MISON で付く
         let last = "skipped=(reason=unsupported_language extensions=(json=1))";
         assert_eq!(out, format!("{}\n1\tfn a() {{}}\n{last}\n", at(&dir, "a.rs")));

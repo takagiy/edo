@@ -37,17 +37,22 @@ pub struct Error {
     pub code: &'static str,
     pub message: String,
     pub skipped: Skipped,
+    /// Which of several requested items failed, counting from 1; absent when only one was requested.
+    pub item: Option<usize>,
 }
 
 impl Error {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Error { code, message: message.into(), skipped: Skipped::new() }
+        Error { code, message: message.into(), skipped: Skipped::new(), item: None }
     }
 
     pub fn to_json(&self) -> Value {
         let mut v = json!({"ok": false, "error": self.code, "message": self.message});
         if !self.skipped.is_empty() {
             v["skipped"] = skipped_json(&self.skipped);
+        }
+        if let Some(item) = self.item {
+            v["item"] = item.into();
         }
         v
     }
