@@ -13,6 +13,15 @@
 - [x] `--remove` で edo の hook が消え、ほかの hook は残る
 - [x] `--remove` で MCP は `claude mcp remove --scope user` で外れる
 
+## Codex
+
+- [x] MCP は `codex mcp add` に edo の絶対パスと `mcp` を渡して登録する
+- [x] hook は `~/.codex/hooks.json` の `PreToolUse`（apply_patch）と `PostToolUse`（Bash）に、edo の絶対パスで入る
+## hook のコマンド
+
+- [x] hook のコマンドは、引用符で囲まない edo のパスで書く（PowerShell では、引用符で囲んだパスの後に引数を続けられない）
+- [x] 以前の版が引用符付きで書いた hook も、入れ直すと置き換わる
+- [x] 空白を含むパスの edo では、何も書き込まずにエラーになる
 ## 共通
 
 - [x] ハーネスを省くと、設定ディレクトリがあるハーネスすべてが対象になる

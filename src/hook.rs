@@ -90,7 +90,8 @@ struct Adapter {
 
 fn adapter(harness: &str) -> Option<Adapter> {
     match harness {
-        "ClaudeCode" => Some(Adapter { call: claude_call, answer: claude_answer }),
+        "ClaudeCode" => Some(Adapter { call: claude_call, answer: hook_specific_answer }),
+        "Codex" => Some(Adapter { call: codex_call, answer: hook_specific_answer }),
         _ => None,
     }
 }
@@ -133,8 +134,25 @@ fn claude_call(input: &Value) -> Option<Call> {
     })
 }
 
-/// Claude Code reads nothing as allow, `permissionDecision` as a denial and `additionalContext` as a note.
-fn claude_answer(phase: Phase, decision: Decision) -> String {
+/// Codex edits files with `apply_patch`, whose patch names each file on a `*** Add File:` or `*** Update File:`
+/// line; it has no read tool. A deleted file is left alone, since edo cannot delete one.
+fn codex_call(input: &Value) -> Option<Call> {
+    let command = input["tool_input"]["command"].as_str()?;
+    match input["tool_name"].as_str()? {
+        "Bash" => Some(Call { action: Action::Shell, paths: shown_files(command) }),
+        "apply_patch" => {
+            let files =
+                |line: &'static str| command.lines().filter_map(move |l| l.strip_prefix(line)).map(PathBuf::from);
+            let updated: Vec<PathBuf> = files("*** Update File: ").collect();
+            let action = if updated.is_empty() { Action::Write } else { Action::Edit };
+            Some(Call { action, paths: updated.into_iter().chain(files("*** Add File: ")).collect() })
+        }
+        _ => None,
+    }
+}
+
+/// Claude Code and Codex read nothing as allow, `permissionDecision` as a denial and `additionalContext` as a note.
+fn hook_specific_answer(phase: Phase, decision: Decision) -> String {
     let event = match phase {
         Phase::Pre => "PreToolUse",
         Phase::Post => "PostToolUse",
@@ -316,6 +334,57 @@ mod tests {
         let out = run("ClaudeCode:PreToolUse", &input.to_string(), &langs());
         // Then: 何も出力しない
         assert_eq!(out, "");
+    }
+
+    fn codex(event: &str, input: Value) -> Value {
+        let out = run(&format!("Codex:{event}"), &input.to_string(), &langs());
+        if out.is_empty() { Value::Null } else { serde_json::from_str(&out).unwrap() }
+    }
+
+    fn patch(body: &str) -> Value {
+        json!({"tool_name": "apply_patch", "tool_input": {"command": format!("*** Begin Patch\n{body}*** End Patch\n")}})
+    }
+
+    #[test]
+    fn codex_patch_updating_file_is_editing_it() {
+        // Given: Codex の、src/a.rs を更新する apply_patch の入力
+        let input = patch("*** Update File: src/a.rs\n@@\n-fn a() {}\n+fn b() {}\n");
+        // When: 実行前の hook に渡す
+        let out = codex("PreToolUse", input);
+        // Then: src/a.rs を編集する呼び出しとして止められる
+        let reason = out["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+        assert!(reason.contains("src/a.rs") && reason.contains("before and after"), "{out}");
+    }
+
+    #[test]
+    fn codex_patch_adding_file_is_writing_it() {
+        // Given: Codex の、src/a.rs を追加する apply_patch の入力
+        let input = patch("*** Add File: src/a.rs\n+fn a() {}\n");
+        // When: 実行前の hook に渡す
+        let out = codex("PreToolUse", input);
+        // Then: src/a.rs を書く呼び出しとして止められる
+        let reason = out["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+        assert!(reason.contains("src/a.rs") && reason.contains("whole file"), "{out}");
+    }
+
+    #[test]
+    fn codex_patch_on_unsupported_file_is_allowed() {
+        // Given: Codex の、README.txt を更新する apply_patch の入力
+        let input = patch("*** Update File: README.txt\n@@\n-a\n+b\n");
+        // When: 実行前の hook に渡す
+        let out = run("Codex:PreToolUse", &input.to_string(), &langs());
+        // Then: 何も出力せずに通す
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn codex_bash_takes_shell_command_from_command() {
+        // Given: Codex の Bash の入力
+        let input = json!({"tool_name": "Bash", "tool_input": {"command": "cat src/a.rs"}});
+        // When: 実行後の hook に渡す
+        let out = codex("PostToolUse", input);
+        // Then: additionalContext で edo を勧める
+        assert!(out["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("src/a.rs"), "{out}");
     }
 
     #[test]

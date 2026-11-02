@@ -16,14 +16,39 @@ pub struct Env<'a> {
     pub run: Run<'a>,
 }
 
-/// A harness edo installs into: its settings directory under the home, and how to install or remove.
+/// A harness edo installs into. Both register MCP servers through their own CLI, since they own the file
+/// those live in, and keep hooks in a JSON file of the same shape.
 struct Harness {
     name: &'static str,
+    /// Settings directory under the home.
     dir: &'static str,
-    install: fn(&Env, &Path, bool) -> Result<(), Error>,
+    /// The CLI that registers MCP servers, and the arguments that make `mcp add`/`mcp remove` user-level.
+    cli: &'static str,
+    scope: &'static [&'static str],
+    /// The JSON file holding `hooks`, and edo's hooks in it as (event, matcher).
+    hooks_file: &'static str,
+    hooks: &'static [(&'static str, &'static str)],
 }
 
-const HARNESSES: [Harness; 1] = [Harness { name: "ClaudeCode", dir: ".claude", install: claude }];
+const HARNESSES: [Harness; 2] = [
+    Harness {
+        name: "ClaudeCode",
+        dir: ".claude",
+        cli: "claude",
+        scope: &["--scope", "user"],
+        hooks_file: "settings.json",
+        hooks: &[("PreToolUse", "Read|Edit|Write"), ("PostToolUse", "Bash")],
+    },
+    // Codex has no read tool, so reads only get advice after the shell ran them.
+    Harness {
+        name: "Codex",
+        dir: ".codex",
+        cli: "codex",
+        scope: &[],
+        hooks_file: "hooks.json",
+        hooks: &[("PreToolUse", "apply_patch"), ("PostToolUse", "Bash")],
+    },
+];
 
 /// Installs edo into the named harnesses, or into every harness whose settings directory exists;
 /// with `remove`, takes out what an install added. Reports per harness.
@@ -39,7 +64,7 @@ pub fn init(env: &Env, names: &[String], remove: bool) -> Vec<Value> {
         if !dir.is_dir() {
             return Err(Error::new("not_found", format!("{} does not exist", dir.display())));
         }
-        (harness.install)(env, &dir, remove)
+        install(env, harness, &dir, remove)
     };
     let reports = names.iter().map(|name| match report(name) {
         Ok(()) => json!({"ok": true, "harness": name, "installed": !remove}),
@@ -57,21 +82,23 @@ pub fn run_program(program: &str, args: &[String]) -> Result<(), String> {
     Err(format!("{program} {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()))
 }
 
-/// Claude Code owns `~/.claude.json`, where user-scope MCP servers live, so its CLI registers edo there;
-/// the hooks go into `settings.json`.
-fn claude(env: &Env, dir: &Path, remove: bool) -> Result<(), Error> {
-    let claude = |args: &[&str]| {
-        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-        (env.run)("claude", &args).map_err(|e| Error::new("harness", e))
+fn install(env: &Env, harness: &Harness, dir: &Path, remove: bool) -> Result<(), Error> {
+    // shortcut: no quoting works in every shell a harness may run hooks with; quote per harness if this bites.
+    if env.exe.to_string_lossy().contains(char::is_whitespace) {
+        let message = format!("{} contains spaces; put edo where its path has none", env.exe.display());
+        return Err(Error::new("unsupported_path", message));
+    }
+    let mcp = |verb: &str, rest: &[&str]| {
+        let args = ["mcp", verb].iter().chain(harness.scope).chain(rest).map(|a| a.to_string()).collect::<Vec<_>>();
+        (env.run)(harness.cli, &args).map_err(|e| Error::new("harness", e))
     };
     // Also takes out an earlier registration, so installing again replaces it; there may be none.
-    let _ = claude(&["mcp", "remove", "--scope", "user", "edo"]);
+    let _ = mcp("remove", &["edo"]);
     if !remove {
-        claude(&["mcp", "add", "--scope", "user", "edo", "--", &env.exe.to_string_lossy(), "mcp"])?;
+        mcp("add", &["edo", "--", &env.exe.to_string_lossy(), "mcp"])?;
     }
-    let groups: &[(&str, &str)] =
-        if remove { &[] } else { &[("PreToolUse", "Read|Edit|Write"), ("PostToolUse", "Bash")] };
-    edit_json(&dir.join("settings.json"), |settings| set_hooks(settings, "ClaudeCode", &env.exe, groups))
+    let hooks = if remove { &[][..] } else { harness.hooks };
+    edit_json(&dir.join(harness.hooks_file), |settings| set_hooks(settings, harness.name, &env.exe, hooks))
 }
 
 /// Replaces edo's hooks under `hooks.<event>` with one group per `(event, matcher)`, leaving other hooks alone.
@@ -91,7 +118,9 @@ fn set_hooks(settings: &mut Value, harness: &str, exe: &Path, groups: &[(&str, &
         });
     }
     events.retain(|_, groups| groups.as_array().is_none_or(|g| !g.is_empty()));
-    let command = |event: &str| format!("\"{}\" hook {harness}:{event}", exe.to_string_lossy().replace('\\', "/"));
+    // Unquoted, since a quoted program followed by arguments is a syntax error in PowerShell, which Codex runs
+    // hooks with on Windows; `install` refuses a path with spaces, which would need quoting.
+    let command = |event: &str| format!("{} hook {harness}:{event}", exe.to_string_lossy().replace('\\', "/"));
     for (event, matcher) in groups {
         let group = json!({"matcher": matcher, "hooks": [{"type": "command", "command": command(event)}]});
         let list = events.entry(*event).or_insert_with(|| json!([]));
@@ -210,8 +239,8 @@ mod tests {
         let settings = f.settings();
         assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "Read|Edit|Write");
         assert_eq!(settings["hooks"]["PostToolUse"][0]["matcher"], "Bash");
-        assert_eq!(f.commands("PreToolUse"), [format!("\"{EDO}\" hook ClaudeCode:PreToolUse")]);
-        assert_eq!(f.commands("PostToolUse"), [format!("\"{EDO}\" hook ClaudeCode:PostToolUse")]);
+        assert_eq!(f.commands("PreToolUse"), [format!("{EDO} hook ClaudeCode:PreToolUse")]);
+        assert_eq!(f.commands("PostToolUse"), [format!("{EDO} hook ClaudeCode:PostToolUse")]);
     }
 
     #[test]
@@ -248,7 +277,31 @@ mod tests {
         // When: 別の場所の edo で入れ直す
         f.init("/usr/local/bin/edo", &["ClaudeCode"], false);
         // Then: hook のパスが置き換わる
-        assert_eq!(f.commands("PreToolUse"), ["\"/usr/local/bin/edo\" hook ClaudeCode:PreToolUse"]);
+        assert_eq!(f.commands("PreToolUse"), ["/usr/local/bin/edo hook ClaudeCode:PreToolUse"]);
+    }
+
+    #[test]
+    fn hooks_written_with_quotes_by_earlier_versions_are_replaced() {
+        // Given: 引用符で囲んだパスの edo の hook が入った settings.json
+        let f = Fixture::new();
+        let quoted = json!({"matcher": "Read", "hooks": [{"type": "command", "command": format!("\"{EDO}\" hook ClaudeCode:PreToolUse")}]});
+        f.write_settings(json!({"hooks": {"PreToolUse": [quoted]}}));
+        // When: 入れ直す
+        f.init(EDO, &["ClaudeCode"], false);
+        // Then: 引用符のない hook だけが残る
+        assert_eq!(f.commands("PreToolUse"), [format!("{EDO} hook ClaudeCode:PreToolUse")]);
+    }
+
+    #[test]
+    fn edo_path_with_spaces_is_error_without_changes() {
+        // Given: ~/.claude のあるホームと、空白を含むパスの edo
+        let f = Fixture::new();
+        // When: 入れる
+        let reports = f.init("/opt/my tools/edo", &["ClaudeCode"], false);
+        // Then: エラーになり、MCP の登録も hook の書き込みもしない
+        assert_eq!(reports[0]["ok"], false);
+        assert!(f.calls.borrow().is_empty(), "{:?}", f.calls);
+        assert!(!f.settings_path().exists());
     }
 
     #[test]
@@ -320,5 +373,32 @@ mod tests {
         let reports = f.init(EDO, &["ClaudeCode"], false);
         // Then: ハーネスごとの報告になる
         assert_eq!(reports, [json!({"ok": true, "harness": "ClaudeCode", "installed": true})]);
+    }
+
+    #[test]
+    fn codex_mcp_is_added_with_absolute_path() {
+        // Given: ~/.codex のあるホーム
+        let f = Fixture::new();
+        std::fs::create_dir(f.home.path().join(".codex")).unwrap();
+        // When: Codex に入れる
+        f.init(EDO, &["Codex"], false);
+        // Then: codex mcp add に edo の絶対パスと mcp が渡る
+        assert!(f.calls.borrow().contains(&format!("codex mcp add edo -- {EDO} mcp")), "{:?}", f.calls);
+    }
+
+    #[test]
+    fn codex_hooks_go_into_hooks_json_with_absolute_path() {
+        // Given: ~/.codex のあるホーム
+        let f = Fixture::new();
+        std::fs::create_dir(f.home.path().join(".codex")).unwrap();
+        // When: Codex に入れる
+        f.init(EDO, &["Codex"], false);
+        // Then: ~/.codex/hooks.json の、実行前は apply_patch に、実行後は Bash に、edo の絶対パスの hook が入る
+        let text = std::fs::read_to_string(f.home.path().join(".codex/hooks.json")).unwrap();
+        let hooks: Value = serde_json::from_str(&text).unwrap();
+        let pre = &hooks["hooks"]["PreToolUse"][0];
+        assert_eq!(pre["matcher"], "apply_patch");
+        assert_eq!(pre["hooks"][0]["command"], format!("{EDO} hook Codex:PreToolUse"));
+        assert_eq!(hooks["hooks"]["PostToolUse"][0]["matcher"], "Bash");
     }
 }
