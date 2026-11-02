@@ -17,6 +17,11 @@
 
 - [x] MCP は `codex mcp add` に edo の絶対パスと `mcp` を渡して登録する
 - [x] hook は `~/.codex/hooks.json` の `PreToolUse`（apply_patch）と `PostToolUse`（Bash）に、edo の絶対パスで入る
+## Cursor
+
+- [x] MCP は `~/.cursor/mcp.json` の `mcpServers.edo` に、edo の絶対パスと `mcp` で入る
+- [x] hook は `~/.cursor/hooks.json` に、`version: 1` と、実行前は Read と Write、実行後は Shell を対象にしたエントリーとして入る
+- [x] `--remove` で edo だけが消え、ほかの MCP サーバーと hook は残る
 ## hook のコマンド
 
 - [x] hook のコマンドは、引用符で囲まない edo のパスで書く（PowerShell では、引用符で囲んだパスの後に引数を続けられない）

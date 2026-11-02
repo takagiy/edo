@@ -90,8 +90,10 @@ struct Adapter {
 
 fn adapter(harness: &str) -> Option<Adapter> {
     match harness {
-        "ClaudeCode" => Some(Adapter { call: claude_call, answer: hook_specific_answer }),
+        // Cursor runs Claude Code's hooks too, so where both have edo, Cursor hears from it twice.
+        "ClaudeCode" => Some(Adapter { call: tool_call, answer: hook_specific_answer }),
         "Codex" => Some(Adapter { call: codex_call, answer: hook_specific_answer }),
+        "Cursor" => Some(Adapter { call: tool_call, answer: cursor_answer }),
         _ => None,
     }
 }
@@ -104,9 +106,10 @@ pub fn run(target: &str, input: &str, langs: &Languages) -> String {
         eprintln!("edo hook: unknown harness {harness}; allowing");
         return String::new();
     };
-    let phase = match event {
-        "PreToolUse" => Phase::Pre,
-        "PostToolUse" => Phase::Post,
+    // Cursor spells its events preToolUse and postToolUse.
+    let phase = match event.to_ascii_lowercase().as_str() {
+        "pretooluse" => Phase::Pre,
+        "posttooluse" => Phase::Post,
         _ => {
             eprintln!("edo hook: unknown event {event}; allowing");
             return (adapter.answer)(Phase::Pre, Decision::Allow);
@@ -122,16 +125,29 @@ pub fn run(target: &str, input: &str, langs: &Languages) -> String {
     (adapter.answer)(phase, decision)
 }
 
-fn claude_call(input: &Value) -> Option<Call> {
+/// Claude Code's and Cursor's tools: their file tools take `file_path` and their shell (Bash or Shell)
+/// `command`.
+fn tool_call(input: &Value) -> Option<Call> {
     let tool = &input["tool_input"];
     let file = || tool["file_path"].as_str().map(PathBuf::from).into_iter().collect();
     Some(match input["tool_name"].as_str()? {
         "Read" => Call { action: Action::Read, paths: file() },
         "Edit" | "MultiEdit" => Call { action: Action::Edit, paths: file() },
         "Write" => Call { action: Action::Write, paths: file() },
-        "Bash" => Call { action: Action::Shell, paths: shown_files(tool["command"].as_str()?) },
+        "Bash" | "Shell" => Call { action: Action::Shell, paths: shown_files(tool["command"].as_str()?) },
         _ => return None,
     })
+}
+
+/// Cursor blocks an action when a permission hook answers anything but valid JSON, so allow is spelled out.
+fn cursor_answer(phase: Phase, decision: Decision) -> String {
+    let answer = match (phase, decision) {
+        (_, Decision::Deny(reason)) => json!({"permission": "deny", "agent_message": reason}),
+        (_, Decision::Advise(note)) => json!({"additional_context": note}),
+        (Phase::Pre, Decision::Allow) => json!({"permission": "allow"}),
+        (Phase::Post, Decision::Allow) => json!({}),
+    };
+    answer.to_string()
 }
 
 /// Codex edits files with `apply_patch`, whose patch names each file on a `*** Add File:` or `*** Update File:`
@@ -385,6 +401,60 @@ mod tests {
         let out = codex("PostToolUse", input);
         // Then: additionalContext で edo を勧める
         assert!(out["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("src/a.rs"), "{out}");
+    }
+
+    fn cursor(event: &str, input: Value) -> Value {
+        serde_json::from_str(&run(&format!("Cursor:{event}"), &input.to_string(), &langs())).unwrap()
+    }
+
+    #[test]
+    fn cursor_read_is_denied_with_agent_message() {
+        // Given: Cursor の、対応言語のファイルを読む Read の入力
+        let input =
+            json!({"tool_name": "Read", "tool_input": {"file_path": "C:\\work\\a.rs"}, "cursor_version": "3.27.12"});
+        // When: 実行前の hook に渡す
+        let out = cursor("preToolUse", input);
+        // Then: permission: deny と、エージェント向けの理由を返す
+        assert_eq!(out["permission"], "deny");
+        assert!(out["agent_message"].as_str().unwrap().contains("mcp__edo__read"), "{out}");
+    }
+
+    #[test]
+    fn cursor_write_is_denied_toward_edo_write() {
+        // Given: Cursor の、対応言語のファイルを書く Write の入力
+        let input = json!({"tool_name": "Write", "tool_input": {"file_path": "a.rs", "content": "fn a() {}"}});
+        // When: 実行前の hook に渡す
+        let out = cursor("preToolUse", input);
+        // Then: mcp__edo__write へ誘導して止める
+        assert!(out["agent_message"].as_str().unwrap().contains("mcp__edo__write"), "{out}");
+    }
+
+    #[test]
+    fn cursor_allow_is_permission_allow() {
+        // Given: Cursor の、対応していないファイルを読む Read の入力
+        let input = json!({"tool_name": "Read", "tool_input": {"file_path": "a.yaml"}});
+        // When: 実行前の hook に渡す
+        let out = cursor("preToolUse", input);
+        // Then: 正しい JSON で permission: allow を返す
+        assert_eq!(out, json!({"permission": "allow"}));
+    }
+
+    #[test]
+    fn cursor_shell_after_run_is_advised_with_additional_context() {
+        // Given: Cursor の、対応言語のファイルを表示した Shell の入力
+        let input = json!({"tool_name": "Shell", "tool_input": {"command": "cat a.rs"}});
+        // When: 実行後の hook に渡す
+        let out = cursor("postToolUse", input);
+        // Then: additional_context で edo を勧める
+        assert!(out["additional_context"].as_str().unwrap().contains("a.rs"), "{out}");
+    }
+
+    #[test]
+    fn cursor_unreadable_input_is_allowed_with_valid_json() {
+        // Given / When: JSON でない入力を Cursor の実行前の hook に渡す
+        let out = run("Cursor:preToolUse", "not json", &langs());
+        // Then: 正しい JSON で通す（Cursor は不正な JSON の答えで操作を止めるため）
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), json!({"permission": "allow"}));
     }
 
     #[test]

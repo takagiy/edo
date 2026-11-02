@@ -30,6 +30,12 @@
 - [x] apply_patch の `*** Add File:` の行のファイルは、書く呼び出しのパスになる
 - [x] 対応していないファイルだけの apply_patch は、何も出力せずに通す
 - [x] Bash の `tool_input.command` がシェルの呼び出しになり、添えるときは `additionalContext` を返す
+## Cursor の入口と出口
+
+- [x] Read と Write の `tool_input.file_path` がその呼び出しのパスになり、止めるときは `permission: deny` と `agent_message` を返す
+- [x] 通すときは `{"permission":"allow"}` を返す
+- [x] Shell の `tool_input.command` がシェルの呼び出しになり、添えるときは `additional_context` を返す
+- [x] 読めない入力でも、正しい JSON で通す
 ## 失敗
 
 - [x] 読めない入力では、ハーネスの形で通す

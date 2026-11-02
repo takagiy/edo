@@ -57,8 +57,8 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum HarnessCmd {
-    /// Register edo's MCP server and hooks in the user settings of the given harnesses (ClaudeCode), or of
-    /// every harness whose settings directory exists.
+    /// Register edo's MCP server and hooks in the user settings of the given harnesses (ClaudeCode, Codex,
+    /// Cursor), or of every harness whose settings directory exists.
     Init {
         harnesses: Vec<String>,
         /// Take out what init added instead.

@@ -16,37 +16,62 @@ pub struct Env<'a> {
     pub run: Run<'a>,
 }
 
-/// A harness edo installs into. Both register MCP servers through their own CLI, since they own the file
-/// those live in, and keep hooks in a JSON file of the same shape.
+/// Where a harness keeps its user-level MCP servers.
+enum Mcp {
+    /// Its CLI owns the file, so edo registers through `<program> mcp add|remove <scope...>`.
+    Cli { program: &'static str, scope: &'static [&'static str] },
+    /// A JSON file of `mcpServers` that edo edits itself, for a harness without such a CLI.
+    Json(&'static str),
+}
+
+/// A harness edo installs into.
 struct Harness {
     name: &'static str,
     /// Settings directory under the home.
     dir: &'static str,
-    /// The CLI that registers MCP servers, and the arguments that make `mcp add`/`mcp remove` user-level.
-    cli: &'static str,
-    scope: &'static [&'static str],
-    /// The JSON file holding `hooks`, and edo's hooks in it as (event, matcher).
+    mcp: Mcp,
+    /// The JSON file holding `hooks`, what a new one starts as, and edo's hooks in it as (event, matcher).
     hooks_file: &'static str,
+    hooks_new: fn() -> Value,
     hooks: &'static [(&'static str, &'static str)],
+    /// One hook entry under an event, from its matcher and command.
+    entry: fn(&str, &str) -> Value,
 }
 
-const HARNESSES: [Harness; 2] = [
+/// Claude Code and Codex group hooks under a matcher.
+fn group(matcher: &str, command: &str) -> Value {
+    json!({"matcher": matcher, "hooks": [{"type": "command", "command": command}]})
+}
+
+const HARNESSES: [Harness; 3] = [
     Harness {
         name: "ClaudeCode",
         dir: ".claude",
-        cli: "claude",
-        scope: &["--scope", "user"],
+        mcp: Mcp::Cli { program: "claude", scope: &["--scope", "user"] },
         hooks_file: "settings.json",
+        hooks_new: || json!({}),
         hooks: &[("PreToolUse", "Read|Edit|Write"), ("PostToolUse", "Bash")],
+        entry: group,
     },
     // Codex has no read tool, so reads only get advice after the shell ran them.
     Harness {
         name: "Codex",
         dir: ".codex",
-        cli: "codex",
-        scope: &[],
+        mcp: Mcp::Cli { program: "codex", scope: &[] },
         hooks_file: "hooks.json",
+        hooks_new: || json!({}),
         hooks: &[("PreToolUse", "apply_patch"), ("PostToolUse", "Bash")],
+        entry: group,
+    },
+    // Cursor also runs Claude Code's hooks, so where both have edo, its hooks run twice; that is harmless.
+    Harness {
+        name: "Cursor",
+        dir: ".cursor",
+        mcp: Mcp::Json("mcp.json"),
+        hooks_file: "hooks.json",
+        hooks_new: || json!({"version": 1}),
+        hooks: &[("preToolUse", "Read|Write"), ("postToolUse", "Shell")],
+        entry: |matcher, command| json!({"matcher": matcher, "command": command}),
     },
 ];
 
@@ -88,43 +113,66 @@ fn install(env: &Env, harness: &Harness, dir: &Path, remove: bool) -> Result<(),
         let message = format!("{} contains spaces; put edo where its path has none", env.exe.display());
         return Err(Error::new("unsupported_path", message));
     }
-    let mcp = |verb: &str, rest: &[&str]| {
-        let args = ["mcp", verb].iter().chain(harness.scope).chain(rest).map(|a| a.to_string()).collect::<Vec<_>>();
-        (env.run)(harness.cli, &args).map_err(|e| Error::new("harness", e))
-    };
-    // Also takes out an earlier registration, so installing again replaces it; there may be none.
-    let _ = mcp("remove", &["edo"]);
-    if !remove {
-        mcp("add", &["edo", "--", &env.exe.to_string_lossy(), "mcp"])?;
+    let exe = env.exe.to_string_lossy();
+    match harness.mcp {
+        Mcp::Cli { program, scope } => {
+            let mcp = |verb: &str, rest: &[&str]| {
+                let args = ["mcp", verb].iter().chain(scope).chain(rest).map(|a| a.to_string()).collect::<Vec<_>>();
+                (env.run)(program, &args).map_err(|e| Error::new("harness", e))
+            };
+            // Also takes out an earlier registration, so installing again replaces it; there may be none.
+            let _ = mcp("remove", &["edo"]);
+            if !remove {
+                mcp("add", &["edo", "--", &exe, "mcp"])?;
+            }
+        }
+        Mcp::Json(file) => edit_json(&dir.join(file), json!({}), |settings| {
+            let servers = settings
+                .as_object_mut()
+                .ok_or_else(|| Error::new("settings", format!("{file} is not a JSON object")))?;
+            let servers = servers.entry("mcpServers").or_insert_with(|| json!({}));
+            let servers =
+                servers.as_object_mut().ok_or_else(|| Error::new("settings", "mcpServers is not a JSON object"))?;
+            servers.remove("edo");
+            if !remove {
+                servers.insert("edo".into(), json!({"command": exe, "args": ["mcp"]}));
+            }
+            Ok(())
+        })?,
     }
     let hooks = if remove { &[][..] } else { harness.hooks };
-    edit_json(&dir.join(harness.hooks_file), |settings| set_hooks(settings, harness.name, &env.exe, hooks))
+    edit_json(&dir.join(harness.hooks_file), (harness.hooks_new)(), |settings| {
+        set_hooks(settings, harness, &env.exe, hooks)
+    })
 }
 
-/// Replaces edo's hooks under `hooks.<event>` with one group per `(event, matcher)`, leaving other hooks alone.
-fn set_hooks(settings: &mut Value, harness: &str, exe: &Path, groups: &[(&str, &str)]) -> Result<(), Error> {
+/// Replaces edo's hooks under `hooks.<event>` with one entry per `(event, matcher)`, leaving other hooks alone.
+/// An entry is a group of hooks (Claude Code, Codex) or a hook itself (Cursor).
+fn set_hooks(settings: &mut Value, harness: &Harness, exe: &Path, hooks: &[(&str, &str)]) -> Result<(), Error> {
+    let name = harness.name;
     let Some(settings) = settings.as_object_mut() else {
         return Err(Error::new("settings", "settings are not a JSON object"));
     };
     let events = settings.entry("hooks").or_insert_with(|| json!({}));
     let events = events.as_object_mut().ok_or_else(|| Error::new("settings", "hooks is not a JSON object"))?;
-    for groups in events.values_mut().filter_map(Value::as_array_mut) {
-        groups.retain_mut(|group| match group.get_mut("hooks").and_then(Value::as_array_mut) {
-            Some(hooks) => {
-                hooks.retain(|h| !is_edo_hook(h["command"].as_str().unwrap_or(""), harness));
-                !hooks.is_empty()
+    let is_edo = |hook: &Value| is_edo_hook(hook["command"].as_str().unwrap_or(""), name);
+    for entries in events.values_mut().filter_map(Value::as_array_mut) {
+        entries.retain_mut(|entry| match entry.get_mut("hooks").and_then(Value::as_array_mut) {
+            Some(group) => {
+                group.retain(|hook| !is_edo(hook));
+                !group.is_empty()
             }
-            None => true,
+            None => !is_edo(entry),
         });
     }
-    events.retain(|_, groups| groups.as_array().is_none_or(|g| !g.is_empty()));
+    events.retain(|_, entries| entries.as_array().is_none_or(|e| !e.is_empty()));
     // Unquoted, since a quoted program followed by arguments is a syntax error in PowerShell, which Codex runs
     // hooks with on Windows; `install` refuses a path with spaces, which would need quoting.
-    let command = |event: &str| format!("{} hook {harness}:{event}", exe.to_string_lossy().replace('\\', "/"));
-    for (event, matcher) in groups {
-        let group = json!({"matcher": matcher, "hooks": [{"type": "command", "command": command(event)}]});
+    let command = |event: &str| format!("{} hook {name}:{event}", exe.to_string_lossy().replace('\\', "/"));
+    for (event, matcher) in hooks {
         let list = events.entry(*event).or_insert_with(|| json!([]));
-        list.as_array_mut().ok_or_else(|| Error::new("settings", format!("hooks.{event} is not a list")))?.push(group);
+        let list = list.as_array_mut().ok_or_else(|| Error::new("settings", format!("hooks.{event} is not a list")))?;
+        list.push((harness.entry)(matcher, &command(event)));
     }
     if events.is_empty() {
         settings.remove("hooks");
@@ -142,9 +190,9 @@ fn is_edo_hook(command: &str, harness: &str) -> bool {
         && rest.trim_start().starts_with(&format!("hook {harness}:"))
 }
 
-/// Rewrites a JSON settings file through `edit`, keeping the previous version as `<file>.bak`.
-/// A file that does not parse is left alone.
-fn edit_json(path: &Path, edit: impl FnOnce(&mut Value) -> Result<(), Error>) -> Result<(), Error> {
+/// Rewrites a JSON settings file through `edit`, starting from `new` when there is none, and keeping the
+/// previous version as `<file>.bak`. A file that does not parse is left alone.
+fn edit_json(path: &Path, new: Value, edit: impl FnOnce(&mut Value) -> Result<(), Error>) -> Result<(), Error> {
     let io = |e: std::io::Error| Error::new("io", format!("{}: {e}", path.display()));
     let before = match std::fs::read_to_string(path) {
         Ok(text) => Some(text),
@@ -155,7 +203,7 @@ fn edit_json(path: &Path, edit: impl FnOnce(&mut Value) -> Result<(), Error>) ->
         Some(text) => {
             serde_json::from_str(text).map_err(|e| Error::new("settings", format!("{}: {e}", path.display())))?
         }
-        None => json!({}),
+        None => new,
     };
     edit(&mut value)?;
     let after = serde_json::to_string_pretty(&value).expect("JSON value") + "\n";
@@ -400,5 +448,64 @@ mod tests {
         assert_eq!(pre["matcher"], "apply_patch");
         assert_eq!(pre["hooks"][0]["command"], format!("{EDO} hook Codex:PreToolUse"));
         assert_eq!(hooks["hooks"]["PostToolUse"][0]["matcher"], "Bash");
+    }
+
+    fn cursor_fixture() -> Fixture {
+        let f = Fixture::new();
+        std::fs::create_dir(f.home.path().join(".cursor")).unwrap();
+        f
+    }
+
+    fn read_json(path: PathBuf) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn cursor_mcp_goes_into_mcp_json_with_absolute_path() {
+        // Given: ~/.cursor のあるホーム
+        let f = cursor_fixture();
+        // When: Cursor に入れる
+        f.init(EDO, &["Cursor"], false);
+        // Then: ~/.cursor/mcp.json の mcpServers.edo に edo の絶対パスと mcp が入り、CLI は呼ばれない
+        let mcp = read_json(f.home.path().join(".cursor/mcp.json"));
+        assert_eq!(mcp["mcpServers"]["edo"], json!({"command": EDO, "args": ["mcp"]}));
+        assert!(f.calls.borrow().is_empty(), "{:?}", f.calls);
+    }
+
+    #[test]
+    fn cursor_hooks_go_into_hooks_json_as_flat_entries_with_version() {
+        // Given: ~/.cursor のあるホーム
+        let f = cursor_fixture();
+        // When: Cursor に入れる
+        f.init(EDO, &["Cursor"], false);
+        // Then: ~/.cursor/hooks.json に version 1 と、実行前は Read と Write に、実行後は Shell に、edo の hook が入る
+        let hooks = read_json(f.home.path().join(".cursor/hooks.json"));
+        assert_eq!(hooks["version"], 1);
+        let pre = json!([{"matcher": "Read|Write", "command": format!("{EDO} hook Cursor:preToolUse")}]);
+        assert_eq!(hooks["hooks"]["preToolUse"], pre);
+        assert_eq!(hooks["hooks"]["postToolUse"][0]["matcher"], "Shell");
+    }
+
+    #[test]
+    fn cursor_remove_drops_edo_and_keeps_other_servers_and_hooks() {
+        // Given: ほかの MCP サーバーとほかの hook がある Cursor に、edo を入れたホーム
+        let f = cursor_fixture();
+        let other_server = json!({"command": "other"});
+        let other_hook = json!({"command": "audit.sh"});
+        std::fs::write(
+            f.home.path().join(".cursor/mcp.json"),
+            json!({"mcpServers": {"other": other_server}}).to_string(),
+        )
+        .unwrap();
+        let hooks = json!({"version": 1, "hooks": {"preToolUse": [other_hook]}});
+        std::fs::write(f.home.path().join(".cursor/hooks.json"), hooks.to_string()).unwrap();
+        f.init(EDO, &["Cursor"], false);
+        // When: 外す
+        f.init(EDO, &["Cursor"], true);
+        // Then: edo だけが消え、ほかの MCP サーバーと hook は残る
+        let mcp = read_json(f.home.path().join(".cursor/mcp.json"));
+        assert_eq!(mcp["mcpServers"], json!({"other": other_server}));
+        let hooks = read_json(f.home.path().join(".cursor/hooks.json"));
+        assert_eq!(hooks["hooks"], json!({"preToolUse": [other_hook]}));
     }
 }
