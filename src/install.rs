@@ -359,7 +359,10 @@ pub fn installed(home: &Path) -> Result<Vec<Installed>, Error> {
     let mut out = vec![];
     for p in Cache::load(home)?.packages {
         let dir = package_dir(home, &p.registry, &p.name)?;
-        let (extensions, lsp) = manifest(&dir)?.package.map_or((vec![], None), |m| (m.extensions, m.lsp));
+        // The cache is the record of what is installed; a package whose manifest is gone or broken still is one,
+        // so it stays removable, and it claims no extensions.
+        let package = manifest(&dir).ok().and_then(|m| m.package);
+        let (extensions, lsp) = package.map_or((vec![], None), |m| (m.extensions, m.lsp));
         out.push(Installed { source: p.source(), registry: p.registry, name: p.name, extensions, lsp, dir });
     }
     out.sort_by(|a, b| (&a.registry, &a.name).cmp(&(&b.registry, &b.name)));
@@ -711,6 +714,37 @@ mod tests {
         let langs = languages(home.path());
         // Then: .myrs のファイルにそのパッケージが選ばれる
         assert_eq!(langs.for_path(Path::new("a.myrs")).map(|l| l.name.as_str()), Some("myrust"));
+    }
+
+    /// A home with myrust and other installed, and other's manifest gone.
+    fn home_with_broken_package() -> tempfile::TempDir {
+        let repo = langs_repo();
+        let home = tempfile::tempdir().unwrap();
+        let fetch = local(vec![("github.com/foo/langs", &repo)]);
+        install_all(home.path(), &["foo/langs:myrust".into(), "foo/langs:other".into()], &fetch);
+        std::fs::remove_file(home.path().join("packages/github.com/foo/langs/other/edo-package.toml")).unwrap();
+        home
+    }
+
+    #[test]
+    fn package_without_manifest_does_not_stop_others_loading() {
+        // Given: 2 つのパッケージのうち、片方の manifest が消えたインストール先
+        let home = home_with_broken_package();
+        // When: 言語を読み込む
+        let langs = languages(home.path());
+        // Then: もう片方は読み込まれる
+        assert_eq!(langs.for_path(Path::new("a.myrs")).map(|l| l.name.as_str()), Some("myrust"));
+    }
+
+    #[test]
+    fn package_without_manifest_can_be_removed() {
+        // Given: manifest が消えたパッケージのあるインストール先
+        let home = home_with_broken_package();
+        // When: そのパッケージを削除する
+        let report = remove(home.path(), "other");
+        // Then: 削除できる
+        assert_eq!(report["ok"], true, "{report}");
+        assert!(!home.path().join("packages/github.com/foo/langs/other").exists());
     }
 
     #[test]
