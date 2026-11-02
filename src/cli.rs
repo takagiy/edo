@@ -165,32 +165,37 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages,
         }
         Cmd::Write { mode, all_matches, target, texts } => {
             let (path, scope) = split_target(&target);
-            // `-` stands for stdin, which holds one text, or two when it has conflict markers.
-            let mut expanded = vec![];
-            for text in texts {
-                if text != "-" {
-                    expanded.push(text);
-                    continue;
-                }
-                let input = stdin();
-                // An empty stdin is a forgotten pipe, not a request to delete everything.
-                if input.is_empty() {
-                    return usage("stdin is empty".into());
-                }
-                match split_conflict(&input) {
-                    Some((b, a)) => expanded.extend([b, a]),
-                    None => expanded.push(input),
-                }
+            // `-` stands for stdin, which holds one text, or before/after pairs between conflict markers.
+            let input = texts.iter().any(|t| t == "-").then(&mut *stdin);
+            // An empty stdin is a forgotten pipe, not a request to delete everything.
+            if input.as_deref() == Some("") {
+                return usage("stdin is empty".into());
             }
-            let (before, after) = match expanded.as_slice() {
-                [after] => (None, after.clone()),
-                [before, after] => (Some(before.clone()), after.clone()),
+            let blocks = input.as_deref().map(split_conflict).unwrap_or_default();
+            let texts: Vec<String> =
+                texts.into_iter().map(|t| if t == "-" { input.clone().unwrap() } else { t }).collect();
+            let edits: Vec<(Option<String>, String)> = match texts.as_slice() {
+                [_] if !blocks.is_empty() => blocks.into_iter().map(|(b, a)| (Some(b), a)).collect(),
+                _ if !blocks.is_empty() => {
+                    return usage("conflict markers in stdin already give before and after".into());
+                }
+                [after] => vec![(None, after.clone())],
+                [before, after] => vec![(Some(before.clone()), after.clone())],
                 _ => return usage("expected [BEFORE] <AFTER>".into()),
             };
-            let req =
-                WriteRequest { path, scope, before: before.as_deref(), after: &after, all_matches, place: mode.into() };
+            let reqs: Vec<WriteRequest> = edits
+                .iter()
+                .map(|(before, after)| WriteRequest {
+                    path,
+                    scope,
+                    before: before.as_deref(),
+                    after,
+                    all_matches,
+                    place: mode.into(),
+                })
+                .collect();
             // The CLI runs no language servers; `edo mcp` keeps them running between writes.
-            match command::write(&langs, &req, &mut |_| serde_json::Map::new()) {
+            match command::write(&langs, &reqs, &mut |_| serde_json::Map::new()) {
                 Ok(reports) => {
                     let code = if reports.iter().any(|r| r["ok"] == false) { 1 } else { 0 };
                     (crate::report(&reports.into()), code)
@@ -201,13 +206,20 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages,
     }
 }
 
-/// Splits `<<<<<<< before` / `=======` / `>>>>>>> after` blocks; markers count only as whole lines.
-fn split_conflict(input: &str) -> Option<(String, String)> {
+/// The `<<<<<<< before` / `=======` / `>>>>>>> after` blocks as (before, after); markers count only as whole lines.
+fn split_conflict(input: &str) -> Vec<(String, String)> {
     let lines: Vec<&str> = input.lines().collect();
-    let open = lines.iter().position(|l| l.trim_end() == "<<<<<<< before")?;
-    let mid = open + lines[open..].iter().position(|l| l.trim_end() == "=======")?;
-    let close = mid + lines[mid..].iter().position(|l| l.trim_end() == ">>>>>>> after")?;
-    Some((lines[open + 1..mid].join("\n"), lines[mid + 1..close].join("\n")))
+    let at = |from: usize, marker: &str| lines[from..].iter().position(|l| l.trim_end() == marker).map(|i| from + i);
+    let mut blocks = vec![];
+    let mut from = 0;
+    while let Some(open) = at(from, "<<<<<<< before")
+        && let Some(mid) = at(open, "=======")
+        && let Some(close) = at(mid, ">>>>>>> after")
+    {
+        blocks.push((lines[open + 1..mid].join("\n"), lines[mid + 1..close].join("\n")));
+        from = close + 1;
+    }
+    blocks
 }
 
 fn usage(message: String) -> (String, i32) {
@@ -292,6 +304,18 @@ mod tests {
         edo(&["write", &path, "-"], "<<<<<<< before\nx();\n=======\ny();\nz();\n>>>>>>> after\n");
         // Then: マーカーで分けた before が after に置き換わる
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    y();\n    z();\n}\n");
+    }
+
+    #[test]
+    fn stdin_with_several_conflict_blocks_writes_each() {
+        // Given: 呼び出しが 2 つある関数
+        let (_dir, path) = file("fn a() {\n    x();\n    y();\n}\n");
+        // When: コンフリクトマーカーの組を 2 つ書いた標準入力を流す
+        let input =
+            "<<<<<<< before\nx();\n=======\nv();\n>>>>>>> after\n<<<<<<< before\ny();\n=======\nw();\n>>>>>>> after\n";
+        edo(&["write", &path, "-"], input);
+        // Then: 組ごとに置き換わる
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    v();\n    w();\n}\n");
     }
 
     #[test]

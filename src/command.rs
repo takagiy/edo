@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::path::Path;
 
 use crate::diagnostic::{Hunk, new_errors};
@@ -116,9 +117,10 @@ pub fn read(langs: &Languages, items: &[ReadItem]) -> Result<String, Error> {
     })
 }
 
-/// `write_files`, with a panic reported as an `internal` error.
-pub fn write(langs: &Languages, req: &WriteRequest, check: Check) -> Result<Vec<Value>, Error> {
-    guarded(|| write_files(langs, req, check))
+/// Writes every request, with a panic reported as an `internal` error. All requests are matched against the
+/// files as they were before the call, and if any fails, nothing is written and the failures are reported.
+pub fn write(langs: &Languages, reqs: &[WriteRequest], check: Check) -> Result<Vec<Value>, Error> {
+    guarded(|| write_requests(langs, reqs, check))
 }
 
 /// Runs `f`, turning a panic into an `internal` error so that a bug answers the agent instead of leaving
@@ -215,105 +217,186 @@ pub struct Written<'a> {
 /// Adds warnings to a written file's report, such as the errors a language server found.
 pub type Check<'a> = &'a mut dyn FnMut(&Written) -> Map<String, Value>;
 
-/// Writes `after` into each matched file and reports per file; `check` adds warnings to each file written.
-fn write_files(langs: &Languages, req: &WriteRequest, check: Check) -> Result<Vec<Value>, Error> {
-    if !is_glob(req.path) {
-        return Ok(vec![write_one(langs, req.path, req, check)?]);
+/// Finds every request's targets, then writes each file once; reports per file, or only the failures.
+fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: Check) -> Result<Vec<Value>, Error> {
+    let several = reqs.len() > 1;
+    let mut plans: Vec<Plan> = vec![];
+    let mut failures: Vec<Value> = vec![];
+    let mut skipped = Skipped::new();
+    for (item, req) in reqs.iter().enumerate() {
+        let glob = is_glob(req.path);
+        let (files, missed) =
+            if glob { supported(langs, expand(req.path)?) } else { (vec![req.path.into()], Skipped::new()) };
+        let mut found = false;
+        let mut reports = vec![];
+        for file in files {
+            let at = match plans.iter().position(|p| p.path == file) {
+                Some(at) => Ok(at),
+                None => Plan::open(langs, file, req).map(|p| {
+                    plans.push(p);
+                    plans.len() - 1
+                }),
+            };
+            match at.and_then(|at| plans[at].find(req, item)) {
+                Ok(()) => found = true,
+                // A glob writes the files that `before` and `scope` are found in.
+                Err(report) if glob && report["error"] == "not_found" => {}
+                Err(report) => reports.push(report),
+            }
+        }
+        if glob && !found && reports.is_empty() {
+            reports.push(Error { skipped: missed.clone(), ..Error::new("not_found", "no file matched") }.to_json());
+        }
+        for (ext, n) in missed {
+            *skipped.entry(ext).or_default() += n;
+        }
+        if several {
+            reports.iter_mut().for_each(|r| r["item"] = (item + 1).into());
+        }
+        failures.extend(reports);
     }
-    let (files, skipped) = supported(langs, expand(req.path)?);
-    let mut reports: Vec<Value> = files
-        .iter()
-        .map(|f| {
-            write_one(langs, f, req, check)
-                .unwrap_or_else(|e| json!({"ok": false, "file": f, "error": e.code, "message": e.message}))
-        })
-        .filter(|r| r["error"] != "not_found")
-        .collect();
-    if reports.is_empty() {
-        let mut err = Error::new("not_found", "no file matched");
-        err.skipped = skipped;
-        return Ok(vec![err.to_json()]);
+    plans.retain(|p| !p.targets.is_empty());
+    failures.extend(plans.iter_mut().filter_map(|p| p.overlap(several)));
+    if !failures.is_empty() {
+        return Ok(failures);
     }
+    let mut reports = plans.iter().map(|p| p.write(check)).collect::<Result<Vec<_>, _>>()?;
     if !skipped.is_empty() {
         reports.push(skipped_line(&skipped));
     }
     Ok(reports)
 }
 
-fn write_one(langs: &Languages, path: &str, req: &WriteRequest, check: Check) -> Result<Value, Error> {
-    let file = Path::new(path);
-    // Writing a whole file that does not exist yet is writing over an empty one.
-    let creating = !file.exists() && req.scope.is_none() && req.before.is_none();
-    let lang = language(langs, file)?;
-    let src = Source::new(lang, if creating { String::new() } else { read_text(file)? });
-    let tree = src.lang.parser().parse(&src.text, None).expect("parse");
-    let leaves = matcher::leaves(src.lang, &tree, &src.text);
-    let regions = match req.scope {
-        Some(s) => scope::resolve(s, &src.defs, &src.text)?,
-        None => vec![Hit { range: 0..src.text.len(), def: None }],
-    };
-    let mut closest: Option<matcher::Closest> = None;
-    let targets: Vec<Hit> = match req.before {
-        Some(before) => regions
-            .iter()
-            .flat_map(|r| {
-                let found = matcher::find(&src.text, &leaves, r.range.clone(), before);
-                closest = closest.take().or(found.closest);
-                found.matches
-            })
-            .map(|range| Hit { range, def: None })
-            .collect(),
-        None => regions,
-    };
-    if targets.is_empty() {
-        let mut report = json!({"ok": false, "file": path, "error": "not_found"});
-        if let Some(c) = closest {
-            let t = &src.text;
-            let mismatch = json!({"line": line_of(t, c.mismatch), "expected": c.expected, "found": c.found});
-            report["closest"] =
-                json!({"range": lines(line_of(t, c.range.start), line_of(t, c.range.end)), "mismatch": mismatch});
+/// One place in a file to put a request's `after`.
+struct Target<'a> {
+    range: Range<usize>,
+    after: &'a str,
+    place: Place,
+    /// The request's index.
+    item: usize,
+}
+
+/// A file to write: its text before the call and the targets the requests found in it.
+struct Plan<'a> {
+    path: String,
+    src: Source<'a>,
+    targets: Vec<Target<'a>>,
+}
+
+impl<'a> Plan<'a> {
+    /// Opens `path` for `req`; writing a whole file that does not exist yet is writing over an empty one.
+    fn open(langs: &'a Languages, path: String, req: &WriteRequest) -> Result<Plan<'a>, Value> {
+        let file = Path::new(&path);
+        let creating = !file.exists() && req.scope.is_none() && req.before.is_none();
+        let src = language(langs, file)
+            .and_then(|lang| Ok(Source::new(lang, if creating { String::new() } else { read_text(file)? })))
+            .map_err(|e| json!({"ok": false, "file": path, "error": e.code, "message": e.message}))?;
+        Ok(Plan { path, src, targets: vec![] })
+    }
+
+    /// Adds the targets `req` finds in the file, or reports why it found none, or too many.
+    fn find(&mut self, req: &WriteRequest<'a>, item: usize) -> Result<(), Value> {
+        let (src, path) = (&self.src, &self.path);
+        let failed = |e: Error| json!({"ok": false, "file": path, "error": e.code, "message": e.message});
+        let regions = match req.scope {
+            Some(s) => scope::resolve(s, &src.defs, &src.text).map_err(failed)?,
+            None => vec![Hit { range: 0..src.text.len(), def: None }],
+        };
+        let mut closest: Option<matcher::Closest> = None;
+        let hits: Vec<Hit> = match req.before {
+            Some(before) => {
+                let tree = src.lang.parser().parse(&src.text, None).expect("parse");
+                let leaves = matcher::leaves(src.lang, &tree, &src.text);
+                regions
+                    .iter()
+                    .flat_map(|r| {
+                        let found = matcher::find(&src.text, &leaves, r.range.clone(), before);
+                        closest = closest.take().or(found.closest);
+                        found.matches
+                    })
+                    .map(|range| Hit { range, def: None })
+                    .collect()
+            }
+            None => regions,
+        };
+        if hits.is_empty() {
+            let mut report = json!({"ok": false, "file": path, "error": "not_found"});
+            if let Some(c) = closest {
+                let t = &src.text;
+                let mismatch = json!({"line": line_of(t, c.mismatch), "expected": c.expected, "found": c.found});
+                report["closest"] =
+                    json!({"range": lines(line_of(t, c.range.start), line_of(t, c.range.end)), "mismatch": mismatch});
+            }
+            return Err(report);
         }
-        return Ok(report);
+        if hits.len() > 1 && !req.all_matches {
+            let matches: Vec<Value> = hits.iter().map(|t| candidate(src, t)).collect();
+            return Err(json!({"ok": false, "file": path, "error": "ambiguous", "matches": matches}));
+        }
+        let target = |h: Hit| Target { range: h.range, after: req.after, place: req.place, item };
+        self.targets.extend(hits.into_iter().map(target));
+        Ok(())
     }
-    if targets.len() > 1 && !req.all_matches {
-        let matches: Vec<Value> = targets.iter().map(|t| candidate(&src, t)).collect();
-        return Ok(json!({"ok": false, "file": path, "error": "ambiguous", "matches": matches}));
+
+    /// Sorts the targets by place, and reports two that write over the same text, or at the same point.
+    fn overlap(&mut self, several: bool) -> Option<Value> {
+        self.targets.sort_by_key(|t| t.range.start);
+        let (a, b) = self
+            .targets
+            .windows(2)
+            .map(|w| (&w[0], &w[1]))
+            .find(|(a, b)| b.range.start < a.range.end.max(a.range.start + 1))?;
+        let message = format!("items {} and {} write over the same text", a.item + 1, b.item + 1);
+        let mut report = json!({"ok": false, "file": self.path, "error": "overlap", "message": message});
+        if several {
+            report["item"] = (b.item + 1).into();
+        }
+        Some(report)
     }
-    // Apply from the last target so earlier ranges stay valid, then shift each one's lines by the edits before it.
-    let mut text = src.text.clone();
-    let mut done: Vec<(edit::Outcome, isize)> = vec![];
-    for t in targets.iter().rev() {
-        let out = edit::edit(src.lang, &text, t.range.clone(), req.after, req.place);
-        let grown = out.text.matches('\n').count() as isize - text.matches('\n').count() as isize;
-        text = out.text.clone();
-        done.push((out, grown));
+
+    /// Writes the targets, sorted by place, and reports the lines each now holds in the order of the requests.
+    fn write(&self, check: Check) -> Result<Value, Error> {
+        let (src, path, file) = (&self.src, &self.path, Path::new(&self.path));
+        // Apply from the last target so earlier ranges stay valid, then shift each one's lines by the edits before it.
+        let mut text = src.text.clone();
+        let mut done: Vec<(edit::Outcome, isize)> = vec![];
+        for t in self.targets.iter().rev() {
+            let out = edit::edit(src.lang, &text, t.range.clone(), t.after, t.place);
+            let grown = out.text.matches('\n').count() as isize - text.matches('\n').count() as isize;
+            text = out.text.clone();
+            done.push((out, grown));
+        }
+        done.reverse();
+        // Each edit's lines after it are counted in a text without the edits before it, so shift them past those.
+        let mut shift = 0;
+        let mut replaced = vec![];
+        let mut hunks = vec![];
+        for (t, (out, grown)) in self.targets.iter().zip(done) {
+            let at = |line: usize| (line as isize + shift) as usize;
+            replaced.push((t.item, lines(at(out.lines.0), at(out.lines.1))));
+            hunks.push(Hunk { old: out.hunk.old, new: at(out.hunk.new.start)..at(out.hunk.new.end) });
+            shift += grown;
+        }
+        replaced.sort_by_key(|(item, _)| *item);
+        let replaced: Vec<Value> = replaced.into_iter().map(|(_, r)| r).collect();
+        let syntax =
+            new_errors(&edit::syntax_errors(src.lang, &src.text), edit::syntax_errors(src.lang, &text), &hunks);
+        let line_text = |line: usize| text.lines().nth(line - 1).unwrap_or("").trim().to_string();
+        let errors: Vec<Value> = syntax.iter().map(|e| json!({"line": e.line, "text": line_text(e.line)})).collect();
+        let io = |e: std::io::Error| Error::new("io", format!("{path}: {e}"));
+        std::fs::create_dir_all(file.parent().unwrap_or(Path::new("."))).map_err(io)?;
+        std::fs::write(file, &text).map_err(io)?;
+        let mut warnings =
+            check(&Written { lang: src.lang, path: file, before: &src.text, after: &text, hunks: &hunks });
+        if !errors.is_empty() {
+            warnings.insert("new_syntax_errors".into(), errors.into());
+        }
+        let mut report = json!({"ok": true, "file": path, "replaced": replaced});
+        if !warnings.is_empty() {
+            report["warnings"] = warnings.into();
+        }
+        Ok(report)
     }
-    done.reverse();
-    // Each edit's lines after it are counted in a text without the edits before it, so shift them past those.
-    let mut shift = 0;
-    let mut replaced = vec![];
-    let mut hunks = vec![];
-    for (out, grown) in done {
-        let at = |line: usize| (line as isize + shift) as usize;
-        replaced.push(lines(at(out.lines.0), at(out.lines.1)));
-        hunks.push(Hunk { old: out.hunk.old, new: at(out.hunk.new.start)..at(out.hunk.new.end) });
-        shift += grown;
-    }
-    let syntax = new_errors(&edit::syntax_errors(src.lang, &src.text), edit::syntax_errors(src.lang, &text), &hunks);
-    let line_text = |line: usize| text.lines().nth(line - 1).unwrap_or("").trim().to_string();
-    let errors: Vec<Value> = syntax.iter().map(|e| json!({"line": e.line, "text": line_text(e.line)})).collect();
-    let io = |e: std::io::Error| Error::new("io", format!("{path}: {e}"));
-    std::fs::create_dir_all(file.parent().unwrap_or(Path::new("."))).map_err(io)?;
-    std::fs::write(path, &text).map_err(io)?;
-    let mut warnings = check(&Written { lang: src.lang, path: file, before: &src.text, after: &text, hunks: &hunks });
-    if !errors.is_empty() {
-        warnings.insert("new_syntax_errors".into(), errors.into());
-    }
-    let mut report = json!({"ok": true, "file": path, "replaced": replaced});
-    if !warnings.is_empty() {
-        report["warnings"] = warnings.into();
-    }
-    Ok(report)
 }
 
 fn line_of(text: &str, byte: usize) -> usize {
@@ -471,7 +554,7 @@ mod tests {
         let path = at(&dir, "a.rs");
         // When: その呼び出しを before にして書く
         let req = WriteRequest { path: &path, before: Some("x();"), after: "y();", ..Default::default() };
-        let reports = write(&Languages::builtin(), &req, &mut |_| Map::new()).unwrap();
+        let reports = write(&Languages::builtin(), &[req], &mut |_| Map::new()).unwrap();
         // Then: 書き込まれ、ok が報告される
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    y();\n}\n");
         assert_eq!(reports, [serde_json::json!({"ok": true, "file": path, "replaced": ["2-2"]})]);
@@ -481,7 +564,7 @@ mod tests {
         let path = req.path.to_string();
         let req = WriteRequest { path: &path, ..req };
         let _ = dir;
-        write(&Languages::builtin(), &req, &mut |_| Map::new()).unwrap()
+        write(&Languages::builtin(), &[req], &mut |_| Map::new()).unwrap()
     }
 
     #[test]
@@ -490,9 +573,77 @@ mod tests {
         let dir = dir_with(&[("a.rs", "fn a() { x(); }\n")]);
         let req = WriteRequest { path: &at(&dir, "a.rs"), before: Some("x();"), after: "y();", ..Default::default() };
         // When: 書く
-        let err = write(&Languages::builtin(), &req, &mut |_| panic!("boom")).unwrap_err();
+        let err = write(&Languages::builtin(), &[req], &mut |_| panic!("boom")).unwrap_err();
         // Then: panic の内容を持つ internal エラーが返る
         assert_eq!((err.code, err.message.as_str()), ("internal", "boom"));
+    }
+
+    fn write_all(reqs: &[WriteRequest]) -> Vec<Value> {
+        write(&Languages::builtin(), reqs, &mut |_| Map::new()).unwrap()
+    }
+
+    /// A replace of `before` with `after` in `path`.
+    fn swap<'a>(path: &'a str, before: &'a str, after: &'a str) -> WriteRequest<'a> {
+        WriteRequest { path, before: Some(before), after, ..Default::default() }
+    }
+
+    #[test]
+    fn several_items_are_matched_against_original_and_reported_in_their_order() {
+        // Given: 呼び出しが 2 つある関数
+        let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n    y();\n}\n")]);
+        let a = at(&dir, "a.rs");
+        // When: 後ろの呼び出し、前の呼び出しの順に、2 つの書き換えを 1 回で渡す
+        let reports = write_all(&[swap(&a, "y();", "w();"), swap(&a, "x();", "v();")]);
+        // Then: どちらも書かれ、replaced は渡した順に並ぶ
+        assert_eq!(content(&dir, "a.rs"), "fn a() {\n    v();\n    w();\n}\n");
+        assert_eq!(reports, [json!({"ok": true, "file": a, "replaced": ["3-3", "2-2"]})]);
+    }
+
+    #[test]
+    fn failing_item_writes_nothing_and_has_its_number() {
+        // Given: 呼び出しのある関数
+        let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n}\n")]);
+        let a = at(&dir, "a.rs");
+        // When: 一致する書き換えと、一致しない書き換えを 1 回で渡す
+        let reports = write_all(&[swap(&a, "x();", "v();"), swap(&a, "zzz();", "w();")]);
+        // Then: 何も書かれず、2 つ目の要素の not_found が報告される
+        assert_eq!(content(&dir, "a.rs"), "fn a() {\n    x();\n}\n");
+        assert_eq!((&reports[0]["error"], &reports[0]["item"]), (&json!("not_found"), &json!(2)));
+    }
+
+    #[test]
+    fn overlapping_items_write_nothing() {
+        // Given: 呼び出しが 2 つある関数
+        let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n    y();\n}\n")]);
+        let a = at(&dir, "a.rs");
+        // When: 書き換える範囲が重なる 2 つの書き換えを 1 回で渡す
+        let reports = write_all(&[swap(&a, "x();", "v();"), swap(&a, "x();\ny();", "w();")]);
+        // Then: overlap になり、何も書かれない
+        assert_eq!(reports[0]["error"], "overlap", "{reports:?}");
+        assert_eq!(content(&dir, "a.rs"), "fn a() {\n    x();\n    y();\n}\n");
+    }
+
+    #[test]
+    fn items_in_several_files_are_reported_per_file() {
+        // Given: 呼び出しのある 2 つのファイル
+        let dir = dir_with(&[("a.rs", "fn a() { x(); }\n"), ("b.rs", "fn b() { x(); }\n")]);
+        let (a, b) = (at(&dir, "a.rs"), at(&dir, "b.rs"));
+        // When: それぞれのファイルへの書き換えを 1 回で渡す
+        let reports = write_all(&[swap(&a, "x();", "v();"), swap(&b, "x();", "w();")]);
+        // Then: ファイルごとに報告される
+        assert_eq!(content(&dir, "b.rs"), "fn b() { w(); }\n");
+        assert_eq!(reports.iter().map(|r| r["file"].clone()).collect::<Vec<_>>(), [json!(a), json!(b)]);
+    }
+
+    #[test]
+    fn failure_in_one_file_writes_no_file() {
+        // Given: 呼び出しのある 2 つのファイル
+        let dir = dir_with(&[("a.rs", "fn a() { x(); }\n"), ("b.rs", "fn b() { x(); }\n")]);
+        let (a, b) = (at(&dir, "a.rs"), at(&dir, "b.rs"));
+        // When: 一致する書き換えと、別のファイルで一致しない書き換えを 1 回で渡す
+        write_all(&[swap(&a, "x();", "v();"), swap(&b, "zzz();", "w();")]);
+        // Then: どちらのファイルも書かれない
+        assert_eq!(content(&dir, "a.rs"), "fn a() { x(); }\n");
     }
 
     #[test]

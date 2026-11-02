@@ -11,3 +11,4 @@
 - [x] 識別子のスコープで書くときは、stale の警告は付かない
 - [x] write ツールの `mode` で一致の後ろに挿入できる
 - [x] read ツールは path と scope に加えて reads の要素も読み、path の分、reads の分の順に並べる
+- [x] write ツールは path の書き換えに加えて edits の要素も書き、replaced は path の分、edits の分の順に並ぶ

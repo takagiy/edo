@@ -34,6 +34,27 @@ pub struct ReadTarget {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WriteParams {
     /// File path or glob.
+    pub path: Option<String>,
+    /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M).
+    pub scope: Option<String>,
+    /// Code to find. Omit to target the whole `scope` (or the whole file).
+    pub before: Option<String>,
+    /// Code to write. Empty deletes the target.
+    pub after: Option<String>,
+    /// Edit every match instead of failing as ambiguous.
+    #[serde(default)]
+    pub all_matches: bool,
+    /// What to do with each match (or with the whole target when `before` is omitted).
+    #[serde(default)]
+    pub mode: Mode,
+    /// More edits in the same call, after the one given by `path`.
+    #[serde(default)]
+    pub edits: Vec<EditParams>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EditParams {
+    /// File path or glob.
     pub path: String,
     /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M).
     pub scope: Option<String>,
@@ -47,6 +68,19 @@ pub struct WriteParams {
     /// What to do with each match (or with the whole target when `before` is omitted).
     #[serde(default)]
     pub mode: Mode,
+}
+
+impl EditParams {
+    fn request(&self) -> WriteRequest<'_> {
+        WriteRequest {
+            path: &self.path,
+            scope: self.scope.as_deref(),
+            before: self.before.as_deref(),
+            after: &self.after,
+            all_matches: self.all_matches,
+            place: self.mode.into(),
+        }
+    }
 }
 
 /// What a file looked like when it was last read or written through this server.
@@ -116,17 +150,33 @@ impl Server {
         without `scope` (created if missing).\n\n\
         `after` is re-indented to fit, so its indentation does not need to match the file. An empty `after` deletes \
         the target.\n\n\
-        On success, `replaced` gives the line ranges that now hold `after`; there is no need to read the file back.")]
+        On success, `replaced` gives the line ranges that now hold `after`; there is no need to read the file back.\n\n\
+        To make several edits in one call, list them in `edits` with the same fields. All of them are matched \
+        against the files as they are now, and if any fails, nothing is written.")]
     fn write(&self, Parameters(p): Parameters<WriteParams>) -> CallToolResult {
-        let req = WriteRequest {
-            path: &p.path,
-            scope: p.scope.as_deref(),
-            before: p.before.as_deref(),
-            after: &p.after,
-            all_matches: p.all_matches,
-            place: p.mode.into(),
+        let first = match (p.path, p.after) {
+            (Some(path), Some(after)) => Some(EditParams {
+                path,
+                scope: p.scope,
+                before: p.before,
+                after,
+                all_matches: p.all_matches,
+                mode: p.mode,
+            }),
+            (None, None) => None,
+            _ => return error(crate::Error::new("usage", "give path and after together")),
         };
-        let stale = p.scope.as_deref().and_then(crate::scope::parse_lines).is_some() && self.is_stale(&p.path);
+        let edits: Vec<&EditParams> = first.iter().chain(&p.edits).collect();
+        if edits.is_empty() {
+            return error(crate::Error::new("usage", "give path and after, or edits"));
+        }
+        let reqs: Vec<WriteRequest> = edits.iter().map(|e| e.request()).collect();
+        // Line numbers in a line range scope may be wrong in a file that changed since it was last read.
+        let stale: Vec<std::path::PathBuf> = reqs
+            .iter()
+            .filter(|r| r.scope.and_then(crate::scope::parse_lines).is_some() && self.is_stale(r.path))
+            .filter_map(|r| std::path::absolute(r.path).ok())
+            .collect();
         // shortcut: waits for diagnostics on the runtime's only thread; fine while one agent writes at a time.
         // A check that panicked leaves the lock poisoned; a client cut off mid-request recovers on its next one.
         let mut check = |written: &Written| {
@@ -134,13 +184,14 @@ impl Server {
                 .as_ref()
                 .map_or_else(Map::new, |s| s.lock().unwrap_or_else(std::sync::PoisonError::into_inner).check(written))
         };
-        match command::write(&self.langs, &req, &mut check) {
+        match command::write(&self.langs, &reqs, &mut check) {
             Ok(mut reports) => {
                 for r in reports.iter_mut().filter(|r| r["ok"] == true) {
-                    if stale {
+                    let file = r["file"].as_str().unwrap_or_default().to_string();
+                    if std::path::absolute(&file).is_ok_and(|f| stale.contains(&f)) {
                         r["warnings"]["stale"] = json!("modified since last read");
                     }
-                    self.remember(r["file"].as_str().unwrap_or_default());
+                    self.remember(&file);
                 }
                 let ok = !reports.iter().any(|r| r["ok"] == false);
                 let text = vec![ContentBlock::text(crate::report(&reports.into()))];
@@ -263,6 +314,19 @@ mod tests {
         tool(&client, "write", args).await;
         // Then: 一致の後ろの行に入る
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    x();\n    y();\n}\n");
+    }
+
+    #[tokio::test]
+    async fn write_tool_writes_each_of_edits_after_path() {
+        // Given: 呼び出しが 2 つある関数
+        let (_dir, path) = file("fn a() {\n    x();\n    y();\n}\n");
+        let client = connect().await;
+        // When: path と before と after に加えて、edits にもう 1 つ渡して write を呼ぶ
+        let args = json!({"path": path, "before": "x();", "after": "v();", "edits": [{"path": path, "before": "y();", "after": "w();"}]});
+        let (text, _) = tool(&client, "write", args).await;
+        // Then: どちらも書かれ、replaced は path の分、edits の分の順に並ぶ
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    v();\n    w();\n}\n");
+        assert_eq!(text, format!("ok=true file={path} replaced=2-2,3-3"));
     }
 
     #[tokio::test]
