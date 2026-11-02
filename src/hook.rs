@@ -48,7 +48,9 @@ pub fn decide(phase: Phase, call: &Call, langs: &Languages) -> Decision {
         (Phase::Pre, Action::Write) => Decision::Deny(format!(
             "{path} is a source file edo writes: use mcp__edo__write without before or scope to write the whole file."
         )),
-        (Phase::Post, Action::Shell) => Decision::Advise(format!("The user wants {path} read with mcp__edo__read.")),
+        (Phase::Post, Action::Shell) => {
+            Decision::Advise(format!("The user wants {path} read with mcp__edo__read, which saves context."))
+        }
         _ => Decision::Allow,
     }
 }
