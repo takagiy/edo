@@ -41,18 +41,14 @@ pub fn decide(phase: Phase, call: &Call, langs: &Languages) -> Decision {
     let Some(path) = call.paths.iter().find(|p| langs.for_path(p).is_some()) else { return Decision::Allow };
     let path = path.display();
     match (phase, call.action) {
-        (Phase::Pre, Action::Read) => Decision::Deny(format!(
-            "{path} is a source file edo reads: use mcp__edo__read (a scope of `N-M` shows those lines)."
-        )),
+        (Phase::Pre, Action::Read) => Decision::Deny(format!("{path} is a source file edo reads: use mcp__edo__read.")),
         (Phase::Pre, Action::Edit) => {
             Decision::Deny(format!("{path} is a source file edo edits: use mcp__edo__write with before and after."))
         }
         (Phase::Pre, Action::Write) => Decision::Deny(format!(
             "{path} is a source file edo writes: use mcp__edo__write without before or scope to write the whole file."
         )),
-        (Phase::Post, Action::Shell) => Decision::Advise(format!(
-            "{path} is a source file edo supports: mcp__edo__read shows its outline with function bodies elided."
-        )),
+        (Phase::Post, Action::Shell) => Decision::Advise(format!("The user wants {path} read with mcp__edo__read.")),
         _ => Decision::Allow,
     }
 }
