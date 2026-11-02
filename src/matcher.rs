@@ -244,12 +244,21 @@ impl Matcher<'_> {
     }
 
     fn at_uncached(&self, i: usize, b: usize, end: Option<usize>) -> Option<usize> {
-        let rest = self.before[b..].trim_start();
-        let spaced = rest.len() < self.before.len() - b;
-        let b = self.before.len() - rest.len();
-        if rest.is_empty() {
+        let raw = &self.before[b..];
+        if raw.trim_start().is_empty() {
             return end;
         }
+        // Whitespace in `before` is layout, except what the leaf's own text starts with,
+        // such as the space at the start of a string's content.
+        let run = &raw[..raw.len() - raw.trim_start().len()];
+        let own = self.leaves.get(i).map_or("", |_| {
+            let text = self.text(i);
+            &text[..text.len() - text.trim_start().len()]
+        });
+        let layout = run.strip_suffix(own).unwrap_or(run);
+        let rest = &raw[layout.len()..];
+        let spaced = !layout.is_empty();
+        let b = self.before.len() - rest.len();
         let found = self.leaf_at(i, b, rest, spaced, end).or_else(|| {
             let extra = self.optional.iter().find(|t| rest.starts_with(**t))?;
             end.and_then(|_| self.at(i, b + extra.len(), end))
@@ -354,6 +363,26 @@ mod tests {
         let src = "fn a() { f(\"a  b\"); }\n";
         // When: 空白が 1 つの文字列の before で照合する
         let found = find_in(&rust(""), src, "f(\"a b\");");
+        // Then: 一致しない
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn string_starting_with_space_matches() {
+        // Given: 中身が空白で始まる文字列
+        let src = "fn a() { f(\" {}\", x); }\n";
+        // When: 同じ文字列を含む before で照合する
+        let found = find_in(&rust(""), src, "f(\" {}\", x);");
+        // Then: 一致する
+        assert_eq!(found, ["f(\" {}\", x);"]);
+    }
+
+    #[test]
+    fn string_missing_its_leading_space_does_not_match() {
+        // Given: 中身が空白で始まる文字列
+        let src = "fn a() { f(\" {}\", x); }\n";
+        // When: 先頭の空白がない文字列の before で照合する
+        let found = find_in(&rust(""), src, "f(\"{}\", x);");
         // Then: 一致しない
         assert!(found.is_empty());
     }
