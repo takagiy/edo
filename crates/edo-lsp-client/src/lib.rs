@@ -29,6 +29,14 @@ enum Event {
     Published(PublishDiagnosticsParams),
 }
 
+/// Why there are no diagnostics to give.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Unavailable {
+    /// They did not come in time; the server may still be starting or checking.
+    Late,
+    /// The server has exited.
+    Closed,
+}
 /// A document as the server has it: the text last sent, its version, and its diagnostics once published.
 struct Document {
     version: i32,
@@ -101,11 +109,11 @@ impl Client {
 
     /// The diagnostics the server publishes for `path` holding `text`, waiting up to `wait` for them.
     /// The text last asked about is remembered with its diagnostics, so asking again costs nothing.
-    /// `None` when the server is not ready, or does not publish in time.
-    pub fn diagnostics(&mut self, path: &Path, text: &str, wait: Duration) -> Option<Vec<Diagnostic>> {
+    pub fn diagnostics(&mut self, path: &Path, text: &str, wait: Duration) -> Result<Vec<Diagnostic>, Unavailable> {
         let deadline = Instant::now() + wait;
-        let uri = Url::from_file_path(path).ok()?;
-        let key = key(&uri)?;
+        // Only a relative path has no file URI, and callers ask about absolute ones.
+        let key = Url::from_file_path(path).ok().and_then(|uri| key(&uri).map(|k| (uri, k)));
+        let (uri, key) = key.ok_or(Unavailable::Late)?;
         while !self.ready {
             self.next(deadline)?;
         }
@@ -131,15 +139,20 @@ impl Client {
         }
         loop {
             if let Some(diagnostics) = &self.documents[&key].diagnostics {
-                return Some(diagnostics.clone());
+                return Ok(diagnostics.clone());
             }
             self.next(deadline)?;
         }
     }
 
-    /// Takes in the next event from the server, waiting until `deadline`; `None` when none came in time.
-    fn next(&mut self, deadline: Instant) -> Option<()> {
-        match self.events.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok()? {
+    /// Takes in the next event from the server, waiting until `deadline`.
+    fn next(&mut self, deadline: Instant) -> Result<(), Unavailable> {
+        let event =
+            self.events.recv_timeout(deadline.saturating_duration_since(Instant::now())).map_err(|e| match e {
+                mpsc::RecvTimeoutError::Timeout => Unavailable::Late,
+                mpsc::RecvTimeoutError::Disconnected => Unavailable::Closed,
+            })?;
+        match event {
             Event::Ready => self.ready = true,
             Event::Published(published) => {
                 // Diagnostics for an older version of the text are about a text no longer asked about.
@@ -150,7 +163,7 @@ impl Client {
                 }
             }
         }
-        Some(())
+        Ok(())
     }
 }
 
@@ -297,7 +310,7 @@ mod tests {
     const LONG: Duration = Duration::from_secs(5);
     const SHORT: Duration = Duration::from_millis(200);
 
-    fn messages(diagnostics: Option<Vec<Diagnostic>>) -> Option<Vec<String>> {
+    fn messages(diagnostics: Result<Vec<Diagnostic>, Unavailable>) -> Result<Vec<String>, Unavailable> {
         diagnostics.map(|d| d.into_iter().map(|d| d.message).collect())
     }
 
@@ -306,7 +319,7 @@ mod tests {
         // Given: 偽のサーバーにつないだクライアント
         let (mut client, received) = fake(echo());
         // When: 診断を問い合わせる
-        client.diagnostics(&doc(), "x", LONG);
+        let _ = client.diagnostics(&doc(), "x", LONG);
         // Then: サーバーは initialize、initialized の順に受け取っている
         assert_eq!(received.lock().unwrap()[..2], ["initialize", "initialized"]);
     }
@@ -316,7 +329,7 @@ mod tests {
         // Given: initialize に答えないサーバー
         let (mut client, _) = fake(Box::new(|_| vec![]));
         // When / Then: 診断の問い合わせには、届かなかったと答える
-        assert_eq!(messages(client.diagnostics(&doc(), "x", SHORT)), None);
+        assert_eq!(messages(client.diagnostics(&doc(), "x", SHORT)), Err(Unavailable::Late));
     }
 
     #[test]
@@ -326,7 +339,7 @@ mod tests {
         // When: 初めての文書の診断を問い合わせる
         let found = messages(client.diagnostics(&doc(), "x", LONG));
         // Then: didOpen で渡し、その文書に届いた診断を返す
-        assert_eq!(found, Some(vec!["x".to_string()]));
+        assert_eq!(found, Ok(vec!["x".to_string()]));
         assert!(received.lock().unwrap().contains(&"textDocument/didOpen".to_string()));
     }
 
@@ -334,11 +347,11 @@ mod tests {
     fn same_text_is_answered_from_memory() {
         // Given: 一度問い合わせた文書
         let (mut client, received) = fake(echo());
-        client.diagnostics(&doc(), "x", LONG);
+        let _ = client.diagnostics(&doc(), "x", LONG);
         // When: 同じ内容でもう一度問い合わせる
         let found = messages(client.diagnostics(&doc(), "x", LONG));
         // Then: サーバーに送らずに、覚えている診断を返す
-        assert_eq!(found, Some(vec!["x".to_string()]));
+        assert_eq!(found, Ok(vec!["x".to_string()]));
         let sent = received.lock().unwrap().iter().filter(|m| m.starts_with("textDocument/did")).count();
         assert_eq!(sent, 1);
     }
@@ -347,11 +360,11 @@ mod tests {
     fn changed_text_is_sent_with_did_change() {
         // Given: 一度問い合わせた文書
         let (mut client, received) = fake(echo());
-        client.diagnostics(&doc(), "x", LONG);
+        let _ = client.diagnostics(&doc(), "x", LONG);
         // When: 違う内容で問い合わせる
         let found = messages(client.diagnostics(&doc(), "y", LONG));
         // Then: didChange で渡し、新しい診断を返す
-        assert_eq!(found, Some(vec!["y".to_string()]));
+        assert_eq!(found, Ok(vec!["y".to_string()]));
         assert!(received.lock().unwrap().contains(&"textDocument/didChange".to_string()));
     }
 
@@ -360,7 +373,18 @@ mod tests {
         // Given: initialize には答えるが、診断を送らないサーバー
         let (mut client, _) = fake(Box::new(|m| initialize_answer(m).into_iter().collect()));
         // When / Then: 待つ時間のうちに届かないので、届かなかったと答える
-        assert_eq!(messages(client.diagnostics(&doc(), "x", SHORT)), None);
+        assert_eq!(messages(client.diagnostics(&doc(), "x", SHORT)), Err(Unavailable::Late));
+    }
+
+    #[test]
+    fn diagnostics_from_exited_server_are_closed() {
+        // Given: つないだとたんに終了したサーバー
+        let (client_reads, server_writes) = std::io::pipe().unwrap();
+        let (_, client_writes) = std::io::pipe().unwrap();
+        drop(server_writes);
+        let mut client = Client::connect(BufReader::new(client_reads), client_writes, &std::env::temp_dir(), "rust");
+        // When / Then: 診断の問い合わせには、閉じたと答える
+        assert_eq!(messages(client.diagnostics(&doc(), "x", LONG)), Err(Unavailable::Closed));
     }
 
     #[test]
@@ -373,7 +397,7 @@ mod tests {
             _ => initialize_answer(m).into_iter().collect(),
         }));
         // When / Then: 問い合わせた文書の診断としては返さない
-        assert_eq!(messages(client.diagnostics(&doc(), "x", SHORT)), None);
+        assert_eq!(messages(client.diagnostics(&doc(), "x", SHORT)), Err(Unavailable::Late));
     }
 
     #[test]
@@ -395,7 +419,7 @@ mod tests {
         // When: 診断を問い合わせる
         let found = messages(client.diagnostics(&doc(), "x", LONG));
         // Then: その文書の診断として受け取る
-        assert_eq!(found, Some(vec!["x".to_string()]));
+        assert_eq!(found, Ok(vec!["x".to_string()]));
     }
 
     #[test]
@@ -409,7 +433,7 @@ mod tests {
             _ => initialize_answer(m).into_iter().collect(),
         }));
         // When: 診断を問い合わせて、やりとりを進める
-        client.diagnostics(&doc(), "x", SHORT);
+        let _ = client.diagnostics(&doc(), "x", SHORT);
         // Then: 項目の数だけ null を並べた応答を返す
         assert!(
             received.lock().unwrap().contains(&"response [null,null]".to_string()),

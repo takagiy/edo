@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use edo_lsp_client::{Client, DiagnosticSeverity};
+use edo_lsp_client::{Client, DiagnosticSeverity, Unavailable};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -69,7 +69,9 @@ pub struct Servers {
 }
 
 impl Servers {
-    /// LSP's warnings on a write, starting the language's server for the file's project when needed.
+    /// LSP's warnings on a write, starting the language's server for the file's project when needed:
+    /// `new_lsp_errors`, or `lsp: starting` when the diagnostics did not come in time, or `lsp: stopped` when
+    /// the server exited, which drops it so that the next write starts it again.
     /// A language without `[package.lsp]`, or whose server cannot be started, gets none.
     pub fn check(&mut self, written: &Written) -> Map<String, Value> {
         let (Some(lsp), Ok(path)) = (&written.lang.lsp, std::path::absolute(written.path)) else { return Map::new() };
@@ -80,28 +82,38 @@ impl Servers {
             let Ok(client) = Client::start(&lsp.launch(on_path("mise")), &root, language_id) else { return Map::new() };
             self.clients.insert(key.clone(), client);
         }
-        warnings(self.clients.get_mut(&key).expect("just started"), &path, written, WAIT)
+        let status = match warnings(self.clients.get_mut(&key).expect("just started"), &path, written, WAIT) {
+            Ok(found) => return found,
+            Err(Unavailable::Late) => "starting",
+            Err(Unavailable::Closed) => {
+                self.clients.remove(&key);
+                "stopped"
+            }
+        };
+        Map::from_iter([("lsp".to_string(), json!(status))])
     }
 }
 
-/// The errors a write added by the server's diagnostics, as `new_lsp_errors`; `lsp: starting` when the
-/// diagnostics did not arrive within `wait`.
-pub fn warnings(client: &mut Client, path: &Path, written: &Written, wait: Duration) -> Map<String, Value> {
+/// The errors a write added by the server's diagnostics, as `new_lsp_errors`. Without diagnostics for the
+/// text before the write, the text after it is not asked about.
+pub fn warnings(
+    client: &mut Client,
+    path: &Path,
+    written: &Written,
+    wait: Duration,
+) -> Result<Map<String, Value>, Unavailable> {
     let errors = |diagnostics: Vec<edo_lsp_client::Diagnostic>| -> Vec<Diagnostic> {
         let errors = diagnostics.into_iter().filter(|d| d.severity == Some(DiagnosticSeverity::ERROR));
         errors.map(|d| Diagnostic { line: d.range.start.line as usize + 1, message: d.message }).collect()
     };
-    let before = client.diagnostics(path, written.before, wait);
-    let after = client.diagnostics(path, written.after, wait);
-    let (Some(before), Some(after)) = (before, after) else {
-        return Map::from_iter([("lsp".to_string(), json!("starting"))]);
-    };
-    let added = new_errors(&errors(before), errors(after), written.hunks);
+    let before = errors(client.diagnostics(path, written.before, wait)?);
+    let after = errors(client.diagnostics(path, written.after, wait)?);
+    let added = new_errors(&before, after, written.hunks);
     if added.is_empty() {
-        return Map::new();
+        return Ok(Map::new());
     }
     let added: Vec<Value> = added.iter().map(|e| json!({"line": e.line, "message": e.message})).collect();
-    Map::from_iter([("new_lsp_errors".to_string(), added.into())])
+    Ok(Map::from_iter([("new_lsp_errors".to_string(), added.into())]))
 }
 
 /// Whether `program` is on PATH, with the extensions PATHEXT lists on Windows.
@@ -222,7 +234,7 @@ mod tests {
         let lang = langs.for_path(Path::new("a.rs")).unwrap();
         let path = std::env::temp_dir().join("a.rs");
         let written = Written { lang, path: &path, before, after, hunks };
-        Value::Object(warnings(client, &path, &written, Duration::from_secs(5)))
+        Value::Object(warnings(client, &path, &written, Duration::from_secs(5)).unwrap())
     }
 
     #[test]
@@ -258,15 +270,54 @@ mod tests {
     #[test]
     fn diagnostics_not_in_time_are_lsp_starting() {
         // Given: 診断を送らないサーバー
+        let (servers, found) = check_through_servers(fake_server(true));
+        // Then: lsp が starting になり、サーバーはそのまま残る
+        assert_eq!(found, json!({"lsp": "starting"}));
+        assert_eq!(servers.clients.len(), 1);
+    }
+
+    #[test]
+    fn exited_server_is_lsp_stopped_and_dropped() {
+        // Given: つないだとたんに終了したサーバー
+        let (client_reads, server_writes) = std::io::pipe().unwrap();
+        let (_, client_writes) = std::io::pipe().unwrap();
+        drop(server_writes);
+        let client =
+            Client::connect(std::io::BufReader::new(client_reads), client_writes, &std::env::temp_dir(), "rust");
+        // When: LSP の警告を求める
+        let (servers, found) = check_through_servers(client);
+        // Then: lsp が stopped になり、次の書き込みで起動し直すよう、サーバーは捨てられる
+        assert_eq!(found, json!({"lsp": "stopped"}));
+        assert!(servers.clients.is_empty());
+    }
+
+    #[test]
+    fn text_after_write_is_not_asked_without_diagnostics_before_it() {
+        // Given: 診断を送らないサーバー
         let mut client = fake_server(true);
         let langs = crate::language::Languages::builtin();
         let lang = langs.for_path(Path::new("a.rs")).unwrap();
         let path = std::env::temp_dir().join("a.rs");
         let written = Written { lang, path: &path, before: "a\n", after: "b\n", hunks: &[] };
-        // When: LSP の警告を求める
-        let found = warnings(&mut client, &path, &written, Duration::from_millis(200));
-        // Then: lsp が starting になる
-        assert_eq!(Value::Object(found), json!({"lsp": "starting"}));
+        // When: 待つ時間を 300ms にして LSP の警告を求める
+        let start = std::time::Instant::now();
+        let found = warnings(&mut client, &path, &written, Duration::from_millis(300));
+        // Then: 届かなかったと答え、書いた後の文書のぶんは待たない
+        assert_eq!(found, Err(Unavailable::Late));
+        assert!(start.elapsed() < Duration::from_millis(550), "took {:?}", start.elapsed());
+    }
+
+    /// Checks a write of a.rs through `Servers` that already hold `client` as a.rs's server.
+    fn check_through_servers(client: Client) -> (Servers, Value) {
+        let langs = crate::language::Languages::builtin();
+        let lang = langs.for_path(Path::new("a.rs")).unwrap();
+        let path = std::path::absolute(std::env::temp_dir().join("a.rs")).unwrap();
+        let root = lang.lsp.as_ref().unwrap().root(&path);
+        let mut servers = Servers::default();
+        servers.clients.insert((lang.name.clone(), root), client);
+        let written = Written { lang, path: &path, before: "a\n", after: "b\n", hunks: &[] };
+        let found = Value::Object(servers.check(&written));
+        (servers, found)
     }
 
     #[test]
