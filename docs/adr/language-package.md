@@ -12,7 +12,7 @@
 - `edo.scm` に tree-sitter query で定義（`@definition.*`、`@name`）、省略できる場所（`@body`）、定義に紐づく doc（`@doc`）、照合規則（`@match.*`）を書く。
 - 組み込みの 8 言語（Rust、TypeScript と TSX、JavaScript、Python、Go、Java、Kotlin、Markdown の 9 パッケージ）も同じ形式で書き、grammar だけ静的リンクする。
 - レジストリはリポジトリのルートの `edo-package.toml` の `[registry] packages` に glob で並べる。edo 本体のリポジトリがデフォルトのレジストリを兼ねる。
-- インストール先は `<config>/edo/packages/<registry>/<name>/`。言語は名前ではなく拡張子で選び、組み込みと拡張子が衝突したらインストール済みを優先する。
+- インストール先は `<config>/edo/packages/<registry>/<name>/`。何が入っているかは `<config>/edo/edo-cache.toml` に記録する（[パッケージのキャッシュ](package-cache.md) を参照）。言語は名前ではなく拡張子で選び、組み込みと拡張子が衝突したらインストール済みを優先する。
 
 ## 結果
 

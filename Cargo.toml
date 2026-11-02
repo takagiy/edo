@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
+crossterm = "0.29.0"
 dirs = "7.0.0"
 edo-tree-sitter-kotlin = { version = "0.4.8", path = "crates/edo-tree-sitter-kotlin" }
 flate2 = "1.1.10"

@@ -2,6 +2,7 @@ pub mod cli;
 pub mod command;
 pub mod edit;
 pub mod install;
+pub mod installer;
 pub mod language;
 pub mod matcher;
 pub mod mcp;

@@ -14,3 +14,4 @@
 | CLI | [cli.md](cli.md) | 引数、標準入力、出力、終了コード |
 | MCP | [mcp.md](mcp.md) | ツール、呼び出し、結果 |
 | インストール | [install.md](install.md) | レジストリ、パッケージ、インストール先 |
+| インストーラー | [installer.md](installer.md) | 画面、見出し、カーソル、選択 |

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::Error;
 use crate::language::{Language, Manifest};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 fn manifest(dir: &Path) -> Result<Manifest, Error> {
@@ -40,21 +41,157 @@ pub fn packages_in(root: &Path) -> Result<Vec<(String, PathBuf)>, Error> {
     Ok(out)
 }
 
-/// Holds where an installed package came from.
-const SOURCE_FILE: &str = ".edo-source";
-
 /// A registry checked out to a local directory.
 pub struct Fetched {
     pub dir: PathBuf,
-    /// Where it came from, such as `github.com/owner/repo@<commit>`.
-    pub source: String,
+    /// The commit that was checked out.
+    pub commit: String,
     /// The download's temporary directory; dropping it deletes the checkout.
     pub tmp: Option<tempfile::TempDir>,
 }
 
-/// `<config>/edo/packages`, where packages are installed.
-pub fn store_dir() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("edo").join("packages")
+/// `<config>/edo`, which holds `edo-cache.toml` and the packages under `packages/<registry>/<name>/`.
+pub fn home_dir() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("edo")
+}
+
+fn package_dir(home: &Path, registry: &str, name: &str) -> PathBuf {
+    home.join("packages").join(registry).join(name)
+}
+
+/// `<home>/edo-cache.toml`: the known registries and the installed packages.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Cache {
+    #[serde(default)]
+    pub registries: Vec<KnownRegistry>,
+    #[serde(default)]
+    pub packages: Vec<InstalledPackage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KnownRegistry {
+    #[serde(rename = "type")]
+    pub kind: RegistryKind,
+    /// `owner/repo`
+    pub repo: String,
+    /// The commit `packages` was read from; absent until the registry is first fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub packages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistryKind {
+    Github,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstalledPackage {
+    /// The registry id, such as `github.com/owner/repo`.
+    pub registry: String,
+    pub name: String,
+    pub commit: String,
+}
+
+impl InstalledPackage {
+    /// `<registry>@<commit>`, as reports show it.
+    fn source(&self) -> String {
+        format!("{}@{}", self.registry, self.commit)
+    }
+}
+
+impl KnownRegistry {
+    /// The id used in specs, reports and install paths.
+    pub fn id(&self) -> String {
+        match self.kind {
+            RegistryKind::Github => format!("github.com/{}", self.repo),
+        }
+    }
+
+    fn from_id(id: &str) -> Result<Self, Error> {
+        let repo = id.strip_prefix("github.com/").ok_or_else(|| {
+            Error::new("unsupported_registry", format!("{id}: only github.com registries are supported"))
+        })?;
+        Ok(KnownRegistry { kind: RegistryKind::Github, repo: repo.into(), commit: None, packages: vec![] })
+    }
+}
+
+const CACHE_FILE: &str = "edo-cache.toml";
+
+impl Cache {
+    /// Without a cache file, only the default registry is known.
+    pub fn load(home: &Path) -> Result<Cache, Error> {
+        let path = home.join(CACHE_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => toml::from_str(&text).map_err(|e| Error::new("cache", format!("{}: {e}", path.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Cache { registries: vec![KnownRegistry::from_id(DEFAULT_REGISTRY)?], packages: vec![] })
+            }
+            Err(e) => Err(Error::new("io", format!("{}: {e}", path.display()))),
+        }
+    }
+
+    // shortcut: read-modify-write without a lock, so concurrent edo lang runs can lose an entry; lock if that happens.
+    fn save(&self, home: &Path) -> Result<(), Error> {
+        let io = |e: std::io::Error| Error::new("io", format!("{}: {e}", home.display()));
+        std::fs::create_dir_all(home).map_err(io)?;
+        let text = toml::to_string(self).map_err(|e| Error::new("cache", e.to_string()))?;
+        std::fs::write(home.join(CACHE_FILE), text).map_err(io)
+    }
+}
+
+/// Fetches a registry and records it as known, with the packages it holds.
+pub fn update_registry(
+    home: &Path,
+    id: &str,
+    fetch: &dyn Fn(&str) -> Result<Fetched, Error>,
+) -> Result<Fetched, Error> {
+    let mut known = KnownRegistry::from_id(id)?;
+    let fetched = fetch(id)?;
+    known.commit = Some(fetched.commit.clone());
+    known.packages = packages_in(&fetched.dir)?.into_iter().map(|(name, _)| name).collect();
+    let mut cache = Cache::load(home)?;
+    match cache.registries.iter_mut().find(|r| r.id() == id) {
+        Some(r) => *r = known,
+        None => cache.registries.push(known),
+    }
+    cache.save(home)?;
+    Ok(fetched)
+}
+
+fn error_report(spec: &str, e: Error) -> Value {
+    json!({"ok": false, "spec": spec, "error": e.code, "message": e.message})
+}
+
+/// Makes a registry given as `<repo>` known.
+pub fn add_registry(home: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched, Error>) -> Value {
+    let id = parse_spec(spec).registry.unwrap_or_default();
+    match update_registry(home, &id, fetch).and_then(|_| Cache::load(home)) {
+        Ok(cache) => {
+            let packages = cache.registries.iter().find(|r| r.id() == id).map(|r| r.packages.clone());
+            json!({"ok": true, "registry": id, "packages": packages})
+        }
+        Err(e) => error_report(spec, e),
+    }
+}
+
+/// Forgets a registry given as `<repo>`; packages installed from it stay.
+pub fn remove_registry(home: &Path, spec: &str) -> Value {
+    let id = parse_spec(spec).registry.unwrap_or_default();
+    let removed = Cache::load(home).and_then(|mut cache| {
+        let before = cache.registries.len();
+        cache.registries.retain(|r| r.id() != id);
+        if cache.registries.len() == before {
+            return Err(Error::new("not_found", format!("{id} is not a known registry")));
+        }
+        cache.save(home)
+    });
+    match removed {
+        Ok(()) => json!({"ok": true, "registry": id}),
+        Err(e) => error_report(spec, e),
+    }
 }
 
 /// Downloads a GitHub registry's default branch as a tarball and unpacks it into a temporary directory.
@@ -79,19 +216,18 @@ pub fn fetch_github(registry: &str) -> Result<Fetched, Error> {
         .find(|e| e.path().is_dir())
         .ok_or_else(|| Error::new("io", format!("{registry}: empty archive")))?;
     let commit = top.file_name().to_string_lossy().rsplit('-').next().unwrap_or_default().to_string();
-    Ok(Fetched { dir: top.path(), source: format!("{registry}@{commit}"), tmp: Some(dir) })
+    Ok(Fetched { dir: top.path(), commit, tmp: Some(dir) })
 }
 
-/// Installs one package into `store` (`<config>/edo/packages`) and reports the outcome.
-pub fn install(store: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched, Error>) -> Value {
-    try_install(store, spec, fetch)
-        .unwrap_or_else(|e| json!({"ok": false, "spec": spec, "error": e.code, "message": e.message}))
+/// Installs one package into `home` (`<config>/edo`) and reports the outcome.
+pub fn install(home: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched, Error>) -> Value {
+    try_install(home, spec, fetch).unwrap_or_else(|e| error_report(spec, e))
 }
 
-fn try_install(store: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched, Error>) -> Result<Value, Error> {
+fn try_install(home: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched, Error>) -> Result<Value, Error> {
     let spec = parse_spec(spec);
     let registry = spec.registry.as_deref().unwrap_or(DEFAULT_REGISTRY);
-    let fetched = fetch(registry)?;
+    let fetched = update_registry(home, registry, fetch)?;
     let packages = packages_in(&fetched.dir)?;
     let (name, dir) = match &spec.name {
         Some(n) => packages.into_iter().find(|(p, _)| p == n),
@@ -106,49 +242,52 @@ fn try_install(store: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched,
         },
     }
     .ok_or_else(|| Error::new("not_found", format!("no such package in {registry}")))?;
-    let target = store.join(registry).join(&name);
+    let target = package_dir(home, registry, &name);
     let extensions = manifest(&dir)?.package.map(|p| p.extensions).unwrap_or_default();
-    for other in installed(store)?.iter().filter(|p| p.dir != target) {
+    for other in installed(home)?.iter().filter(|p| p.dir != target) {
         if let Some(ext) = other.extensions.iter().find(|e| extensions.contains(e)) {
             let message = format!(".{ext} is already handled by {}:{}", other.registry, other.name);
             return Err(Error::new("extension_conflict", message));
         }
     }
-    let source_file = target.join(SOURCE_FILE);
-    let previous = std::fs::read_to_string(&source_file).ok();
     let io = |e: std::io::Error| Error::new("io", format!("{}: {e}", target.display()));
     if target.exists() {
         std::fs::remove_dir_all(&target).map_err(io)?;
     }
     copy_dir(&dir, &target).map_err(io)?;
-    std::fs::write(&source_file, &fetched.source).map_err(io)?;
-    let mut report = json!({"ok": true, "name": name, "registry": registry, "source": fetched.source});
+    let mut cache = Cache::load(home)?;
+    let previous = cache.packages.iter().position(|p| p.registry == registry && p.name == name);
+    let previous = previous.map(|i| cache.packages.remove(i));
+    let entry = InstalledPackage { registry: registry.into(), name, commit: fetched.commit.clone() };
+    let mut report = json!({"ok": true, "name": entry.name, "registry": registry, "source": entry.source()});
     if let Some(previous) = previous {
-        report["replaced_source"] = json!(previous);
+        report["replaced_source"] = json!(previous.source());
     }
+    cache.packages.push(entry);
+    cache.save(home)?;
     Ok(report)
 }
 
-pub fn install_all(store: &Path, specs: &[String], fetch: &dyn Fn(&str) -> Result<Fetched, Error>) -> Vec<Value> {
-    specs.iter().map(|s| install(store, s, fetch)).collect()
+pub fn install_all(home: &Path, specs: &[String], fetch: &dyn Fn(&str) -> Result<Fetched, Error>) -> Vec<Value> {
+    specs.iter().map(|s| install(home, s, fetch)).collect()
 }
 
 /// Removes an installed package given as `<name>` or `<repo>:<name>`.
-pub fn remove(store: &Path, spec: &str) -> Value {
+pub fn remove(home: &Path, spec: &str) -> Value {
     let parsed = parse_spec(spec);
     let name = parsed.name.as_deref().unwrap_or("");
-    let found: Vec<Installed> = match installed(store) {
+    let found: Vec<Installed> = match installed(home) {
         Ok(all) => all
             .into_iter()
             .filter(|p| p.name == name && parsed.registry.as_ref().is_none_or(|r| *r == p.registry))
             .collect(),
-        Err(e) => return json!({"ok": false, "spec": spec, "error": e.code, "message": e.message}),
+        Err(e) => return error_report(spec, e),
     };
     match found.as_slice() {
         [] => json!({"ok": false, "spec": spec, "error": "not_found"}),
-        [p] => match std::fs::remove_dir_all(&p.dir) {
+        [p] => match forget(home, p) {
             Ok(()) => json!({"ok": true, "name": p.name, "registry": p.registry}),
-            Err(e) => json!({"ok": false, "spec": spec, "error": "io", "message": e.to_string()}),
+            Err(e) => error_report(spec, e),
         },
         many => {
             let candidates: Vec<String> = many.iter().map(|p| format!("{}:{}", p.registry, p.name)).collect();
@@ -157,25 +296,33 @@ pub fn remove(store: &Path, spec: &str) -> Value {
     }
 }
 
+/// Drops a package from the cache and deletes its directory.
+fn forget(home: &Path, p: &Installed) -> Result<(), Error> {
+    let mut cache = Cache::load(home)?;
+    cache.packages.retain(|c| !(c.registry == p.registry && c.name == p.name));
+    cache.save(home)?;
+    match std::fs::remove_dir_all(&p.dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Error::new("io", e.to_string())),
+        _ => Ok(()),
+    }
+}
+
 /// Builtin languages plus the installed ones, which win on shared extensions.
 /// A package that fails to load is skipped so one broken package does not disable edo.
-pub fn languages(store: &Path) -> crate::language::Languages {
-    let loaded = installed(store).unwrap_or_default().iter().filter_map(|p| Language::load_dir(&p.dir).ok()).collect();
+pub fn languages(home: &Path) -> crate::language::Languages {
+    let loaded = installed(home).unwrap_or_default().iter().filter_map(|p| Language::load_dir(&p.dir).ok()).collect();
     crate::language::Languages::with_installed(loaded)
 }
 
 /// Builtin and installed packages.
-pub fn list(store: &Path) -> Result<Value, Error> {
+pub fn list(home: &Path) -> Result<Value, Error> {
     let builtin: Vec<Value> = crate::language::Languages::builtin()
         .iter()
         .map(|l| json!({"name": l.name, "extensions": l.extensions}))
         .collect();
-    let installed: Vec<Value> = installed(store)?
+    let installed: Vec<Value> = installed(home)?
         .into_iter()
-        .map(|p| {
-            let source = std::fs::read_to_string(p.dir.join(SOURCE_FILE)).unwrap_or_default();
-            json!({"registry": p.registry, "name": p.name, "extensions": p.extensions, "source": source})
-        })
+        .map(|p| json!({"registry": p.registry, "name": p.name, "extensions": p.extensions, "source": p.source}))
         .collect();
     Ok(json!({"builtin": builtin, "installed": installed}))
 }
@@ -187,23 +334,17 @@ pub struct Installed {
     pub name: String,
     pub extensions: Vec<String>,
     pub dir: PathBuf,
+    /// `<registry>@<commit>`
+    pub source: String,
 }
 
-/// Every package in the store (`<store>/<registry>/<name>/edo-package.toml`).
-pub fn installed(store: &Path) -> Result<Vec<Installed>, Error> {
+/// The packages recorded in `edo-cache.toml`, sorted by registry and name.
+pub fn installed(home: &Path) -> Result<Vec<Installed>, Error> {
     let mut out = vec![];
-    if !store.exists() {
-        return Ok(out);
-    }
-    for entry in ignore::WalkBuilder::new(store).standard_filters(false).build().filter_map(Result::ok) {
-        if entry.file_name() != "edo-package.toml" {
-            continue;
-        }
-        let dir = entry.path().parent().unwrap_or(store).to_path_buf();
-        let Some(p) = manifest(&dir)?.package else { continue };
-        let rel = dir.parent().and_then(|d| d.strip_prefix(store).ok()).unwrap_or(Path::new(""));
-        let registry = rel.to_string_lossy().replace('\\', "/");
-        out.push(Installed { registry, name: p.name, extensions: p.extensions, dir });
+    for p in Cache::load(home)?.packages {
+        let dir = package_dir(home, &p.registry, &p.name);
+        let extensions = manifest(&dir)?.package.map(|m| m.extensions).unwrap_or_default();
+        out.push(Installed { source: p.source(), registry: p.registry, name: p.name, extensions, dir });
     }
     out.sort_by(|a, b| (&a.registry, &a.name).cmp(&(&b.registry, &b.name)));
     Ok(out)
@@ -259,12 +400,12 @@ mod tests {
     fn bare_name_looks_in_default_registry() {
         // Given: デフォルトのレジストリにあるパッケージ
         let repo = langs_repo();
-        let store = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         // When: 名前だけを指定してインストールする
-        let report = install(store.path(), "myrust", &local(vec![(DEFAULT_REGISTRY, &repo)]));
+        let report = install(home.path(), "myrust", &local(vec![(DEFAULT_REGISTRY, &repo)]));
         // Then: デフォルトのレジストリから探して入る
         assert_eq!(report["ok"], true, "{report}");
-        assert!(store.path().join(DEFAULT_REGISTRY).join("myrust/edo-package.toml").is_file());
+        assert!(home.path().join("packages").join(DEFAULT_REGISTRY).join("myrust/edo-package.toml").is_file());
     }
 
     #[test]
@@ -338,7 +479,7 @@ mod tests {
             repos.into_iter().map(|(id, d)| (id.to_string(), d.path().to_path_buf())).collect();
         move |id: &str| {
             let (_, dir) = repos.iter().find(|(r, _)| r == id).ok_or_else(|| Error::new("not_found", id))?;
-            Ok(Fetched { dir: dir.clone(), source: format!("{id}@abc"), tmp: None })
+            Ok(Fetched { dir: dir.clone(), commit: "abc".into(), tmp: None })
         }
     }
 
@@ -356,35 +497,62 @@ mod tests {
     fn package_is_installed_under_registry_and_name() {
         // Given: パッケージを持つレジストリと空のインストール先
         let repo = langs_repo();
-        let store = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         // When: <repo>:<name> を指定してインストールする
-        let report = install(store.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
+        let report = install(home.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
         // Then: <インストール先>/<registry>/<name>/ に入る
         assert_eq!(report["ok"], true, "{report}");
-        assert!(store.path().join("github.com/foo/langs/myrust/edo-package.toml").is_file());
+        assert!(home.path().join("packages/github.com/foo/langs/myrust/edo-package.toml").is_file());
     }
 
     #[test]
-    fn installed_package_records_its_source() {
+    fn installed_package_is_recorded_in_cache_with_its_commit() {
         // Given: パッケージを持つレジストリ
         let repo = langs_repo();
-        let store = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         // When: インストールする
-        install(store.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
-        // Then: 入手元が記録される
-        let source = std::fs::read_to_string(store.path().join("github.com/foo/langs/myrust/.edo-source")).unwrap();
-        assert_eq!(source, "github.com/foo/langs@abc");
+        install(home.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
+        // Then: edo-cache.toml に入手元のコミットと一緒に記録される
+        let cache = Cache::load(home.path()).unwrap();
+        let entry =
+            InstalledPackage { registry: "github.com/foo/langs".into(), name: "myrust".into(), commit: "abc".into() };
+        assert_eq!(cache.packages, [entry]);
+    }
+
+    #[test]
+    fn without_cache_only_default_registry_is_known() {
+        // Given: edo-cache.toml のないホーム
+        let home = tempfile::tempdir().unwrap();
+        // When: 読み込む
+        let cache = Cache::load(home.path()).unwrap();
+        // Then: デフォルトのレジストリだけが既知になる
+        let ids: Vec<String> = cache.registries.iter().map(KnownRegistry::id).collect();
+        assert_eq!(ids, [DEFAULT_REGISTRY]);
+    }
+
+    #[test]
+    fn registry_used_for_install_becomes_known_with_its_packages() {
+        // Given: 2 つのパッケージを持つレジストリ
+        let repo = langs_repo();
+        let home = tempfile::tempdir().unwrap();
+        // When: そのうち 1 つをインストールする
+        install(home.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
+        // Then: レジストリが既知になり、パッケージの一覧とコミットが記録される
+        let cache = Cache::load(home.path()).unwrap();
+        let known = cache.registries.iter().find(|r| r.id() == "github.com/foo/langs").unwrap();
+        assert_eq!(known.packages, ["myrust", "other"]);
+        assert_eq!(known.commit.as_deref(), Some("abc"));
     }
 
     #[test]
     fn reinstalling_same_registry_package_overwrites_and_reports_previous_source() {
         // Given: 一度インストールしたパッケージ
         let repo = langs_repo();
-        let store = tempfile::tempdir().unwrap();
-        install(store.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
+        let home = tempfile::tempdir().unwrap();
+        install(home.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
         // When: 新しいコミットから同じパッケージを入れる
-        let newer = |id: &str| Ok(Fetched { dir: repo.path().to_path_buf(), source: format!("{id}@def"), tmp: None });
-        let report = install(store.path(), "foo/langs:myrust", &newer);
+        let newer = |_: &str| Ok(Fetched { dir: repo.path().to_path_buf(), commit: "def".into(), tmp: None });
+        let report = install(home.path(), "foo/langs:myrust", &newer);
         // Then: 上書きされ、前の入手元が報告される
         assert_eq!(report["replaced_source"], "github.com/foo/langs@abc");
     }
@@ -394,15 +562,15 @@ mod tests {
         // Given: 同じ名前で拡張子の違うパッケージを持つ 2 つのレジストリ
         let a = registry(&[("edo-package.toml", &package("sql", "pgsql")), ("edo.scm", "")]);
         let b = registry(&[("edo-package.toml", &package("sql", "mysql")), ("edo.scm", "")]);
-        let store = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         let fetch = local(vec![("github.com/a/sql", &a), ("github.com/b/sql", &b)]);
         // When: 両方をインストールする
-        install(store.path(), "a/sql", &fetch);
-        let report = install(store.path(), "b/sql", &fetch);
+        install(home.path(), "a/sql", &fetch);
+        let report = install(home.path(), "b/sql", &fetch);
         // Then: どちらも残る
         assert_eq!(report["ok"], true, "{report}");
-        assert!(store.path().join("github.com/a/sql/sql/edo-package.toml").is_file());
-        assert!(store.path().join("github.com/b/sql/sql/edo-package.toml").is_file());
+        assert!(home.path().join("packages/github.com/a/sql/sql/edo-package.toml").is_file());
+        assert!(home.path().join("packages/github.com/b/sql/sql/edo-package.toml").is_file());
     }
 
     #[test]
@@ -410,24 +578,24 @@ mod tests {
         // Given: 同じ拡張子を宣言するパッケージを持つ 2 つのレジストリ
         let a = registry(&[("edo-package.toml", &package("kt1", "kt")), ("edo.scm", "")]);
         let b = registry(&[("edo-package.toml", &package("kt2", "kt")), ("edo.scm", "")]);
-        let store = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         let fetch = local(vec![("github.com/a/kt", &a), ("github.com/b/kt", &b)]);
-        install(store.path(), "a/kt", &fetch);
+        install(home.path(), "a/kt", &fetch);
         // When: 2 つ目をインストールする
-        let report = install(store.path(), "b/kt", &fetch);
+        let report = install(home.path(), "b/kt", &fetch);
         // Then: 拡張子の衝突でエラーになり、入らない
         assert_eq!(report["error"], "extension_conflict");
-        assert!(!store.path().join("github.com/b/kt").exists());
+        assert!(!home.path().join("packages/github.com/b/kt").exists());
     }
 
     #[test]
     fn several_specs_give_one_result_each() {
         // Given: 2 つのパッケージを持つレジストリ
         let repo = langs_repo();
-        let store = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         // When: 2 つを同時に指定してインストールする
         let specs = ["foo/langs:myrust".to_string(), "foo/langs:other".to_string()];
-        let reports = install_all(store.path(), &specs, &local(vec![("github.com/foo/langs", &repo)]));
+        let reports = install_all(home.path(), &specs, &local(vec![("github.com/foo/langs", &repo)]));
         // Then: パッケージごとに結果が返る
         let names: Vec<_> = reports.iter().map(|r| r["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["myrust", "other"]);
@@ -437,10 +605,10 @@ mod tests {
     fn list_shows_builtin_and_installed_packages() {
         // Given: 1 つインストールしたインストール先
         let repo = langs_repo();
-        let store = tempfile::tempdir().unwrap();
-        install(store.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
+        let home = tempfile::tempdir().unwrap();
+        install(home.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
         // When: 一覧を出す
-        let listed = list(store.path()).unwrap();
+        let listed = list(home.path()).unwrap();
         // Then: 組み込みとインストール済みのパッケージが並ぶ
         assert_eq!(listed["builtin"][0]["name"], "rust");
         assert_eq!(
@@ -453,13 +621,25 @@ mod tests {
     fn removing_package_deletes_its_directory() {
         // Given: インストールしたパッケージ
         let repo = langs_repo();
-        let store = tempfile::tempdir().unwrap();
-        install(store.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
+        let home = tempfile::tempdir().unwrap();
+        install(home.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
         // When: 名前を指定して削除する
-        let report = remove(store.path(), "myrust");
+        let report = remove(home.path(), "myrust");
         // Then: パッケージのディレクトリが消える
         assert_eq!(report["ok"], true, "{report}");
-        assert!(!store.path().join("github.com/foo/langs/myrust").exists());
+        assert!(!home.path().join("packages/github.com/foo/langs/myrust").exists());
+    }
+
+    #[test]
+    fn removed_package_is_dropped_from_cache() {
+        // Given: インストールしたパッケージ
+        let repo = langs_repo();
+        let home = tempfile::tempdir().unwrap();
+        install(home.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
+        // When: 削除する
+        remove(home.path(), "myrust");
+        // Then: edo-cache.toml から消える
+        assert!(Cache::load(home.path()).unwrap().packages.is_empty());
     }
 
     #[test]
@@ -467,57 +647,110 @@ mod tests {
         // Given: 違うレジストリから入れた同名のパッケージ
         let a = registry(&[("edo-package.toml", &package("sql", "pgsql")), ("edo.scm", "")]);
         let b = registry(&[("edo-package.toml", &package("sql", "mysql")), ("edo.scm", "")]);
-        let store = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         let fetch = local(vec![("github.com/a/sql", &a), ("github.com/b/sql", &b)]);
-        install(store.path(), "a/sql", &fetch);
-        install(store.path(), "b/sql", &fetch);
+        install(home.path(), "a/sql", &fetch);
+        install(home.path(), "b/sql", &fetch);
         // When: 名前だけで削除する
-        let report = remove(store.path(), "sql");
+        let report = remove(home.path(), "sql");
         // Then: ambiguous になり、どちらも消えない
         assert_eq!(report["error"], "ambiguous");
-        assert!(store.path().join("github.com/a/sql/sql").exists());
+        assert!(home.path().join("packages/github.com/a/sql/sql").exists());
     }
 
     #[test]
     fn installed_packages_load_as_languages() {
         // Given: .myrs を宣言するパッケージをインストールしたインストール先
         let repo = langs_repo();
-        let store = tempfile::tempdir().unwrap();
-        install(store.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
+        let home = tempfile::tempdir().unwrap();
+        install(home.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
         // When: 言語を読み込む
-        let langs = languages(store.path());
+        let langs = languages(home.path());
         // Then: .myrs のファイルにそのパッケージが選ばれる
         assert_eq!(langs.for_path(Path::new("a.myrs")).map(|l| l.name.as_str()), Some("myrust"));
+    }
+
+    #[test]
+    fn directory_not_recorded_in_cache_is_not_loaded() {
+        // Given: edo-cache.toml に記録せず、手で置いたパッケージのディレクトリ
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("packages/github.com/foo/langs/myrust");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("edo-package.toml"), package("myrust", "myrs")).unwrap();
+        std::fs::write(dir.join("edo.scm"), "").unwrap();
+        // When: 言語を読み込む
+        let langs = languages(home.path());
+        // Then: そのパッケージは選ばれない
+        assert!(langs.for_path(Path::new("a.myrs")).is_none());
     }
 
     #[test]
     fn registry_without_name_is_error() {
         // Given: 2 つのパッケージを持つ [registry] のレジストリ
         let repo = langs_repo();
-        let store = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         // When: 名前なしでインストールする
-        let report = install(store.path(), "foo/langs", &local(vec![("github.com/foo/langs", &repo)]));
+        let report = install(home.path(), "foo/langs", &local(vec![("github.com/foo/langs", &repo)]));
         // Then: エラーになり、何も入らない
         assert_eq!(report["error"], "name_required", "{report}");
-        assert!(installed(store.path()).unwrap().is_empty());
+        assert!(installed(home.path()).unwrap().is_empty());
     }
 
     #[test]
     fn fetched_temporary_directory_is_removed_after_install() {
         // Given: レジストリを一時ディレクトリに取得する fetcher
-        let store = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         let fetched_at = std::cell::RefCell::new(PathBuf::new());
-        let fetch = |id: &str| {
+        let fetch = |_: &str| {
             let tmp = tempfile::tempdir().unwrap();
             std::fs::write(tmp.path().join("edo-package.toml"), package("myrust", "myrs")).unwrap();
             std::fs::write(tmp.path().join("edo.scm"), "").unwrap();
             *fetched_at.borrow_mut() = tmp.path().to_path_buf();
-            Ok(Fetched { dir: tmp.path().to_path_buf(), source: format!("{id}@abc"), tmp: Some(tmp) })
+            Ok(Fetched { dir: tmp.path().to_path_buf(), commit: "abc".into(), tmp: Some(tmp) })
         };
         // When: インストールする
-        let report = install(store.path(), "foo/myrust", &fetch);
+        let report = install(home.path(), "foo/myrust", &fetch);
         // Then: インストールは成功し、一時ディレクトリは消える
         assert_eq!(report["ok"], true, "{report}");
         assert!(!fetched_at.borrow().exists());
+    }
+
+    #[test]
+    fn added_registry_becomes_known_with_its_packages() {
+        // Given: 2 つのパッケージを持つレジストリ
+        let repo = langs_repo();
+        let home = tempfile::tempdir().unwrap();
+        // When: レジストリを追加する
+        let report = add_registry(home.path(), "foo/langs", &local(vec![("github.com/foo/langs", &repo)]));
+        // Then: 既知になり、パッケージの一覧が記録される
+        assert_eq!(report["ok"], true, "{report}");
+        let cache = Cache::load(home.path()).unwrap();
+        let known = cache.registries.iter().find(|r| r.id() == "github.com/foo/langs").unwrap();
+        assert_eq!(known.packages, ["myrust", "other"]);
+    }
+
+    #[test]
+    fn removed_registry_is_forgotten_but_its_packages_stay() {
+        // Given: パッケージを 1 つ入れたレジストリ
+        let repo = langs_repo();
+        let home = tempfile::tempdir().unwrap();
+        install(home.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
+        // When: レジストリを外す
+        let report = remove_registry(home.path(), "foo/langs");
+        // Then: 既知でなくなり、パッケージは残る
+        assert_eq!(report["ok"], true, "{report}");
+        let cache = Cache::load(home.path()).unwrap();
+        assert!(cache.registries.iter().all(|r| r.id() != "github.com/foo/langs"));
+        assert_eq!(cache.packages.len(), 1);
+    }
+
+    #[test]
+    fn removing_unknown_registry_is_not_found() {
+        // Given: 何も追加していないホーム
+        let home = tempfile::tempdir().unwrap();
+        // When: 既知でないレジストリを外す
+        let report = remove_registry(home.path(), "foo/langs");
+        // Then: not_found になる
+        assert_eq!(report["error"], "not_found");
     }
 }

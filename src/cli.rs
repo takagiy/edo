@@ -46,46 +46,63 @@ enum Cmd {
 #[derive(Subcommand)]
 enum LangCmd {
     /// Install packages given as <name> (default registry), <repo>:<name>, or <repo> whose root is a package.
-    Install {
-        #[arg(required = true)]
-        specs: Vec<String>,
-    },
+    ///
+    /// Without any, opens an interactive installer listing the known registries' packages.
+    Install { specs: Vec<String> },
     /// List builtin and installed packages.
     List,
     /// Remove an installed package given as <name> or <repo>:<name>.
     Remove { spec: String },
+    /// Manage the known registries the interactive installer lists.
+    Registry {
+        #[command(subcommand)]
+        cmd: RegistryCmd,
+    },
 }
 
-fn lang(cmd: LangCmd) -> (String, i32) {
-    let store = install::store_dir();
-    let (out, ok) = match cmd {
-        LangCmd::Install { specs } => {
-            let reports = install::install_all(&store, &specs, &install::fetch_github);
-            let ok = reports.iter().all(|r| r["ok"] == true);
-            (serde_json::Value::from(reports), ok)
+#[derive(Subcommand)]
+enum RegistryCmd {
+    /// Fetch a registry given as <repo> and make it known.
+    Add { repo: String },
+    /// Forget a registry given as <repo>; packages installed from it stay.
+    Remove { repo: String },
+}
+
+fn lang(cmd: LangCmd, interactive: bool) -> (String, i32) {
+    let home = install::home_dir();
+    let fetch = &install::fetch_github;
+    let out = match cmd {
+        LangCmd::Install { specs } if specs.is_empty() => {
+            if !interactive {
+                return usage("give packages to install, or run in a terminal for the interactive installer".into());
+            }
+            match crate::installer::run(&home, fetch) {
+                Ok(reports) => reports.into(),
+                Err(e) => e.to_json(),
+            }
         }
-        LangCmd::List => match install::list(&store) {
-            Ok(v) => (v, true),
-            Err(e) => (e.to_json(), false),
-        },
-        LangCmd::Remove { spec } => {
-            let r = install::remove(&store, &spec);
-            let ok = r["ok"] == true;
-            (r, ok)
-        }
+        LangCmd::Install { specs } => install::install_all(&home, &specs, fetch).into(),
+        LangCmd::List => install::list(&home).unwrap_or_else(|e| e.to_json()),
+        LangCmd::Remove { spec } => install::remove(&home, &spec),
+        LangCmd::Registry { cmd: RegistryCmd::Add { repo } } => install::add_registry(&home, &repo, fetch),
+        LangCmd::Registry { cmd: RegistryCmd::Remove { repo } } => install::remove_registry(&home, &repo),
     };
+    // Every report is an object with ok, or an array of them.
+    let failed = |v: &serde_json::Value| v["ok"] == false;
+    let ok = !(failed(&out) || out.as_array().is_some_and(|a| a.iter().any(failed)));
     (out.to_string(), if ok { 0 } else { 1 })
 }
 
 /// Runs the CLI and returns what to print and the exit code.
-pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages) -> (String, i32) {
+/// `interactive` says whether a person is at the terminal, so `lang install` may open the installer.
+pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages, interactive: bool) -> (String, i32) {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(e) if !e.use_stderr() => return (e.to_string(), 0),
         Err(e) => return usage(e.to_string()),
     };
     match cli.cmd {
-        Cmd::Lang { cmd } => lang(cmd),
+        Cmd::Lang { cmd } => lang(cmd, interactive),
         Cmd::Mcp => match crate::mcp::serve(langs) {
             Ok(()) => (String::new(), 0),
             Err(e) => (json!({"ok": false, "error": "io", "message": e.to_string()}).to_string(), 1),
@@ -183,7 +200,7 @@ mod tests {
     fn edo(args: &[&str], stdin: &str) -> (String, i32) {
         let args: Vec<String> = std::iter::once("edo").chain(args.iter().copied()).map(String::from).collect();
         let stdin = stdin.to_string();
-        run(&args, &mut || stdin.clone(), Languages::builtin())
+        run(&args, &mut || stdin.clone(), Languages::builtin(), false)
     }
 
     #[test]
@@ -320,5 +337,14 @@ mod tests {
         // Then: usage エラーになり、ファイルは変わらない
         assert!(out.contains("\"usage\"") && code != 0, "{out}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {}\n");
+    }
+
+    #[test]
+    fn lang_install_without_specs_outside_terminal_is_usage_error() {
+        // Given: 端末でない呼び出し
+        // When: lang install を引数なしで呼ぶ
+        let (out, code) = edo(&["lang", "install"], "");
+        // Then: usage エラーになる
+        assert_eq!(code, 2, "{out}");
     }
 }
