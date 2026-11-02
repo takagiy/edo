@@ -145,12 +145,11 @@ pub fn find(src: &str, leaves: &[Leaf], scope: Range<usize>, before: &str) -> Fo
         best: Cell::new(None),
         failed: Default::default(),
     };
+    // A leaf such as a comment may hold several matches, so each leaf is tried until it has no more,
+    // always from where the last match ended so that matches do not overlap.
     let mut found: Vec<Range<usize>> = vec![];
-    for (i, leaf) in leaves.iter().enumerate() {
-        if found.last().is_some_and(|f| leaf.range.start < f.end) {
-            continue;
-        }
-        if let Some(range) = m.start_at(i) {
+    for i in 0..leaves.len() {
+        while let Some(range) = m.start_at(i, found.last().map_or(0, |f| f.end)) {
             found.push(range);
         }
     }
@@ -228,13 +227,14 @@ impl Matcher<'_> {
         &self.src[range.start.max(self.start.get()).min(range.end)..range.end]
     }
 
-    /// Matches `before` starting at leaf `i`, or at a later point in it that does not split a word.
-    fn start_at(&self, i: usize) -> Option<Range<usize>> {
+    /// Matches `before` starting at leaf `i`, or at a later point in it that does not split a word, at or
+    /// after byte `from`.
+    fn start_at(&self, i: usize, from: usize) -> Option<Range<usize>> {
         let range = self.leaves[i].range.clone();
         let text = &self.src[range.clone()];
         let splits_word = |k: usize, c: char| text[..k].chars().next_back().is_some_and(is_word) && is_word(c);
         let starts = text.char_indices().filter(|&(k, c)| k == 0 || !(c.is_whitespace() || splits_word(k, c)));
-        starts.map(|(k, _)| range.start + k).find_map(|start| {
+        starts.map(|(k, _)| range.start + k).filter(|&start| start >= from).find_map(|start| {
             self.start.set(start);
             Some(start..self.at(i, 0, None)?)
         })
@@ -590,6 +590,28 @@ mod tests {
         // When: その文で照合する
         let found = find_in(&rust(""), src, "x();");
         // Then: 2 つとも返る
+        assert_eq!(found, ["x();", "x();"]);
+    }
+
+    #[test]
+    fn all_matches_inside_one_leaf_are_returned() {
+        // Given: x が 2 回出てくる 1 つのコメント
+        let lang = rust("(line_comment) @match.collapse");
+        let src = "// a x b x c\nfn f() {}\n";
+        // When: x で照合する
+        let found = find_in(&lang, src, "x");
+        // Then: 2 つとも返される
+        assert_eq!(found, ["x", "x"]);
+    }
+
+    #[test]
+    fn match_after_another_ending_inside_same_leaf_is_returned() {
+        // Given: 呼び出しの後ろに続く、同じ呼び出しを含むコメント
+        let lang = rust("(line_comment) @match.collapse");
+        let src = "fn a() { x(); }\n// x(); again\n";
+        // When: x(); で照合する
+        let found = find_in(&lang, src, "x();");
+        // Then: コードの中とコメントの中の両方が返される
         assert_eq!(found, ["x();", "x();"]);
     }
 
