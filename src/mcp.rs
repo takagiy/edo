@@ -107,8 +107,12 @@ impl Server {
         };
         let stale = p.scope.as_deref().and_then(crate::scope::parse_lines).is_some() && self.is_stale(&p.path);
         // shortcut: waits for diagnostics on the runtime's only thread; fine while one agent writes at a time.
-        let mut check =
-            |written: &Written| self.lsp.as_ref().map_or_else(Map::new, |s| s.lock().unwrap().check(written));
+        // A check that panicked leaves the lock poisoned; a client cut off mid-request recovers on its next one.
+        let mut check = |written: &Written| {
+            self.lsp
+                .as_ref()
+                .map_or_else(Map::new, |s| s.lock().unwrap_or_else(std::sync::PoisonError::into_inner).check(written))
+        };
         match command::write(&self.langs, &req, &mut check) {
             Ok(mut reports) => {
                 for r in reports.iter_mut().filter(|r| r["ok"] == true) {

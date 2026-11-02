@@ -91,8 +91,27 @@ fn supported(langs: &Languages, files: Vec<String>) -> (Vec<String>, Skipped) {
     (files, skipped)
 }
 
-/// Reads a file (or glob) as an outline, or the definitions/lines selected by `scope`.
+/// `read_files`, with a panic reported as an `internal` error.
 pub fn read(langs: &Languages, path: &str, scope: Option<&str>) -> Result<String, Error> {
+    guarded(|| read_files(langs, path, scope))
+}
+
+/// `write_files`, with a panic reported as an `internal` error.
+pub fn write(langs: &Languages, req: &WriteRequest, check: Check) -> Result<Vec<Value>, Error> {
+    guarded(|| write_files(langs, req, check))
+}
+
+/// Runs `f`, turning a panic into an `internal` error so that a bug answers the agent instead of leaving
+/// the MCP call waiting forever.
+fn guarded<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|panic| {
+        let message = panic.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| panic.downcast_ref().cloned());
+        Err(Error::new("internal", message.unwrap_or_else(|| "edo panicked".into())))
+    })
+}
+
+/// Reads a file (or glob) as an outline, or the definitions/lines selected by `scope`.
+fn read_files(langs: &Languages, path: &str, scope: Option<&str>) -> Result<String, Error> {
     if !is_glob(path) {
         return read_one(langs, path, scope);
     }
@@ -177,7 +196,7 @@ pub struct Written<'a> {
 pub type Check<'a> = &'a mut dyn FnMut(&Written) -> Map<String, Value>;
 
 /// Writes `after` into each matched file and reports per file; `check` adds warnings to each file written.
-pub fn write(langs: &Languages, req: &WriteRequest, check: Check) -> Result<Vec<Value>, Error> {
+fn write_files(langs: &Languages, req: &WriteRequest, check: Check) -> Result<Vec<Value>, Error> {
     if !is_glob(req.path) {
         return Ok(vec![write_one(langs, req.path, req, check)?]);
     }
@@ -416,6 +435,17 @@ mod tests {
         let req = WriteRequest { path: &path, ..req };
         let _ = dir;
         write(&Languages::builtin(), &req, &mut |_| Map::new()).unwrap()
+    }
+
+    #[test]
+    fn panic_during_write_is_internal_error() {
+        // Given: 呼び出しのある Rust のファイルと、panic するチェック
+        let dir = dir_with(&[("a.rs", "fn a() { x(); }\n")]);
+        let req = WriteRequest { path: &at(&dir, "a.rs"), before: Some("x();"), after: "y();", ..Default::default() };
+        // When: 書く
+        let err = write(&Languages::builtin(), &req, &mut |_| panic!("boom")).unwrap_err();
+        // Then: panic の内容を持つ internal エラーが返る
+        assert_eq!((err.code, err.message.as_str()), ("internal", "boom"));
     }
 
     #[test]
