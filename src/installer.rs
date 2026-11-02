@@ -3,6 +3,8 @@
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Print, SetAttribute};
@@ -13,9 +15,15 @@ use serde_json::Value;
 use crate::Error;
 use crate::install::{self, Cache, Fetched, KnownRegistry};
 
-type Fetch<'a> = &'a dyn Fn(&str) -> Result<Fetched, Error>;
+// Sync, since fetches run on a worker thread while the screen animates.
+type Fetch<'a> = &'a (dyn Fn(&str) -> Result<Fetched, Error> + Sync);
 
-const HELP: &str = "↑↓: move | tab: select | U: update registry | enter: submit";
+/// Redraws the screen while work is in progress.
+type Draw<'a> = &'a mut dyn FnMut(&Picker);
+
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+const HELP: &str = "↑↓: move | tab: select | U: update registries | enter: submit";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Package {
@@ -31,6 +39,7 @@ impl Package {
 
 #[derive(Debug, PartialEq)]
 enum Row {
+    /// A registry id; shown without `github.com/`.
     Header(String),
     Note(&'static str),
     Package(Package),
@@ -50,6 +59,8 @@ pub enum Input {
 pub enum Action {
     None,
     Update,
+    /// U again right after `Update`.
+    UpdatePackages,
     /// Specs (`<registry>:<name>`) to install and to remove.
     Submit {
         install: Vec<String>,
@@ -67,14 +78,28 @@ pub struct Picker {
     cursor: usize,
     /// Shown above the key help, such as fetch errors.
     pub status: String,
+    /// The registries were just refetched, so U now updates the installed packages.
+    updated: bool,
+    /// Registry ids and package specs being fetched, shown with a spinner.
+    busy: BTreeSet<String>,
+    /// How far the spinner has turned.
+    frame: usize,
 }
 
 impl Picker {
     pub fn new(cache: &Cache) -> Picker {
         let installed: BTreeSet<Package> =
             cache.packages.iter().map(|p| Package { registry: p.registry.clone(), name: p.name.clone() }).collect();
-        let mut picker =
-            Picker { rows: vec![], selected: installed.clone(), installed, cursor: 0, status: String::new() };
+        let mut picker = Picker {
+            rows: vec![],
+            selected: installed.clone(),
+            installed,
+            cursor: 0,
+            status: String::new(),
+            updated: false,
+            busy: BTreeSet::new(),
+            frame: 0,
+        };
         picker.reload(cache);
         picker
     }
@@ -89,6 +114,7 @@ impl Picker {
     }
 
     pub fn handle(&mut self, input: Input) -> Action {
+        let updated = std::mem::take(&mut self.updated);
         let is_package = |i: &usize| as_package(&self.rows[*i]).is_some();
         match input {
             Input::Up => self.cursor = (0..self.cursor).rev().find(is_package).unwrap_or(self.cursor),
@@ -105,6 +131,7 @@ impl Picker {
                 let remove = self.installed.difference(&self.selected).map(Package::spec).collect();
                 return Action::Submit { install, remove };
             }
+            Input::Update if updated => return Action::UpdatePackages,
             Input::Update => return Action::Update,
             Input::Cancel => return Action::Cancel,
         }
@@ -113,13 +140,19 @@ impl Picker {
 
     /// The screen's lines, and the line the cursor is on.
     pub fn render(&self) -> (Vec<String>, Option<usize>) {
+        let spin = |key: String| {
+            if self.busy.contains(&key) { format!(" {}", SPINNER[self.frame % SPINNER.len()]) } else { String::new() }
+        };
         let mut lines: Vec<String> = self
             .rows
             .iter()
             .map(|r| match r {
-                Row::Header(label) => label.clone(),
+                Row::Header(id) => format!("{}{}", id.strip_prefix("github.com/").unwrap_or(id), spin(id.clone())),
                 Row::Note(note) => note.to_string(),
-                Row::Package(p) => format!("[{}] {}", if self.selected.contains(p) { 'x' } else { ' ' }, p.name),
+                Row::Package(p) => {
+                    let mark = if self.selected.contains(p) { 'x' } else { ' ' };
+                    format!("[{mark}] {}{}", p.name, spin(p.spec()))
+                }
                 Row::Blank => String::new(),
             })
             .collect();
@@ -154,7 +187,7 @@ fn rows(cache: &Cache) -> Vec<Row> {
         if !rows.is_empty() {
             rows.push(Row::Blank);
         }
-        rows.push(Row::Header(id.strip_prefix("github.com/").unwrap_or(&id).to_string()));
+        rows.push(Row::Header(id.clone()));
         if names.is_empty() {
             let fetched = known.is_none_or(|r| r.commit.is_some());
             rows.push(Row::Note(if fetched { "(no packages)" } else { "(not fetched)" }));
@@ -165,34 +198,89 @@ fn rows(cache: &Cache) -> Vec<Row> {
     rows
 }
 
-/// Fetches the registries, returning one line per failure.
-fn fetch_all(home: &Path, ids: &[String], fetch: Fetch) -> String {
-    let errors = ids.iter().filter_map(|id| install::update_registry(home, id, fetch).err());
-    errors.map(|e| e.message).collect::<Vec<_>>().join("\n")
+/// Runs `job` for each key in turn on a worker thread, with a spinner next to each key until its job is done,
+/// calling `draw` as the spinner turns. One at a time, since every job rewrites `edo-cache.toml`.
+fn one_by_one<T: Send>(picker: &mut Picker, keys: Vec<String>, job: impl Fn(&str) -> T + Sync, draw: Draw) -> Vec<T> {
+    picker.busy = keys.iter().cloned().collect();
+    let (tx, rx) = mpsc::channel();
+    let job = &job;
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            for key in keys {
+                let done = job(&key);
+                if tx.send((key, done)).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut results = vec![];
+        loop {
+            draw(picker);
+            match rx.recv_timeout(Duration::from_millis(80)) {
+                Ok((key, done)) => {
+                    picker.busy.remove(&key);
+                    results.push(done);
+                }
+                Err(RecvTimeoutError::Timeout) => picker.frame += 1,
+                Err(RecvTimeoutError::Disconnected) => return results,
+            }
+        }
+    })
 }
 
-/// Opens the picker after fetching the registries that were never fetched.
-pub fn start(home: &Path, fetch: Fetch) -> Result<Picker, Error> {
+/// Fetches the registries, returning one line per failure.
+fn fetch_all(picker: &mut Picker, home: &Path, ids: Vec<String>, fetch: Fetch, draw: Draw) -> Vec<String> {
+    let job = |id: &str| install::update_registry(home, id, fetch).err().map(|e| e.message);
+    one_by_one(picker, ids, job, draw).into_iter().flatten().collect()
+}
+
+/// Opens the picker and fetches the registries that were never fetched.
+pub fn start(home: &Path, fetch: Fetch, draw: Draw) -> Result<Picker, Error> {
     let cache = Cache::load(home)?;
+    let mut picker = Picker::new(&cache);
     let unfetched: Vec<String> =
         cache.registries.iter().filter(|r| r.commit.is_none()).map(KnownRegistry::id).collect();
-    let status = fetch_all(home, &unfetched, fetch);
-    let mut picker = Picker::new(&Cache::load(home)?);
-    picker.status = status;
+    picker.status = fetch_all(&mut picker, home, unfetched, fetch, draw).join("\n");
+    picker.reload(&Cache::load(home)?);
     Ok(picker)
 }
 
 /// Refetches every known registry and shows the new package lists.
-pub fn update(picker: &mut Picker, home: &Path, fetch: Fetch) {
+pub fn update(picker: &mut Picker, home: &Path, fetch: Fetch, draw: Draw) {
     let ids: Vec<String> = match Cache::load(home) {
         Ok(cache) => cache.registries.iter().map(KnownRegistry::id).collect(),
         Err(e) => return picker.status = e.message,
     };
-    picker.status = fetch_all(home, &ids, fetch);
+    picker.status = "updating registries...".into();
+    let mut status = fetch_all(picker, home, ids, fetch, draw);
     match Cache::load(home) {
         Ok(cache) => picker.reload(&cache),
-        Err(e) => picker.status = e.message,
+        Err(e) => status.push(e.message),
     }
+    status.push("registries updated. press U again to update installed packages".into());
+    picker.status = status.join("\n");
+    picker.updated = true;
+}
+
+/// Reinstalls every installed package from its registry's latest commit.
+// shortcut: each package downloads its registry again; fetch once per registry if updates get slow.
+pub fn update_packages(picker: &mut Picker, home: &Path, fetch: Fetch, draw: Draw) -> Vec<Value> {
+    let specs: Vec<String> = match Cache::load(home) {
+        Ok(cache) => cache.packages.iter().map(|p| format!("{}:{}", p.registry, p.name)).collect(),
+        Err(e) => {
+            picker.status = e.message;
+            return vec![];
+        }
+    };
+    picker.status = "updating installed packages...".into();
+    let reports = one_by_one(picker, specs, |spec| install::install(home, spec, fetch), draw);
+    let failed = reports.iter().filter(|r| r["ok"] == false);
+    let mut status: Vec<String> = failed
+        .map(|r| format!("{}: {}", r["spec"].as_str().unwrap_or(""), r["message"].as_str().unwrap_or("")))
+        .collect();
+    status.push("installed packages updated".into());
+    picker.status = status.join("\n");
+    reports
 }
 
 /// Removes first, so a package can be swapped for another that claims the same extensions.
@@ -201,59 +289,62 @@ pub fn apply(home: &Path, install: &[String], remove: &[String], fetch: Fetch) -
     removed.chain(install.iter().map(|s| install::install(home, s, fetch))).collect()
 }
 
-/// Runs the installer on the terminal (drawn on stderr) and reports what changed.
+/// Runs the installer on the terminal (drawn on stderr) and reports every install and removal it made.
 pub fn run(home: &Path, fetch: Fetch) -> Result<Vec<Value>, Error> {
     let io = |e: std::io::Error| Error::new("io", e.to_string());
-    let mut picker = start(home, fetch)?;
-    let mut screen = Screen::open().map_err(io)?;
+    let screen = Screen::open().map_err(io)?;
+    // A failed redraw mid-fetch shows up on the next draw in the loop.
+    let mut picker = start(home, fetch, &mut |p| _ = screen.draw(p))?;
+    let mut reports = vec![];
     loop {
         screen.draw(&picker).map_err(io)?;
         let Some(input) = Screen::read().map_err(io)? else { continue };
         match picker.handle(input) {
             Action::None => {}
-            Action::Update => {
-                picker.status = "updating...".into();
-                screen.draw(&picker).map_err(io)?;
-                update(&mut picker, home, fetch);
+            Action::Update => update(&mut picker, home, fetch, &mut |p| _ = screen.draw(p)),
+            Action::UpdatePackages => {
+                reports.extend(update_packages(&mut picker, home, fetch, &mut |p| _ = screen.draw(p)))
             }
-            Action::Cancel => return Ok(vec![]),
+            Action::Cancel => return Ok(reports),
             Action::Submit { install, remove } => {
                 drop(screen);
-                return Ok(apply(home, &install, &remove, fetch));
+                reports.extend(apply(home, &install, &remove, fetch));
+                return Ok(reports);
             }
         }
     }
 }
 
-/// Raw mode on stderr, redrawn in place; restored when dropped.
-// shortcut: redraws by moving up over the last frame, so a list taller than the terminal smears; scroll if it does.
-struct Screen {
-    lines: u16,
-}
+/// Raw mode on stderr. Between draws the cursor rests at the frame's top, so each draw overwrites the last
+/// one and dropping the screen erases it.
+// shortcut: moving back up over the frame breaks once lines wrap or outgrow the terminal; scroll if lists get long.
+struct Screen;
 
 impl Screen {
     fn open() -> std::io::Result<Screen> {
         terminal::enable_raw_mode()?;
         execute!(std::io::stderr(), cursor::Hide)?;
-        Ok(Screen { lines: 0 })
+        Ok(Screen)
     }
 
-    fn draw(&mut self, picker: &Picker) -> std::io::Result<()> {
+    /// Builds the frame in memory and writes it at once, so the terminal never shows a half-drawn screen.
+    fn draw(&self, picker: &Picker) -> std::io::Result<()> {
         let (lines, at) = picker.render();
-        let mut err = std::io::stderr().lock();
-        if self.lines > 0 {
-            queue!(err, cursor::MoveToPreviousLine(self.lines))?;
-        }
-        queue!(err, Clear(ClearType::FromCursorDown))?;
+        let mut frame = vec![];
+        queue!(frame, terminal::BeginSynchronizedUpdate)?;
         for (i, line) in lines.iter().enumerate() {
             if Some(i) == at {
-                queue!(err, SetAttribute(Attribute::Reverse), Print(line), SetAttribute(Attribute::Reset))?;
+                queue!(frame, SetAttribute(Attribute::Reverse), Print(line), SetAttribute(Attribute::Reset))?;
             } else {
-                queue!(err, Print(line))?;
+                queue!(frame, Print(line))?;
             }
-            queue!(err, Print("\r\n"))?;
+            queue!(frame, Clear(ClearType::UntilNewLine), Print("\r\n"))?;
         }
-        self.lines = lines.len() as u16;
+        // The help line is always there, so the frame has at least one line to move back over.
+        queue!(frame, Clear(ClearType::FromCursorDown), cursor::MoveToPreviousLine(lines.len() as u16))?;
+        queue!(frame, terminal::EndSynchronizedUpdate)?;
+        let mut err = std::io::stderr().lock();
+        err.write_all(&frame)?;
         err.flush()
     }
 
@@ -277,7 +368,7 @@ impl Screen {
 
 impl Drop for Screen {
     fn drop(&mut self) {
-        let _ = execute!(std::io::stderr(), cursor::Show);
+        let _ = execute!(std::io::stderr(), Clear(ClearType::FromCursorDown), cursor::Show);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -355,7 +446,7 @@ mod tests {
         // Given / When: 画面を描く
         let picker = Picker::new(&cache());
         // Then: 最後に操作の説明が出る
-        assert_eq!(lines(&picker).last().unwrap(), "↑↓: move | tab: select | U: update registry | enter: submit");
+        assert_eq!(lines(&picker).last().unwrap(), "↑↓: move | tab: select | U: update registries | enter: submit");
     }
 
     #[test]
@@ -481,7 +572,7 @@ mod tests {
         let repo = registry(&["foo"]);
         let home = tempfile::tempdir().unwrap();
         // When: 起動する
-        let picker = start(home.path(), &serve(repo.path())).unwrap();
+        let picker = start(home.path(), &serve(repo.path()), &mut quiet).unwrap();
         // Then: デフォルトのレジストリが取得され、そのパッケージが並ぶ
         assert_eq!(lines(&picker)[..2], ["takagiy/edo", "[ ] foo"]);
     }
@@ -491,10 +582,10 @@ mod tests {
         // Given: 起動した後に、レジストリにパッケージが増える
         let repo = registry(&["foo"]);
         let home = tempfile::tempdir().unwrap();
-        let mut picker = start(home.path(), &serve(repo.path())).unwrap();
+        let mut picker = start(home.path(), &serve(repo.path()), &mut quiet).unwrap();
         add_package(repo.path(), "bar", "bar");
         // When: 取り直す
-        update(&mut picker, home.path(), &serve(repo.path()));
+        update(&mut picker, home.path(), &serve(repo.path()), &mut quiet);
         // Then: 一覧が新しくなる
         assert_eq!(lines(&picker)[..3], ["takagiy/edo", "[ ] bar", "[ ] foo"]);
     }
@@ -504,11 +595,11 @@ mod tests {
         // Given: foo を選択してカーソルを置いた後に、レジストリの foo より前にパッケージが増える
         let repo = registry(&["foo"]);
         let home = tempfile::tempdir().unwrap();
-        let mut picker = start(home.path(), &serve(repo.path())).unwrap();
+        let mut picker = start(home.path(), &serve(repo.path()), &mut quiet).unwrap();
         picker.handle(Input::Toggle);
         add_package(repo.path(), "bar", "bar");
         // When: 取り直す
-        update(&mut picker, home.path(), &serve(repo.path()));
+        update(&mut picker, home.path(), &serve(repo.path()), &mut quiet);
         // Then: foo は選択されたままで、カーソルも foo にある
         assert_eq!(lines(&picker)[2], "[x] foo");
         assert_eq!(picker.render().1, Some(2));
@@ -520,9 +611,129 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let fail = |id: &str| Err(Error::new("network", format!("{id}: unreachable")));
         // When: 起動する
-        let picker = start(home.path(), &fail).unwrap();
+        let picker = start(home.path(), &fail, &mut quiet).unwrap();
         // Then: 操作の説明の上にエラーが出る
         let lines = lines(&picker);
         assert_eq!(lines[lines.len() - 2], "github.com/takagiy/edo: unreachable");
+    }
+
+    fn serve_at(root: &Path, commit: &str) -> impl Fn(&str) -> Result<Fetched, Error> {
+        let (root, commit) = (root.to_path_buf(), commit.to_string());
+        move |_| Ok(Fetched { dir: root.clone(), commit: commit.clone(), tmp: None })
+    }
+
+    #[test]
+    fn update_offers_updating_installed_packages() {
+        // Given: 起動した画面
+        let repo = registry(&["foo"]);
+        let home = tempfile::tempdir().unwrap();
+        let mut picker = start(home.path(), &serve(repo.path()), &mut quiet).unwrap();
+        // When: 取り直す
+        update(&mut picker, home.path(), &serve(repo.path()), &mut quiet);
+        // Then: もう一度 U でインストール済みのパッケージを更新できると出る
+        let lines = lines(&picker);
+        assert_eq!(lines[lines.len() - 2], "registries updated. press U again to update installed packages");
+    }
+
+    #[test]
+    fn u_right_after_update_updates_installed_packages() {
+        // Given: 取り直した直後の画面
+        let repo = registry(&["foo"]);
+        let home = tempfile::tempdir().unwrap();
+        let mut picker = start(home.path(), &serve(repo.path()), &mut quiet).unwrap();
+        update(&mut picker, home.path(), &serve(repo.path()), &mut quiet);
+        // When: U を押す
+        let action = picker.handle(Input::Update);
+        // Then: インストール済みのパッケージの更新になる
+        assert_eq!(action, Action::UpdatePackages);
+    }
+
+    #[test]
+    fn u_after_another_key_updates_registries_again() {
+        // Given: 取り直した後に ↓ を押した画面
+        let repo = registry(&["foo"]);
+        let home = tempfile::tempdir().unwrap();
+        let mut picker = start(home.path(), &serve(repo.path()), &mut quiet).unwrap();
+        update(&mut picker, home.path(), &serve(repo.path()), &mut quiet);
+        picker.handle(Input::Down);
+        // When: U を押す
+        let action = picker.handle(Input::Update);
+        // Then: レジストリの取り直しになる
+        assert_eq!(action, Action::Update);
+    }
+
+    #[test]
+    fn updating_packages_reinstalls_them_from_latest_commit() {
+        // Given: コミット abc から foo を入れたホームと、コミット def に進んだレジストリ
+        let repo = registry(&["foo"]);
+        let home = tempfile::tempdir().unwrap();
+        install::install(home.path(), "takagiy/edo:foo", &serve(repo.path()));
+        let mut picker = start(home.path(), &serve(repo.path()), &mut quiet).unwrap();
+        // When: インストール済みのパッケージを更新する
+        let reports = update_packages(&mut picker, home.path(), &serve_at(repo.path(), "def"), &mut quiet);
+        // Then: foo がコミット def から入れ直される
+        assert_eq!(reports[0]["replaced_source"], "github.com/takagiy/edo@abc", "{reports:?}");
+        assert_eq!(Cache::load(home.path()).unwrap().packages[0].commit, "def");
+    }
+
+    #[test]
+    fn updating_packages_says_so_at_bottom() {
+        // Given: foo を入れたホーム
+        let repo = registry(&["foo"]);
+        let home = tempfile::tempdir().unwrap();
+        install::install(home.path(), "takagiy/edo:foo", &serve(repo.path()));
+        let mut picker = start(home.path(), &serve(repo.path()), &mut quiet).unwrap();
+        // When: インストール済みのパッケージを更新する
+        update_packages(&mut picker, home.path(), &serve(repo.path()), &mut quiet);
+        // Then: 更新したと出る
+        let lines = lines(&picker);
+        assert_eq!(lines[lines.len() - 2], "installed packages updated");
+    }
+
+    fn quiet(_: &Picker) {}
+
+    #[test]
+    fn busy_registry_shows_spinner_right_of_header() {
+        // Given: user/repo を取得している画面
+        let mut picker = Picker::new(&cache());
+        picker.busy.insert("github.com/user/repo".into());
+        // When: 画面を描く
+        // Then: 見出しの右にスピナーが出る
+        assert_eq!(lines(&picker)[0], "user/repo ⠋");
+    }
+
+    #[test]
+    fn busy_package_shows_spinner_right_of_name() {
+        // Given: foo を更新している画面
+        let mut picker = Picker::new(&cache());
+        picker.busy.insert("github.com/user/repo:foo".into());
+        // When: 画面を描く
+        // Then: 名前の右にスピナーが出る
+        assert_eq!(lines(&picker)[2], "[x] foo ⠋");
+    }
+
+    #[test]
+    fn spinner_turns_with_each_frame() {
+        // Given: user/repo を取得している画面
+        let mut picker = Picker::new(&cache());
+        picker.busy.insert("github.com/user/repo".into());
+        // When: 1 コマ進める
+        picker.frame += 1;
+        // Then: スピナーが次の形になる
+        assert_eq!(lines(&picker)[0], "user/repo ⠙");
+    }
+
+    #[test]
+    fn spinner_shows_while_fetching_and_disappears_after() {
+        // Given: 起動した画面
+        let repo = registry(&["foo"]);
+        let home = tempfile::tempdir().unwrap();
+        let mut picker = start(home.path(), &serve(repo.path()), &mut quiet).unwrap();
+        // When: 描くたびに見出しを記録しながら取り直す
+        let mut seen = vec![];
+        update(&mut picker, home.path(), &serve(repo.path()), &mut |p| seen.push(lines(p)[0].clone()));
+        // Then: 取得中は見出しの右にスピナーが出て、終わると消える
+        assert_eq!(seen[0], "takagiy/edo ⠋");
+        assert_eq!(lines(&picker)[0], "takagiy/edo");
     }
 }
