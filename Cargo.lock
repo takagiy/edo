@@ -652,6 +652,7 @@ dependencies = [
  "ignore",
  "insta",
  "lsp-server",
+ "mison",
  "rmcp",
  "schemars",
  "serde",
@@ -1300,6 +1301,15 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mison"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaf50ecac6c20249298896fad577bad1ba8cda3c92647ce2b9491bae7ad4d38d"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

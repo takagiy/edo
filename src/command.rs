@@ -121,7 +121,7 @@ pub fn read(langs: &Languages, path: &str, scope: Option<&str>) -> Result<String
         return Err(err);
     }
     if !skipped.is_empty() {
-        out.push_str(&format!("{}\n", skipped_line(&skipped)));
+        out.push_str(&format!("{}\n", crate::report(&skipped_line(&skipped))));
     }
     Ok(out)
 }
@@ -232,7 +232,7 @@ fn write_one(langs: &Languages, path: &str, req: &WriteRequest, check: Check) ->
             let t = &src.text;
             let mismatch = json!({"line": line_of(t, c.mismatch), "expected": c.expected, "found": c.found});
             report["closest"] =
-                json!({"range": [line_of(t, c.range.start), line_of(t, c.range.end)], "mismatch": mismatch});
+                json!({"range": lines(line_of(t, c.range.start), line_of(t, c.range.end)), "mismatch": mismatch});
         }
         return Ok(report);
     }
@@ -256,7 +256,7 @@ fn write_one(langs: &Languages, path: &str, req: &WriteRequest, check: Check) ->
     let mut hunks = vec![];
     for (out, grown) in done {
         let at = |line: usize| (line as isize + shift) as usize;
-        replaced.push(json!([at(out.lines.0), at(out.lines.1)]));
+        replaced.push(lines(at(out.lines.0), at(out.lines.1)));
         hunks.push(Hunk { old: out.hunk.old, new: at(out.hunk.new.start)..at(out.hunk.new.end) });
         shift += grown;
     }
@@ -279,6 +279,11 @@ fn write_one(langs: &Languages, path: &str, req: &WriteRequest, check: Check) ->
 
 fn line_of(text: &str, byte: usize) -> usize {
     text[..byte].matches('\n').count() + 1
+}
+
+/// A line range as `scope` spells it, so the agent can pass it back as is.
+fn lines(first: usize, last: usize) -> Value {
+    format!("{first}-{last}").into()
 }
 
 /// Describes one of several targets so the agent can tell them apart and pick one by its range.
@@ -304,7 +309,7 @@ fn candidate(src: &Source, target: &Hit) -> Value {
         }
     };
     let last = line_of(text, range.end.max(range.start + 1) - 1);
-    json!({"range": [line_of(text, range.start), last], "parents": parents, "signature": signature})
+    json!({"range": lines(line_of(text, range.start), last), "parents": parents, "signature": signature})
 }
 
 fn read_one(langs: &Languages, path: &str, scope: Option<&str>) -> Result<String, Error> {
@@ -403,7 +408,7 @@ mod tests {
         let reports = write(&Languages::builtin(), &req, &mut |_| Map::new()).unwrap();
         // Then: 書き込まれ、ok が報告される
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    y();\n}\n");
-        assert_eq!(reports, [serde_json::json!({"ok": true, "file": path, "replaced": [[2, 2]]})]);
+        assert_eq!(reports, [serde_json::json!({"ok": true, "file": path, "replaced": ["2-2"]})]);
     }
 
     fn write_in(dir: &tempfile::TempDir, req: WriteRequest) -> Vec<Value> {
@@ -442,8 +447,8 @@ mod tests {
         assert_eq!(
             reports[0]["matches"],
             serde_json::json!([
-                {"range": [3, 5], "parents": ["data object Foo", "companion object"], "signature": "fun bar(x: Int)"},
-                {"range": [9, 10], "parents": ["class Bar"], "signature": "fun bar(s: String)"},
+                {"range": "3-5", "parents": ["data object Foo", "companion object"], "signature": "fun bar(x: Int)"},
+                {"range": "9-10", "parents": ["class Bar"], "signature": "fun bar(s: String)"},
             ])
         );
     }
@@ -466,7 +471,7 @@ mod tests {
         assert_eq!(reports[0]["error"], "not_found");
         assert_eq!(
             reports[0]["closest"],
-            serde_json::json!({"range": [1, 2], "mismatch": {"line": 2, "expected": "hoge(42);", "found": "hoge(1);"}})
+            serde_json::json!({"range": "1-2", "mismatch": {"line": 2, "expected": "hoge(42);", "found": "hoge(1);"}})
         );
     }
 
@@ -485,7 +490,7 @@ mod tests {
         let reports = write_in(&dir, req);
         // Then: どちらも置き換わり、書き換えた後の行がそれぞれ報告される
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    y();\n    z();\n    y();\n    z();\n}\n");
-        assert_eq!(reports[0]["replaced"], serde_json::json!([[2, 3], [4, 5]]));
+        assert_eq!(reports[0]["replaced"], serde_json::json!(["2-3", "4-5"]));
     }
 
     #[test]
@@ -673,13 +678,13 @@ mod tests {
     }
 
     #[test]
-    fn glob_read_skipping_some_files_ends_with_counts_as_json_line() {
+    fn glob_read_skipping_some_files_ends_with_counts_as_mison_line() {
         // Given: Rust のファイルと JSON のファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.json", "{}")]);
         // When: glob で読む
         let out = read(&Languages::builtin(), &at(&dir, "*"), None).unwrap();
-        // Then: 出力の最後の行に、飛ばした拡張子ごとの件数が JSON で付く
-        let last = serde_json::json!({"skipped": {"reason": "unsupported_language", "extensions": {"json": 1}}});
+        // Then: 出力の最後の行に、飛ばした拡張子ごとの件数が MISON で付く
+        let last = "skipped=(reason=unsupported_language extensions=(json=1))";
         assert_eq!(out, format!("{}\n1\tfn a() {{}}\n{last}\n", at(&dir, "a.rs")));
     }
 

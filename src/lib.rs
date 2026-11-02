@@ -21,6 +21,11 @@ use serde_json::{Value, json};
 /// Files a glob matched but edo has no language package for, counted by extension.
 pub type Skipped = BTreeMap<String, usize>;
 
+/// Text of a report for the agent: MISON, which spends fewer tokens than JSON on the same data.
+pub fn report(v: &Value) -> String {
+    mison::to_string(v).expect("JSON values have only string keys, so MISON can write them")
+}
+
 /// `{"reason":"unsupported_language","extensions":{...}}`, shared by every place that reports skipped files.
 pub fn skipped_json(skipped: &Skipped) -> Value {
     json!({"reason": "unsupported_language", "extensions": skipped})

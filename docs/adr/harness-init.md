@@ -14,7 +14,7 @@ edo はハーネスの Read/Write/Edit を置き換えるための道具だが�
 
 ## 決定
 
-- `edo harness init [ClaudeCode|Codex|Cursor ...] [--remove]` が、各ハーネスのユーザー全体の設定に、MCP の登録（`edo mcp`）と 2 つの hook を書き込む。ハーネスを省くと、設定ディレクトリがあるものすべてが対象になる。報告はハーネスごとの JSON の配列。
+- `edo harness init [ClaudeCode|Codex|Cursor ...] [--remove]` が、各ハーネスのユーザー全体の設定に、MCP の登録（`edo mcp`）と 2 つの hook を書き込む。ハーネスを省くと、設定ディレクトリがあるものすべてが対象になる。報告はハーネスごとの配列。
 - 書き込むコマンドは、`edo harness init` を実行した edo の絶対パスにする。何度実行しても同じ結果になり、edo が入れたものは中身（edo のパスと `mcp` / `hook <ハーネス>:<イベント>`）で見分けて置き換える。`--remove` はそれを取り除く。書き換える前のファイルは `.bak` に 1 世代残す。
 - hook のコマンドは、パスを引用符で囲まずに書く。Codex は Windows で hook を PowerShell で実行し、PowerShell では引用符で囲んだパスの後に引数を続けると構文エラーになるため。どのシェルでも動く引用の仕方はないので、空白を含むパスの edo では入れずにエラーにする。
 - MCP は各ハーネスの CLI（`claude mcp`、`codex mcp`）で登録し、hook は JSON のファイルを直接書く。Claude Code と Codex は hook のファイルの形が同じなので、ハーネスごとの違いは CLI、ファイル名、matcher の表に収まる。プロジェクトの設定には書かない。MCP と hook は常に一緒に入れる。

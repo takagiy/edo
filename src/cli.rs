@@ -23,7 +23,7 @@ enum Cmd {
     /// Without <BEFORE>, the whole target is replaced. Pass - as <AFTER> to read stdin; stdin with
     /// <<<<<<< before / ======= / >>>>>>> after markers gives both.
     ///
-    /// On success, "replaced" in the JSON report gives the line ranges that now hold <AFTER>; there is no need
+    /// On success, "replaced" in the report gives the line ranges that now hold <AFTER>; there is no need
     /// to read the file back.
     Write {
         /// What to do with each match (or the whole target without <BEFORE>).
@@ -114,20 +114,22 @@ fn lang(cmd: LangCmd, interactive: bool) -> (String, i32) {
     // Every report is an object with ok, or an array of them.
     let failed = |v: &serde_json::Value| v["ok"] == false;
     let ok = !(failed(&out) || out.as_array().is_some_and(|a| a.iter().any(failed)));
-    (out.to_string(), if ok { 0 } else { 1 })
+    (crate::report(&out), if ok { 0 } else { 1 })
 }
 
 fn harness(names: &[String], remove: bool) -> (String, i32) {
     let (Some(home), Ok(exe)) = (dirs::home_dir(), std::env::current_exe()) else {
         return (
-            json!({"ok": false, "error": "io", "message": "cannot find the home directory or edo itself"}).to_string(),
+            crate::report(
+                &json!({"ok": false, "error": "io", "message": "cannot find the home directory or edo itself"}),
+            ),
             1,
         );
     };
     let env = crate::harness::Env { home, exe, run: &crate::harness::run_program };
     let reports = crate::harness::init(&env, names, remove);
     let code = if reports.iter().any(|r| r["ok"] == false) { 1 } else { 0 };
-    (serde_json::Value::from(reports).to_string(), code)
+    (crate::report(&reports.into()), code)
 }
 
 /// Runs the CLI and returns what to print and the exit code.
@@ -144,13 +146,13 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages,
         Cmd::Harness { cmd: HarnessCmd::Init { harnesses, remove } } => harness(&harnesses, remove),
         Cmd::Mcp => match crate::mcp::serve(langs) {
             Ok(()) => (String::new(), 0),
-            Err(e) => (json!({"ok": false, "error": "io", "message": e.to_string()}).to_string(), 1),
+            Err(e) => (crate::report(&json!({"ok": false, "error": "io", "message": e.to_string()})), 1),
         },
         Cmd::Read { target } => {
             let (path, scope) = split_target(&target);
             match command::read(&langs, path, scope) {
                 Ok(text) => (text, 0),
-                Err(e) => (e.to_json().to_string(), 1),
+                Err(e) => (crate::report(&e.to_json()), 1),
             }
         }
         Cmd::Write { mode, all_matches, target, texts } => {
@@ -183,9 +185,9 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages,
             match command::write(&langs, &req, &mut |_| serde_json::Map::new()) {
                 Ok(reports) => {
                     let code = if reports.iter().any(|r| r["ok"] == false) { 1 } else { 0 };
-                    (serde_json::Value::from(reports).to_string(), code)
+                    (crate::report(&reports.into()), code)
                 }
-                Err(e) => (e.to_json().to_string(), 1),
+                Err(e) => (crate::report(&e.to_json()), 1),
             }
         }
     }
@@ -201,7 +203,7 @@ fn split_conflict(input: &str) -> Option<(String, String)> {
 }
 
 fn usage(message: String) -> (String, i32) {
-    (json!({"ok": false, "error": "usage", "message": message}).to_string(), 2)
+    (crate::report(&json!({"ok": false, "error": "usage", "message": message})), 2)
 }
 
 /// Splits `<file>:<scope>` at the first `:`, except a drive letter's `:` in `C:/...`.
@@ -295,13 +297,13 @@ mod tests {
     }
 
     #[test]
-    fn write_report_is_printed_as_json_array() {
+    fn write_report_is_printed_as_mison() {
         // Given: 呼び出しのある関数
         let (_dir, path) = file("fn a() { x(); }\n");
         // When: 書く
         let (out, _) = edo(&["write", &path, "x();", "y();"], "");
-        // Then: 報告が JSON の配列で出力される
-        assert_eq!(out, serde_json::json!([{"ok": true, "file": path, "replaced": [[1, 1]]}]).to_string());
+        // Then: 報告が MISON で出力される
+        assert_eq!(out, format!("ok=true file={path} replaced=1-1"));
     }
 
     #[test]
@@ -346,7 +348,7 @@ mod tests {
         // Given / When: --mode に未知の値を渡す
         let (out, code) = edo(&["write", "--mode", "append", "a.rs", "x"], "");
         // Then: usage エラーになる
-        assert!(out.contains("\"usage\"") && code != 0, "{out}");
+        assert!(out.contains("error=usage") && code != 0, "{out}");
     }
 
     #[test]
@@ -354,7 +356,7 @@ mod tests {
         // Given / When: 位置引数を 4 つ渡す
         let (out, code) = edo(&["write", "a.rs", "b.rs", "x", "y"], "");
         // Then: usage エラーになる
-        assert!(out.contains("\"usage\"") && code != 0, "{out}");
+        assert!(out.contains("error=usage") && code != 0, "{out}");
     }
 
     #[test]
@@ -364,7 +366,7 @@ mod tests {
         // When: before を渡したうえで、コンフリクトマーカー付きの標準入力を流す
         let (out, code) = edo(&["write", &path, "x();", "-"], "<<<<<<< before\nx();\n=======\ny();\n>>>>>>> after\n");
         // Then: usage エラーになり、ファイルは変わらない
-        assert!(out.contains("\"usage\"") && code != 0, "{out}");
+        assert!(out.contains("error=usage") && code != 0, "{out}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    x();\n}\n");
     }
 
@@ -375,7 +377,7 @@ mod tests {
         // When: after に - を渡し、標準入力に何も流さない
         let (out, code) = edo(&["write", &path, "-"], "");
         // Then: usage エラーになり、ファイルは変わらない
-        assert!(out.contains("\"usage\"") && code != 0, "{out}");
+        assert!(out.contains("error=usage") && code != 0, "{out}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {}\n");
     }
 

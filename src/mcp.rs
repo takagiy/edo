@@ -118,7 +118,7 @@ impl Server {
                     self.remember(r["file"].as_str().unwrap_or_default());
                 }
                 let ok = !reports.iter().any(|r| r["ok"] == false);
-                let text = vec![ContentBlock::text(serde_json::Value::from(reports).to_string())];
+                let text = vec![ContentBlock::text(crate::report(&reports.into()))];
                 if ok { CallToolResult::success(text) } else { CallToolResult::error(text) }
             }
             Err(e) => error(e),
@@ -127,7 +127,7 @@ impl Server {
 }
 
 fn error(e: crate::Error) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(e.to_json().to_string())])
+    CallToolResult::error(vec![ContentBlock::text(crate::report(&e.to_json()))])
 }
 
 #[tool_handler]
@@ -229,14 +229,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_tool_returns_same_json_as_cli() {
+    async fn write_tool_returns_same_report_as_cli() {
         // Given: 呼び出しのある関数
         let (_dir, path) = file("fn a() { x(); }\n");
         let client = connect().await;
         // When: write を呼ぶ
         let (text, _) = tool(&client, "write", json!({"path": path, "before": "x();", "after": "y();"})).await;
-        // Then: CLI と同じ JSON が返る
-        assert_eq!(text, json!([{"ok": true, "file": path, "replaced": [[1, 1]]}]).to_string());
+        // Then: CLI と同じ MISON の報告が返る
+        assert_eq!(text, format!("ok=true file={path} replaced=1-1"));
     }
 
     #[tokio::test]
@@ -262,10 +262,6 @@ mod tests {
         assert_eq!(text, "1\tfn a() {}\n");
     }
 
-    fn report(text: &str) -> Value {
-        serde_json::from_str::<Value>(text).unwrap()[0].clone()
-    }
-
     #[tokio::test]
     async fn line_range_write_to_file_changed_since_read_warns_stale() {
         // Given: read した後に外で書き換えられたファイル
@@ -276,7 +272,7 @@ mod tests {
         // When: 行範囲のスコープで書く
         let (text, _) = tool(&client, "write", json!({"path": path, "scope": "2", "after": "fn c() {}"})).await;
         // Then: stale の警告が付く
-        assert_eq!(report(&text)["warnings"]["stale"], "modified since last read");
+        assert!(text.contains("warnings=(stale=\"modified since last read\")"), "{text}");
     }
 
     #[tokio::test]
@@ -289,7 +285,7 @@ mod tests {
         // When: 行範囲のスコープでもう一度書く
         let (text, _) = tool(&client, "write", json!({"path": path, "scope": "2", "after": "fn c() {}"})).await;
         // Then: stale の警告は付かない
-        assert!(report(&text).get("warnings").is_none(), "{text}");
+        assert!(!text.contains("warnings"), "{text}");
     }
 
     #[tokio::test]
@@ -302,6 +298,6 @@ mod tests {
         // When: 識別子のスコープで書く
         let (text, _) = tool(&client, "write", json!({"path": path, "scope": "b", "after": "fn c() {}"})).await;
         // Then: stale の警告は付かない
-        assert!(report(&text).get("warnings").is_none(), "{text}");
+        assert!(!text.contains("warnings"), "{text}");
     }
 }
