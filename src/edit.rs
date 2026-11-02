@@ -63,28 +63,35 @@ fn lines_of(text: &str, range: &Range<usize>) -> Range<usize> {
 }
 
 pub fn edit(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Place) -> Outcome {
-    let (text, replaced) = apply(lang, src, range, after, place);
+    // A last line without a newline gets one while editing, so that every line ends in one; it goes again after.
+    let nl = newline(src);
+    let unterminated = !src.is_empty() && !src.ends_with('\n');
+    let src = &if unterminated { format!("{src}{nl}") } else { src.to_string() };
+    let (mut text, replaced) = apply(lang, src, range, after, place);
     let written = replaced.start..replaced.start + text.len() + replaced.len() - src.len();
     let first = text[..written.start].matches('\n').count() + 1;
     let last = text[..written.end].trim_end_matches(['\n', '\r']).matches('\n').count() + 1;
     let lines = if written.is_empty() { (first, first - 1) } else { (first, last.max(first)) };
     let hunk = Hunk { old: lines_of(src, &replaced), new: lines_of(&text, &written) };
+    if unterminated && text.ends_with(nl) {
+        text.truncate(text.len() - nl.len());
+    }
     Outcome { text, lines, hunk }
 }
 
-/// Number of lines that end at or before byte `pos`, which is a line boundary or the end of `src`.
-fn lines_before(src: &str, pos: usize) -> usize {
-    src[..pos].split_inclusive('\n').count()
+/// The newline that lines written into `src` end with: CRLF if the file has any.
+fn newline(src: &str) -> &'static str {
+    if src.contains("\r\n") { "\r\n" } else { "\n" }
 }
 
-/// Returns the edited text and the range of `src` that it replaced.
+/// Returns the edited text and the range of `src` that it replaced. Every line of `src` ends in a newline.
 ///
-/// A target covering whole lines (and every insertion) is edited as lines: the file is its lines plus
-/// whether it ends with a newline, and `after` becomes zero or more lines, so deleting, inserting and
-/// replacing are the same splice. Any other target is a span of text inside a line.
+/// A target covering whole lines (and every insertion) is edited as lines: `after` becomes zero or more
+/// lines spliced in between two lines of `src`, so deleting, inserting and replacing are the same splice.
+/// Any other target is a span of text inside a line.
 fn apply(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Place) -> (String, Range<usize>) {
     let base = indent_of_line_at(src, range.start);
-    let nl = if src.contains("\r\n") { "\r\n" } else { "\n" };
+    let nl = newline(src);
     let unit = indent_unit(&indents(src.lines()));
     let after = after.replace("\r\n", "\n");
     let line_start = |b: usize| src[..b].rfind('\n').map_or(0, |i| i + 1);
@@ -97,11 +104,12 @@ fn apply(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Pl
     // Builds the text with `after` reindented (keeping `protected` lines) and where `after` landed in it.
     let build = |protected: &[usize]| -> (String, Range<usize>) {
         let body = reindent(&after, base, unit.clone(), protected);
-        let Some(span) = &lines else {
-            let start = range.start;
+        let span = lines.clone().unwrap_or(range.clone());
+        let (head, tail) = (&src[..span.start], &src[span.end..]);
+        if lines.is_none() {
             let body = body.replace('\n', nl);
-            return (format!("{}{body}{}", &src[..start], &src[range.end..]), start..start + body.len());
-        };
+            return (format!("{head}{body}{tail}"), span.start..span.start + body.len());
+        }
         let mut new: Vec<String> = if after.is_empty() { vec![] } else { body.split('\n').map(String::from).collect() };
         if after.ends_with('\n') {
             new.pop();
@@ -109,14 +117,8 @@ fn apply(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Pl
         if let Some(first) = new.first_mut().filter(|l| !l.is_empty()) {
             first.insert_str(0, base);
         }
-        let mut all: Vec<String> = src.lines().map(String::from).collect();
-        let (a, b) = (lines_before(src, span.start), lines_before(src, span.end));
-        let start: usize = all[..a].iter().map(|l| l.len() + nl.len()).sum();
-        let len = new.join(nl).len();
-        all.splice(a..b, new);
-        let ends_with_newline = src.is_empty() || src.ends_with('\n');
-        let tail = if ends_with_newline && !all.is_empty() { nl } else { "" };
-        (all.join(nl) + tail, start..start + len)
+        let body: String = new.iter().map(|l| format!("{l}{nl}")).collect();
+        (format!("{head}{body}{tail}"), span.start..span.start + new.join(nl).len())
     };
     // Embed once with plain reindenting, then parse the whole file to find lines inside literals.
     let (draft, at) = build(&[]);
@@ -462,6 +464,17 @@ mod tests {
         let out = outcome(src, "x あ", "い\nう");
         // Then: 前の 2 行目が、後の 2〜3 行目になった
         assert_eq!(out.hunk, Hunk { old: 2..3, new: 2..4 });
+    }
+
+    #[test]
+    fn whole_line_edit_leaves_other_lines_endings_alone() {
+        // Given: 1 行目だけが CRLF の、改行コードが混ざったファイル
+        let src = "fn a() {}\r\nfn b() {}\nfn c() {}\n";
+        // When: 3 行目を置き換える
+        let out = outcome(src, "fn c() {}", "fn d() {}");
+        // Then: ほかの行の改行はそのままで、書いた行として 3 行目が返される
+        assert_eq!(out.text, "fn a() {}\r\nfn b() {}\nfn d() {}\r\n");
+        assert_eq!(out.lines, (3, 3));
     }
 
     #[test]
