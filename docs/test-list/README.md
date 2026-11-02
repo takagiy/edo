@@ -15,3 +15,5 @@
 | MCP | [mcp.md](mcp.md) | ツール、呼び出し、結果 |
 | インストール | [install.md](install.md) | レジストリ、パッケージ、インストール先 |
 | インストーラー | [installer.md](installer.md) | 画面、見出し、カーソル、選択 |
+| hook | [hook.md](hook.md) | 呼び出し、対応ファイル、止める、添える、入口、出口 |
+| ハーネスへの組み込み | [harness.md](harness.md) | ハーネス、設定、登録、hook、外す |

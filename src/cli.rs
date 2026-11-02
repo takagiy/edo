@@ -44,6 +44,27 @@ enum Cmd {
         #[command(subcommand)]
         cmd: LangCmd,
     },
+    /// Set up coding harnesses to use edo.
+    Harness {
+        #[command(subcommand)]
+        cmd: HarnessCmd,
+    },
+    /// Answer a harness hook (<HARNESS>:<EVENT>, such as ClaudeCode:PreToolUse) for the input on stdin.
+    ///
+    /// Run by the hooks that `edo harness init` installs.
+    Hook { target: String },
+}
+
+#[derive(Subcommand)]
+enum HarnessCmd {
+    /// Register edo's MCP server and hooks in the user settings of the given harnesses (ClaudeCode), or of
+    /// every harness whose settings directory exists.
+    Init {
+        harnesses: Vec<String>,
+        /// Take out what init added instead.
+        #[arg(long)]
+        remove: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -96,6 +117,19 @@ fn lang(cmd: LangCmd, interactive: bool) -> (String, i32) {
     (out.to_string(), if ok { 0 } else { 1 })
 }
 
+fn harness(names: &[String], remove: bool) -> (String, i32) {
+    let (Some(home), Ok(exe)) = (dirs::home_dir(), std::env::current_exe()) else {
+        return (
+            json!({"ok": false, "error": "io", "message": "cannot find the home directory or edo itself"}).to_string(),
+            1,
+        );
+    };
+    let env = crate::harness::Env { home, exe, run: &crate::harness::run_program };
+    let reports = crate::harness::init(&env, names, remove);
+    let code = if reports.iter().any(|r| r["ok"] == false) { 1 } else { 0 };
+    (serde_json::Value::from(reports).to_string(), code)
+}
+
 /// Runs the CLI and returns what to print and the exit code.
 /// `interactive` says whether a person is at the terminal, so `lang install` may open the installer.
 pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages, interactive: bool) -> (String, i32) {
@@ -106,6 +140,8 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages,
     };
     match cli.cmd {
         Cmd::Lang { cmd } => lang(cmd, interactive),
+        Cmd::Hook { target } => (crate::hook::run(&target, &stdin(), &langs), 0),
+        Cmd::Harness { cmd: HarnessCmd::Init { harnesses, remove } } => harness(&harnesses, remove),
         Cmd::Mcp => match crate::mcp::serve(langs) {
             Ok(()) => (String::new(), 0),
             Err(e) => (json!({"ok": false, "error": "io", "message": e.to_string()}).to_string(), 1),
@@ -349,5 +385,16 @@ mod tests {
         let (out, code) = edo(&["lang", "install"], "");
         // Then: usage エラーになる
         assert_eq!(code, 2, "{out}");
+    }
+
+    #[test]
+    fn hook_answers_stdin_and_exits_zero() {
+        // Given: Rust のファイルを読む Claude Code の hook の入力
+        let input = serde_json::json!({"tool_name": "Read", "tool_input": {"file_path": "src/a.rs"}}).to_string();
+        // When: hook を呼ぶ
+        let (out, code) = edo(&["hook", "ClaudeCode:PreToolUse"], &input);
+        // Then: 止める答えが出力され、終了コードは 0 になる
+        assert!(out.contains("\"deny\""), "{out}");
+        assert_eq!(code, 0);
     }
 }
