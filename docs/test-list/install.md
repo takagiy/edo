@@ -7,6 +7,7 @@
 - [x] ルートの `[registry] packages` の glob でパッケージが列挙される
 - [x] ルートが `[package]` のレジストリは、名前なしでインストールできる
 - [x] `[registry]` と `[package]` が同じファイルにあるとエラーになる
+- [x] 名前が `<config>/edo/packages/` の外を指すパッケージは入れず、何も消さない
 - [x] パッケージは `<config>/edo/packages/<registry>/<name>/` に入る
 - [x] インストールしたパッケージは入手元のコミットと一緒に `edo-cache.toml` に記録される
 - [x] `edo-cache.toml` がなければ、デフォルトのレジストリだけが既知になる

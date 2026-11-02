@@ -55,8 +55,14 @@ pub fn home_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("edo")
 }
 
-fn package_dir(home: &Path, registry: &str, name: &str) -> PathBuf {
-    home.join("packages").join(registry).join(name)
+/// `<home>/packages/<registry>/<name>`. Both come from outside (a registry's manifest, the cache, the user), so
+/// each must be plain directory names: `..` or an absolute path would point the install's delete elsewhere.
+fn package_dir(home: &Path, registry: &str, name: &str) -> Result<PathBuf, Error> {
+    let plain = |p: &str| Path::new(p).components().all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !(plain(registry) && plain(name) && Path::new(name).components().count() == 1) {
+        return Err(Error::new("invalid_name", format!("{registry}:{name} is not a plain registry and package name")));
+    }
+    Ok(home.join("packages").join(registry).join(name))
 }
 
 /// `<home>/edo-cache.toml`: the known registries and the installed packages.
@@ -242,7 +248,7 @@ fn try_install(home: &Path, spec: &str, fetch: &dyn Fn(&str) -> Result<Fetched, 
         },
     }
     .ok_or_else(|| Error::new("not_found", format!("no such package in {registry}")))?;
-    let target = package_dir(home, registry, &name);
+    let target = package_dir(home, registry, &name)?;
     let extensions = manifest(&dir)?.package.map(|p| p.extensions).unwrap_or_default();
     for other in installed(home)?.iter().filter(|p| p.dir != target) {
         if let Some(ext) = other.extensions.iter().find(|e| extensions.contains(e)) {
@@ -352,7 +358,7 @@ pub struct Installed {
 pub fn installed(home: &Path) -> Result<Vec<Installed>, Error> {
     let mut out = vec![];
     for p in Cache::load(home)?.packages {
-        let dir = package_dir(home, &p.registry, &p.name);
+        let dir = package_dir(home, &p.registry, &p.name)?;
         let (extensions, lsp) = manifest(&dir)?.package.map_or((vec![], None), |m| (m.extensions, m.lsp));
         out.push(Installed { source: p.source(), registry: p.registry, name: p.name, extensions, lsp, dir });
     }
@@ -513,6 +519,19 @@ mod tests {
         // Then: <インストール先>/<registry>/<name>/ に入る
         assert_eq!(report["ok"], true, "{report}");
         assert!(home.path().join("packages/github.com/foo/langs/myrust/edo-package.toml").is_file());
+    }
+
+    #[test]
+    fn package_named_outside_packages_dir_is_refused_and_deletes_nothing() {
+        // Given: ルートのパッケージ名がインストール先の外を指すレジストリと、インストール先にあるファイル
+        let repo = registry(&[("edo-package.toml", &package("../../../..", "evil")), ("edo.scm", "")]);
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("keep"), "").unwrap();
+        // When: 名前なしでインストールする
+        let report = install(home.path(), "foo/evil", &local(vec![("github.com/foo/evil", &repo)]));
+        // Then: エラーになり、インストール先のファイルは消えない
+        assert_eq!(report["error"], "invalid_name", "{report}");
+        assert!(home.path().join("keep").is_file());
     }
 
     #[test]
