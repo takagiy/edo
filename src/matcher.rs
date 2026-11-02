@@ -36,26 +36,43 @@ pub struct Leaf {
 }
 
 /// Lists the file's tokens in order. A node captured by `@match.*` is one token even if it has children.
+/// Text that no node covers, such as the words of a link inside a Markdown table cell, is a token per word,
+/// so every non-whitespace character of the file belongs to a token.
 pub fn leaves(lang: &Language, tree: &tree_sitter::Tree, src: &str) -> Vec<Leaf> {
     let rules = rules(lang, tree, src);
     let mut out = vec![];
+    // End of the last token, so the text between it and the next one is what no node covered.
+    let mut pos = 0;
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
         let rule = rules.get(&node.id());
         if rule.is_some() || node.child_count() == 0 {
             if !node.byte_range().is_empty() {
+                out.extend(words(src, pos..node.start_byte()));
                 out.push(Leaf { range: node.byte_range(), ..rule.cloned().unwrap_or_default() });
+                pos = node.end_byte();
             }
         } else if cursor.goto_first_child() {
             continue;
         }
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
+                out.extend(words(src, pos..src.len()));
                 return out;
             }
         }
     }
+}
+
+/// A token for each word in `src[range]`.
+fn words(src: &str, range: Range<usize>) -> impl Iterator<Item = Leaf> + '_ {
+    let text = &src[range.clone()];
+    text.split_whitespace().map(move |word| {
+        // `word` is a slice of `text`; its offset in `text` is the distance between their pointers.
+        let start = range.start + (word.as_ptr() as usize - text.as_ptr() as usize);
+        Leaf { range: start..start + word.len(), ..Default::default() }
+    })
 }
 
 /// The rules for each captured node, as a `Leaf` without its range; captures on one node combine.
@@ -164,8 +181,10 @@ struct Progress {
     matched_end: usize,
 }
 
+/// A character of an identifier, which a partial match must not cut. ASCII only: identifiers are, and text
+/// without spaces between words (such as Japanese) can then be cut anywhere.
 fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 fn starts_with_word(s: &str) -> bool {
@@ -251,8 +270,8 @@ impl Matcher<'_> {
         // Whitespace in `before` is layout, except what the leaf's own text starts with,
         // such as the space at the start of a string's content.
         let run = &raw[..raw.len() - raw.trim_start().len()];
-        let own = self.leaves.get(i).map_or("", |_| {
-            let text = self.text(i);
+        let own = self.leaves.get(i).map_or("", |leaf| {
+            let text = &self.src[leaf.range.clone()];
             &text[..text.len() - text.trim_start().len()]
         });
         let layout = run.strip_suffix(own).unwrap_or(run);
@@ -388,6 +407,18 @@ mod tests {
     }
 
     #[test]
+    fn text_between_child_nodes_is_matched_too() {
+        // Given: リンクを含む表のセルの Markdown（リンクの文字はどの子ノードにも入らない）
+        let langs = crate::language::Languages::builtin();
+        let md = langs.for_path(std::path::Path::new("a.md")).unwrap();
+        let src = "| a | b |\n|---|---|\n| x | [list.md](list.md) |\n";
+        // When: その行の before で照合する
+        let found = find_in(md, src, "| x | [list.md](list.md) |");
+        // Then: 一致する
+        assert_eq!(found, ["| x | [list.md](list.md) |"]);
+    }
+
+    #[test]
     fn collapse_leaf_matches_with_different_whitespace_runs() {
         // Given: コメントの空白をまとめて比べる query と、インデントの付いたブロックコメント
         let lang = rust("(block_comment) @match.collapse");
@@ -477,6 +508,27 @@ mod tests {
         let found = find_in(&rust(""), src, "f(\"hello");
         // Then: 文字列の前半まで一致する
         assert_eq!(found, ["f(\"hello"]);
+    }
+
+    #[test]
+    fn tail_of_before_may_end_inside_japanese_text() {
+        // Given: 日本語の行コメント
+        let lang = rust("(line_comment) @match.collapse");
+        let src = "// 子ノードの間にある文字\nfn f() {}\n";
+        // When: 日本語の途中で終わる before で照合する
+        let found = find_in(&lang, src, "// 子ノードの間");
+        // Then: コメントの前半に一致する
+        assert_eq!(found, ["// 子ノードの間"]);
+    }
+
+    #[test]
+    fn tail_of_before_does_not_end_inside_identifier() {
+        // Given: 識別子 foobar の呼び出し
+        let src = "fn a() { foobar(); }\n";
+        // When: 識別子の途中で終わる before で照合する
+        let found = find_in(&rust(""), src, "{ foo");
+        // Then: 一致しない
+        assert!(found.is_empty());
     }
 
     #[test]
