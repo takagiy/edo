@@ -58,7 +58,8 @@ fn lines_of(text: &str, range: &Range<usize>) -> Range<usize> {
         let at_line_start = range.start == 0 || text[..range.start].ends_with('\n');
         return if at_line_start { first..first } else { first..first + 1 };
     }
-    first..text[..range.end - 1].matches('\n').count() + 2
+    let through = &text[..range.end];
+    first..through.strip_suffix('\n').unwrap_or(through).matches('\n').count() + 2
 }
 
 pub fn edit(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Place) -> Outcome {
@@ -449,6 +450,16 @@ mod tests {
         let src = "fn a() {\n    x();\n}\n";
         // When: 2 行目を 2 行の after で置き換える
         let out = outcome(src, "x();", "y();\nz();");
+        // Then: 前の 2 行目が、後の 2〜3 行目になった
+        assert_eq!(out.hunk, Hunk { old: 2..3, new: 2..4 });
+    }
+
+    #[test]
+    fn hunk_of_target_ending_in_multibyte_char_has_its_lines() {
+        // Given: 行の途中に複数バイトの文字がある関数
+        let src = "fn a() {\n    f(\"x あ\");\n}\n";
+        // When: その文字で終わる範囲を、複数バイトの文字で終わる 2 行で置き換える
+        let out = outcome(src, "x あ", "い\nう");
         // Then: 前の 2 行目が、後の 2〜3 行目になった
         assert_eq!(out.hunk, Hunk { old: 2..3, new: 2..4 });
     }
