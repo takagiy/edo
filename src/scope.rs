@@ -25,6 +25,9 @@ pub fn resolve(spec: &str, defs: &[Definition], src: &str) -> Result<Vec<Hit>, E
         let segs: Vec<&str> = spec.split("::").flat_map(|s| s.split('.')).collect();
         found = (0..defs.len()).filter(|&i| matches_path(defs, i, &segs)).collect();
     }
+    if found.is_empty() {
+        return Err(Error::new("not_found", format!("no definition matches {spec}")));
+    }
     Ok(found.into_iter().map(|i| Hit { range: defs[i].range.clone(), def: Some(i) }).collect())
 }
 
@@ -143,13 +146,13 @@ mod tests {
     }
 
     #[test]
-    fn scope_without_matching_definition_is_empty() {
+    fn scope_without_matching_definition_is_not_found() {
         // Given: 関数 a だけがあるファイル
         let src = "fn a() {}\n";
         // When: スコープ b を解決する
-        let hits = names("b", src);
-        // Then: 空になる
-        assert!(hits.is_empty());
+        let err = resolve("b", &defs(&rust(QUERY), src), src).unwrap_err();
+        // Then: not_found のエラーになる
+        assert_eq!(err.code, "not_found");
     }
 
     #[test]

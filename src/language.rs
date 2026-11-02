@@ -296,4 +296,17 @@ module = \"builtin:rust\"
         assert!(!root.has_error(), "{}", root.to_sexp());
         assert_eq!(root.child(0).unwrap().kind(), "object_declaration");
     }
+
+    #[test]
+    fn builtin_rust_names_generic_impl_by_type_name() {
+        // Given: 組み込みの Rust と、型引数付きの型の impl
+        let langs = Languages::builtin();
+        let lang = langs.for_path(Path::new("a.rs")).unwrap();
+        let src = "impl<'a> Matcher<'a> {}\nimpl Foo for &Bar {}\n";
+        // When: 定義を抽出する
+        let tree = lang.parser().parse(src, None).unwrap();
+        let names: Vec<String> = crate::outline::outline(lang, &tree, src).into_iter().map(|d| d.name).collect();
+        // Then: 型引数付きの型は型引数を除いた名前になり、それ以外の型はそのままの名前になる
+        assert_eq!(names, ["Matcher", "&Bar"]);
+    }
 }

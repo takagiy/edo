@@ -107,7 +107,17 @@ pub fn read(langs: &Languages, path: &str, scope: Option<&str>) -> Result<String
     }
     let mut out = String::new();
     for file in files {
-        out.push_str(&format!("{file}\n{}", read_one(langs, &file, scope)?));
+        match read_one(langs, &file, scope) {
+            Ok(text) => out.push_str(&format!("{file}\n{text}")),
+            // Like write, a file that the scope does not resolve in is left out.
+            Err(e) if e.code == "not_found" => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if out.is_empty() {
+        let mut err = Error::new("not_found", format!("no matched file defines {}", scope.unwrap_or_default()));
+        err.skipped = skipped;
+        return Err(err);
     }
     if !skipped.is_empty() {
         out.push_str(&format!("{}\n", skipped_line(&skipped)));
@@ -559,6 +569,37 @@ mod tests {
         let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
         // When: どのファイルにも一致しない glob で読む
         let err = read(&Languages::builtin(), &at(&dir, "*.kt"), None).unwrap_err();
+        // Then: not_found になる
+        assert_eq!(err.code, "not_found");
+    }
+
+    #[test]
+    fn reading_scope_without_definition_is_not_found_naming_scope() {
+        // Given: 関数 a だけがある Rust のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
+        // When: スコープ b で読む
+        let err = read(&Languages::builtin(), &at(&dir, "a.rs"), Some("b")).unwrap_err();
+        // Then: スコープの名前を挙げた not_found になる
+        assert_eq!(err.code, "not_found");
+        assert!(err.message.contains("b"), "{}", err.message);
+    }
+
+    #[test]
+    fn glob_read_leaves_files_without_scope_definition_out() {
+        // Given: 関数 a を持つファイルと、関数 b を持つファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")]);
+        // When: 両方に一致する glob を、スコープ a で読む
+        let out = read(&Languages::builtin(), &at(&dir, "*.rs"), Some("a")).unwrap();
+        // Then: a を持つファイルだけが出る
+        assert_eq!(out, format!("{}\n1\tfn a() {{}}\n", at(&dir, "a.rs")));
+    }
+
+    #[test]
+    fn glob_read_with_scope_no_file_defines_is_not_found() {
+        // Given: 関数 a だけを持つファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
+        // When: glob を、どのファイルにもないスコープ b で読む
+        let err = read(&Languages::builtin(), &at(&dir, "*.rs"), Some("b")).unwrap_err();
         // Then: not_found になる
         assert_eq!(err.code, "not_found");
     }
