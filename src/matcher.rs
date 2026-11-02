@@ -150,7 +150,6 @@ pub fn find(src: &str, leaves: &[Leaf], scope: Range<usize>, before: &str) -> Fo
         if found.last().is_some_and(|f| leaf.range.start < f.end) {
             continue;
         }
-        m.start.set(leaf.range.start);
         if let Some(range) = m.start_at(i) {
             found.push(range);
         }
@@ -223,26 +222,21 @@ struct Matcher<'a> {
 }
 
 impl Matcher<'_> {
+    /// A leaf's text from the current attempt's start on: an attempt may start inside a leaf.
     fn text(&self, i: usize) -> &str {
-        &self.src[self.leaves[i].range.clone()]
+        let range = &self.leaves[i].range;
+        &self.src[range.start.max(self.start.get()).min(range.end)..range.end]
     }
 
-    /// Matches `before` starting at leaf `i`, or at a later part of it that does not split a word.
+    /// Matches `before` starting at leaf `i`, or at a later point in it that does not split a word.
     fn start_at(&self, i: usize) -> Option<Range<usize>> {
-        let leaf = self.leaves[i];
-        if let Some(end) = self.at(i, 0, None) {
-            return Some(leaf.range.start..end);
-        }
-        let text = self.text(i);
-        let rest = self.before.trim_start();
-        let b = self.before.len() - rest.len();
-        text.char_indices().skip(1).find_map(|(k, c)| {
-            let splits_word = text[..k].chars().next_back().is_some_and(is_word) && is_word(c);
-            if splits_word || !rest.starts_with(&text[k..]) {
-                return None;
-            }
-            let end = self.at(i + 1, b + text.len() - k, Some(leaf.range.end))?;
-            Some(leaf.range.start + k..end)
+        let range = self.leaves[i].range.clone();
+        let text = &self.src[range.clone()];
+        let splits_word = |k: usize, c: char| text[..k].chars().next_back().is_some_and(is_word) && is_word(c);
+        let starts = text.char_indices().filter(|&(k, c)| k == 0 || !(c.is_whitespace() || splits_word(k, c)));
+        starts.map(|(k, _)| range.start + k).find_map(|start| {
+            self.start.set(start);
+            Some(start..self.at(i, 0, None)?)
         })
     }
 
@@ -270,10 +264,8 @@ impl Matcher<'_> {
         // Whitespace in `before` is layout, except what the leaf's own text starts with,
         // such as the space at the start of a string's content.
         let run = &raw[..raw.len() - raw.trim_start().len()];
-        let own = self.leaves.get(i).map_or("", |leaf| {
-            let text = &self.src[leaf.range.clone()];
-            &text[..text.len() - text.trim_start().len()]
-        });
+        let own = if i < self.leaves.len() { self.text(i) } else { "" };
+        let own = &own[..own.len() - own.trim_start().len()];
         let layout = run.strip_suffix(own).unwrap_or(run);
         let rest = &raw[layout.len()..];
         let spaced = !layout.is_empty();
@@ -297,7 +289,9 @@ impl Matcher<'_> {
     fn leaf_at(&self, i: usize, b: usize, rest: &str, spaced: bool, end: Option<usize>) -> Option<usize> {
         let leaf = self.leaves.get(i)?;
         let text = self.text(i);
-        if end.is_some() && !spaced && ends_with_word(self.text(i - 1)) && starts_with_word(text) {
+        // `before` may not join two words that the file separates.
+        let gap = i > 0 && self.leaves[i - 1].range.end < leaf.range.start;
+        if end.is_some() && !spaced && gap && ends_with_word(self.text(i - 1)) && starts_with_word(text) {
             return None;
         }
         let consumed = match &leaf.compare {
@@ -320,7 +314,7 @@ impl Matcher<'_> {
                 let tail = rest.trim_end();
                 let next = text.get(tail.len()..)?.chars().next()?;
                 let splits_word = ends_with_word(tail) && is_word(next);
-                (text.starts_with(tail) && !splits_word).then_some(leaf.range.start + tail.len())
+                (text.starts_with(tail) && !splits_word).then_some(leaf.range.end - text.len() + tail.len())
             })
     }
 }
@@ -529,6 +523,29 @@ mod tests {
         let found = find_in(&rust(""), src, "{ foo");
         // Then: 一致しない
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn before_inside_one_comment_line_matches() {
+        // Given: 行末の改行まで葉に含む Rust の doc コメント
+        let lang = rust("(line_comment) @match.collapse");
+        let src = "/// the given harnesses (ClaudeCode), or of\nfn f() {}\n";
+        // When: コメントの途中から始まって行末で終わる before で照合する
+        let found = find_in(&lang, src, "harnesses (ClaudeCode), or of");
+        // Then: コメントの後半に一致する
+        assert_eq!(found, ["harnesses (ClaudeCode), or of"]);
+    }
+
+    #[test]
+    fn word_leaves_joined_in_file_match_joined_before() {
+        // Given: 表のセルの中で、単語と _ が隙間なく並ぶ Markdown（mcp と _ と servers が別の葉になる）
+        let langs = crate::language::Languages::builtin();
+        let md = langs.for_path(std::path::Path::new("a.md")).unwrap();
+        let src = "| a | b |\n|---|---|\n| x | [mcp_servers](a) |\n";
+        // When: 同じく隙間のない before で照合する
+        let found = find_in(md, src, "| x | [mcp_servers](a) |");
+        // Then: 一致する
+        assert_eq!(found, ["| x | [mcp_servers](a) |"]);
     }
 
     #[test]
