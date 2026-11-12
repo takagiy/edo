@@ -12,7 +12,7 @@ edo-tree-sitter-kotlin = { version = "0.4.8", path = "crates/edo-tree-sitter-kot
 flate2 = "1.1.10"
 globset = "0.4.21"
 ignore = "0.4.34"
-mison = "0.1.2"
+mison = "0.2.0"
 rmcp = { version = "3.8", features = ["server", "macros", "transport-io", "client"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }

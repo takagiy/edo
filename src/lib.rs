@@ -23,7 +23,35 @@ pub type Skipped = BTreeMap<String, usize>;
 
 /// Text of a report for the agent: MISON, which spends fewer tokens than JSON on the same data.
 pub fn report(v: &Value) -> String {
-    mison::to_string(v).expect("JSON values have only string keys, so MISON can write them")
+    mison::to_string(&Mison(v))
+}
+
+/// A JSON value as MISON writes it. A `Value` has no type to take heights from, so each array takes its
+/// height from its elements.
+struct Mison<'a>(&'a Value);
+
+impl mison::Encode for Mison<'_> {
+    /// Unused: `write` passes each array's height to the writer itself.
+    const HEIGHT: usize = 0;
+
+    fn write(&self, w: &mut mison::Writer) {
+        match self.0 {
+            Value::Null => {}
+            Value::Bool(b) => w.literal(if *b { "true" } else { "false" }),
+            Value::Number(n) => w.literal(&n.to_string()),
+            Value::String(s) => w.string(s),
+            Value::Array(xs) => w.seq(height(self.0), xs.len(), |s| xs.iter().for_each(|x| s.element(&Mison(x)))),
+            Value::Object(m) => w.record(|r| m.iter().for_each(|(k, v)| r.field(k, &Mison(v)))),
+        }
+    }
+}
+
+/// How deeply arrays nest in `v`: 0 for a value that is not an array.
+fn height(v: &Value) -> usize {
+    match v {
+        Value::Array(xs) => 1 + xs.iter().map(height).max().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// `{"reason":"unsupported_language","extensions":{...}}`, shared by every place that reports skipped files.
@@ -55,5 +83,34 @@ impl Error {
             v["item"] = item.into();
         }
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_in_array_field_are_in_parentheses() {
+        // Given: ambiguous の報告。matches はレコードの配列
+        let v = json!({"ok": false, "error": "ambiguous", "matches": [
+            {"range": "2-2", "parents": "fn a()"},
+            {"range": "5-5", "parents": "fn b()"},
+        ]});
+        // When: 報告を書く
+        // Then: 各レコードが丸括弧で囲まれ、, で区切られる
+        assert_eq!(
+            report(&v),
+            r#"ok=false error=ambiguous matches=(range=2-2 parents="fn a()"),(range=5-5 parents="fn b()")"#
+        );
+    }
+
+    #[test]
+    fn array_separator_follows_nesting_depth() {
+        // Given: 配列の配列、数の配列、空の配列、null を持つ報告
+        let v = json!({"a": [[1, 2], [3]], "b": [1, 2], "c": [], "d": null});
+        // When: 報告を書く
+        // Then: 深さ 2 の配列は ; で、深さ 1 の配列は , で区切られ、空の配列と null は何も書かれない
+        assert_eq!(report(&v), "a=1,2;3 b=1,2 c= d=");
     }
 }

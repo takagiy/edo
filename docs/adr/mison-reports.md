@@ -8,6 +8,7 @@ edo の CLI と MCP は、write の結果やエラーを JSON で返していた
 
 - エージェントに返す報告は、すべて MISON で書く。対象は CLI の stdout（write、lang、harness init、エラー）、MCP のツールの結果、glob の read が最後に付ける飛ばした拡張子ごとの件数の行。
 - 報告のデータは今までどおり `serde_json::Value` で組み立て、書き出す直前に `report`（`src/lib.rs`）で MISON にする。
+- mison 0.2 は配列の区切りを型の高さで決めるが、`Value` には型がない。そこで `report` は、各配列の高さを要素の入れ子の深さから求めて `mison::Writer` に渡す。
 - 行範囲は `"2-5"` のように `scope` と同じ書き方にする。MISON の範囲の書き方とも同じなので、エージェントは報告の範囲をそのまま `scope` に渡せる。
 - hook の答えは JSON のまま残す。読むのはハーネスで、ハーネスが JSON を求めるため。
 
@@ -26,5 +27,5 @@ ok=true file=a.rs replaced=2-2,5-5 warnings=(new_syntax_errors=(line=2 text="y(;
 ## 採らなかった案
 
 - `--format json` のような切り替えを残す: エージェント以外に報告を読む使い手がまだいない。
-- 報告ごとに型を定義する: MISON は `Value` もそのまま書けるので、今の報告には要らない。
+- 報告ごとに型を定義する: `Value` を書く数十行のアダプタで足りるので、今の報告には要らない。
 - 行範囲を `[2, 5]` のままにする: MISON では `(2,5)` になり、`scope` にそのまま渡せない。
