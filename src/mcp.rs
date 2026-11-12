@@ -123,7 +123,7 @@ impl Server {
     #[tool(description = "Read a source file with line numbers (`N<TAB>line`). Function and method bodies are \
         hidden: they leave gaps in the line numbers, or show as `...` when they share a line with other code.\n\n\
         To see more, pass `scope`: an identifier such as `Foo.bar` or `Foo::bar` (a function shows in full; a class \
-        shows its members with bodies hidden), or a line range `N` or `N-M` (shown in full). `path` may be a glob.\n\n\
+        shows its members with bodies hidden), or a line range `N` or `N-M` (shown in full). `path` may be a glob with `*` and `?`.\n\n\
         To read several things in one call, list them in `reads` as `{path, scope}`; each one's text follows its \
         path.")]
     fn read(&self, Parameters(p): Parameters<ReadParams>) -> CallToolResult {
@@ -134,8 +134,8 @@ impl Server {
             return error(crate::Error::new("usage", "give path, or reads"));
         }
         match command::read(&self.langs, &items) {
-            Ok(text) => {
-                items.iter().for_each(|i| self.remember(i.path));
+            Ok((text, files)) => {
+                files.iter().for_each(|f| self.remember(f));
                 CallToolResult::success(vec![ContentBlock::text(text)])
             }
             Err(e) => error(e),
@@ -152,7 +152,7 @@ impl Server {
         the target.\n\n\
         On success, `replaced` gives the line ranges that now hold `after`; there is no need to read the file back.\n\n\
         To make several edits in one call, list them in `edits` with the same fields. All of them are matched \
-        against the files as they are now, and if any fails, nothing is written.")]
+        against the files as they are now, and if any is not found, is ambiguous or overlaps another, nothing is written.")]
     fn write(&self, Parameters(p): Parameters<WriteParams>) -> CallToolResult {
         let first = match (p.path, p.after) {
             (Some(path), Some(after)) => Some(EditParams {
@@ -179,10 +179,13 @@ impl Server {
             .collect();
         // shortcut: waits for diagnostics on the runtime's only thread; fine while one agent writes at a time.
         // A check that panicked leaves the lock poisoned; a client cut off mid-request recovers on its next one.
+        // The files of one call share one wait, so a glob over many files waits no longer than one file.
+        let deadline = std::time::Instant::now() + crate::lsp::WAIT;
         let mut check = |written: &Written| {
-            self.lsp
-                .as_ref()
-                .map_or_else(Map::new, |s| s.lock().unwrap_or_else(std::sync::PoisonError::into_inner).check(written))
+            let servers = self.lsp.as_ref();
+            servers.map_or_else(Map::new, |s| {
+                s.lock().unwrap_or_else(std::sync::PoisonError::into_inner).check(written, deadline)
+            })
         };
         match command::write(&self.langs, &reqs, &mut check) {
             Ok(mut reports) => {
@@ -376,6 +379,19 @@ mod tests {
         assert!(text.contains("warnings=(stale=\"modified since last read\")"), "{text}");
     }
 
+    #[tokio::test]
+    async fn line_range_write_to_file_read_by_glob_and_changed_warns_stale() {
+        // Given: glob で read した後に外で書き換えられたファイル
+        let (dir, path) = file("fn a() {}\n");
+        let client = connect().await;
+        let glob = format!("{}/*.rs", dir.path().to_string_lossy().replace('\\', "/"));
+        tool(&client, "read", json!({"path": glob})).await;
+        std::fs::write(&path, "fn a() {}\nfn b() {}\n").unwrap();
+        // When: 行範囲のスコープで書く
+        let (text, _) = tool(&client, "write", json!({"path": path, "scope": "2", "after": "fn c() {}"})).await;
+        // Then: stale の警告が付く
+        assert!(text.contains("warnings=(stale=\"modified since last read\")"), "{text}");
+    }
     #[tokio::test]
     async fn stale_warning_does_not_depend_on_how_path_is_spelled() {
         // Given: read した後に外で書き換えられたファイル

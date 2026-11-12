@@ -1305,11 +1305,24 @@ dependencies = [
 
 [[package]]
 name = "mison"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaf50ecac6c20249298896fad577bad1ba8cda3c92647ce2b9491bae7ad4d38d"
+checksum = "2ad0a0bae18fc470b95774b42ddd1024e82a848615361f4ef75f2c6a2fa8dfb7"
 dependencies = [
- "serde",
+ "itoa",
+ "mison-derive",
+ "ryu",
+]
+
+[[package]]
+name = "mison-derive"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7dc786d9de5cb190a281584ddc32b6f642b0403e0946d51c3375b6bf27a8f59"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1669,6 +1682,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "same-file"

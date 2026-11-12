@@ -47,19 +47,23 @@ fn read_text(path: &Path) -> Result<String, Error> {
     String::from_utf8(bytes).map_err(|_| Error::new("encoding", format!("{shown}: not UTF-8")))
 }
 
+/// `*` and `?` make a glob. `[` and `]` do not: paths such as `app/[id]/page.tsx` name a file.
 fn is_glob(path: &str) -> bool {
-    path.contains(['*', '?', '['])
+    path.contains(['*', '?'])
 }
 
 /// Files matching a glob, skipping what `.gitignore` excludes, as `/`-separated paths in order.
 fn expand(pattern: &str) -> Result<Vec<String>, Error> {
-    let glob = globset::GlobBuilder::new(pattern)
+    // Windows paths cannot hold `\`, so there it is a separator; elsewhere it escapes as globset reads it.
+    let pattern = &if cfg!(windows) { pattern.replace('\\', "/") } else { pattern.to_string() };
+    let glob = globset::GlobBuilder::new(&pattern.replace('[', "\\[").replace(']', "\\]"))
         .literal_separator(true)
+        .backslash_escape(true)
         .build()
         .map_err(|e| Error::new("usage", e.to_string()))?
         .compile_matcher();
     // Walk from the longest directory prefix without glob characters.
-    let base_len = pattern[..pattern.find(['*', '?', '[']).unwrap()].rfind('/').map_or(0, |i| i + 1);
+    let base_len = pattern[..pattern.find(['*', '?']).unwrap()].rfind('/').map_or(0, |i| i + 1);
     let base = if base_len == 0 { "." } else { &pattern[..base_len] };
     let mut out: Vec<String> = ignore::WalkBuilder::new(base)
         .require_git(false)
@@ -101,24 +105,26 @@ pub struct ReadItem<'a> {
 
 /// Reads each item in turn, with a panic reported as an `internal` error. With several items, each one's
 /// text follows its path, as a glob's files do, and the first failure fails the whole read.
-pub fn read(langs: &Languages, items: &[ReadItem]) -> Result<String, Error> {
+/// Returns the text and the files read, in order.
+pub fn read(langs: &Languages, items: &[ReadItem]) -> Result<(String, Vec<String>), Error> {
     let several = items.len() > 1;
     guarded(|| {
-        let mut out = String::new();
+        let (mut out, mut files) = (String::new(), vec![]);
         for (i, item) in items.iter().enumerate() {
-            let text =
+            let (text, read) =
                 read_files(langs, item.path, item.scope).map_err(|e| Error { item: several.then_some(i + 1), ..e })?;
             if several && !is_glob(item.path) {
                 out.push_str(&format!("{}\n", item.path));
             }
             out.push_str(&text);
+            files.extend(read);
         }
-        Ok(out)
+        Ok((out, files))
     })
 }
 
 /// Writes every request, with a panic reported as an `internal` error. All requests are matched against the
-/// files as they were before the call, and if any fails, nothing is written and the failures are reported.
+/// files as they were before the call, and if any is not found, is ambiguous or overlaps another, nothing is written and the failures are reported.
 pub fn write(langs: &Languages, reqs: &[WriteRequest], check: Check) -> Result<Vec<Value>, Error> {
     guarded(|| write_requests(langs, reqs, check))
 }
@@ -132,10 +138,10 @@ fn guarded<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
     })
 }
 
-/// Reads a file (or glob) as an outline, or the definitions/lines selected by `scope`.
-fn read_files(langs: &Languages, path: &str, scope: Option<&str>) -> Result<String, Error> {
+/// Reads a file (or glob) as an outline, or the definitions/lines selected by `scope`, with the files read.
+fn read_files(langs: &Languages, path: &str, scope: Option<&str>) -> Result<(String, Vec<String>), Error> {
     if !is_glob(path) {
-        return read_one(langs, path, scope);
+        return Ok((read_one(langs, path, scope)?, vec![path.to_string()]));
     }
     let files = expand(path)?;
     if files.is_empty() {
@@ -147,10 +153,13 @@ fn read_files(langs: &Languages, path: &str, scope: Option<&str>) -> Result<Stri
         err.skipped = skipped;
         return Err(err);
     }
-    let mut out = String::new();
+    let (mut out, mut read) = (String::new(), vec![]);
     for file in files {
         match read_one(langs, &file, scope) {
-            Ok(text) => out.push_str(&format!("{file}\n{text}")),
+            Ok(text) => {
+                out.push_str(&format!("{file}\n{text}"));
+                read.push(file);
+            }
             // Like write, a file that the scope does not resolve in is left out.
             Err(e) if e.code == "not_found" => {}
             Err(e) => return Err(e),
@@ -164,7 +173,7 @@ fn read_files(langs: &Languages, path: &str, scope: Option<&str>) -> Result<Stri
     if !skipped.is_empty() {
         out.push_str(&format!("{}\n", crate::report(&skipped_line(&skipped))));
     }
-    Ok(out)
+    Ok((out, read))
 }
 
 /// `{"skipped":{...}}`, the note a glob ends with when it skipped files.
@@ -260,7 +269,9 @@ fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: Check) -> Res
     if !failures.is_empty() {
         return Ok(failures);
     }
-    let mut reports = plans.iter().map(|p| p.write(check)).collect::<Result<Vec<_>, _>>()?;
+    // A file that cannot be written fails alone: the files before it are written, and their reports say so.
+    let mut reports: Vec<Value> =
+        plans.iter().map(|p| p.write(check).unwrap_or_else(|e| failure(&p.path, e))).collect();
     if !skipped.is_empty() {
         reports.push(skipped_line(&skipped));
     }
@@ -290,16 +301,15 @@ impl<'a> Plan<'a> {
         let creating = !file.exists() && req.scope.is_none() && req.before.is_none();
         let src = language(langs, file)
             .and_then(|lang| Ok(Source::new(lang, if creating { String::new() } else { read_text(file)? })))
-            .map_err(|e| json!({"ok": false, "file": path, "error": e.code, "message": e.message}))?;
+            .map_err(|e| failure(&path, e))?;
         Ok(Plan { path, src, targets: vec![] })
     }
 
     /// Adds the targets `req` finds in the file, or reports why it found none, or too many.
     fn find(&mut self, req: &WriteRequest<'a>, item: usize) -> Result<(), Value> {
         let (src, path) = (&self.src, &self.path);
-        let failed = |e: Error| json!({"ok": false, "file": path, "error": e.code, "message": e.message});
         let regions = match req.scope {
-            Some(s) => scope::resolve(s, &src.defs, &src.text).map_err(failed)?,
+            Some(s) => scope::resolve(s, &src.defs, &src.text).map_err(|e| failure(path, e))?,
             None => vec![Hit { range: 0..src.text.len(), def: None }],
         };
         let mut closest: Option<matcher::Closest> = None;
@@ -399,6 +409,10 @@ impl<'a> Plan<'a> {
     }
 }
 
+/// The report of a file that `e` kept from being written.
+fn failure(file: &str, e: Error) -> Value {
+    json!({"ok": false, "file": file, "error": e.code, "message": e.message})
+}
 fn line_of(text: &str, byte: usize) -> usize {
     text[..byte].matches('\n').count() + 1
 }
@@ -436,7 +450,6 @@ fn candidate(src: &Source, target: &Hit) -> Value {
 
 fn read_one(langs: &Languages, path: &str, scope: Option<&str>) -> Result<String, Error> {
     let src = open(langs, Path::new(path))?;
-    let _ = src.lang;
     match scope {
         None => Ok(view::render(&src.text, &src.defs, 0..src.text.len(), true)),
         Some(scope) => Ok(view::render_hits(&src.text, &src.defs, &scope::resolve(scope, &src.defs, &src.text)?)),
@@ -466,7 +479,7 @@ mod tests {
         // Given: 関数のある Rust のファイル
         let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n}\n")]);
         // When: ファイルを読む
-        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: None }]).unwrap();
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: None }]).unwrap().0;
         // Then: ボディを省略したアウトラインが返る
         assert_eq!(out, "1\tfn a() {\n3\t}\n");
     }
@@ -476,7 +489,7 @@ mod tests {
         // Given: 2 つの Rust のファイル
         let dir = dir_with(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
         // When: glob で読む
-        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "src/*.rs"), scope: None }]).unwrap();
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "src/*.rs"), scope: None }]).unwrap().0;
         // Then: ファイルごとにパスの行が前に付く
         assert_eq!(
             out,
@@ -493,7 +506,7 @@ mod tests {
         let out =
             read(&Languages::builtin(), &[ReadItem { path: &a, scope: Some("b") }, ReadItem { path: &b, scope: None }]);
         // Then: 要素ごとに、パスの行の後にその内容が並ぶ
-        assert_eq!(out.unwrap(), format!("{a}\n2\tfn b() {{}}\n{b}\n1\tfn c() {{}}\n"));
+        assert_eq!(out.unwrap().0, format!("{a}\n2\tfn b() {{}}\n{b}\n1\tfn c() {{}}\n"));
     }
 
     #[test]
@@ -580,6 +593,92 @@ mod tests {
 
     fn write_all(reqs: &[WriteRequest]) -> Vec<Value> {
         write(&Languages::builtin(), reqs, &mut |_| Map::new()).unwrap()
+    }
+
+    /// `app/[id]/page.tsx` and `app/d/page.tsx`, which `[id]` would match as a glob character class.
+    fn bracket_dirs() -> tempfile::TempDir {
+        dir_with(&[("app/[id]/page.tsx", "export function A() {}\n"), ("app/d/page.tsx", "export function D() {}\n")])
+    }
+
+    #[test]
+    fn path_with_brackets_reads_that_file() {
+        // Given: 名前に [ と ] を含むディレクトリのファイルと、[id] の文字に一致するディレクトリのファイル
+        let dir = bracket_dirs();
+        // When: [ と ] を含むパスで読む
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "app/[id]/page.tsx"), scope: None }]);
+        // Then: そのファイルだけが読まれる
+        assert_eq!(out.unwrap().0, "1\texport function A() {}\n");
+    }
+
+    #[test]
+    fn path_with_brackets_writes_that_file() {
+        // Given: 名前に [ と ] を含むディレクトリのファイルと、[id] の文字に一致するディレクトリのファイル
+        let dir = bracket_dirs();
+        // When: [ と ] を含むパスに、ファイル全体を書く
+        write_all(&[WriteRequest {
+            path: &at(&dir, "app/[id]/page.tsx"),
+            after: "export function B() {}",
+            ..Default::default()
+        }]);
+        // Then: そのファイルが書かれ、もう一方は変わらない
+        assert_eq!(content(&dir, "app/[id]/page.tsx"), "export function B() {}\n");
+        assert_eq!(content(&dir, "app/d/page.tsx"), "export function D() {}\n");
+    }
+
+    #[test]
+    fn brackets_in_glob_match_themselves() {
+        // Given: 名前に [ と ] を含むディレクトリのファイルと、[id] の文字に一致するディレクトリのファイル
+        let dir = bracket_dirs();
+        // When: [ と ] を含む glob で読む
+        let (_, files) =
+            read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "app/[id]/*.tsx"), scope: None }]).unwrap();
+        // Then: [ と ] は文字どおりに一致する
+        assert_eq!(files, [at(&dir, "app/[id]/page.tsx")]);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn backslash_glob_matches_on_windows() {
+        // Given: 2 つの Rust のファイル
+        let dir = dir_with(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
+        // When: \ 区切りの glob で読む
+        let glob = format!("{}\\src\\*.rs", dir.path().display());
+        let (_, files) = read(&Languages::builtin(), &[ReadItem { path: &glob, scope: None }]).unwrap();
+        // Then: / 区切りのときと同じファイルに一致する
+        assert_eq!(files, [at(&dir, "src/a.rs"), at(&dir, "src/b.rs")]);
+    }
+
+    #[test]
+    fn reading_reports_files_read() {
+        // Given: 2 つの Rust のファイル
+        let dir = dir_with(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
+        // When: glob とファイルを並べて読む
+        let items = [
+            ReadItem { path: &at(&dir, "src/*.rs"), scope: None },
+            ReadItem { path: &at(&dir, "src/a.rs"), scope: None },
+        ];
+        let (_, files) = read(&Languages::builtin(), &items).unwrap();
+        // Then: 読んだファイルが、要素の順に並ぶ
+        assert_eq!(files, [at(&dir, "src/a.rs"), at(&dir, "src/b.rs"), at(&dir, "src/a.rs")]);
+    }
+
+    #[test]
+    fn file_that_fails_to_be_written_is_reported_with_files_written() {
+        // Given: 書けるファイルと、親がファイルなので書けないパス
+        let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("f", "")]);
+        let (a, b) = (at(&dir, "a.rs"), at(&dir, "f/b.rs"));
+        // When: 2 つを 1 回で書く
+        let reports = write_all(&[
+            WriteRequest { path: &a, after: "fn b() {}", ..Default::default() },
+            WriteRequest { path: &b, after: "fn c() {}", ..Default::default() },
+        ]);
+        // Then: 書けたファイルは ok と報告され、書けなかったファイルは io エラーと報告される
+        assert_eq!(content(&dir, "a.rs"), "fn b() {}\n");
+        assert_eq!(reports[0], json!({"ok": true, "file": a, "replaced": ["1-1"]}));
+        assert_eq!(
+            (&reports[1]["ok"], &reports[1]["file"], &reports[1]["error"]),
+            (&json!(false), &json!(b), &json!("io"))
+        );
     }
 
     /// A replace of `before` with `after` in `path`.
@@ -833,7 +932,7 @@ mod tests {
         // Given: .gitignore で target/ を除外したディレクトリ
         let dir = dir_with(&[(".gitignore", "target/\n"), ("a.rs", "fn a() {}\n"), ("target/b.rs", "fn b() {}\n")]);
         // When: ** の glob で読む
-        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "**/*.rs"), scope: None }]).unwrap();
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "**/*.rs"), scope: None }]).unwrap().0;
         // Then: 除外されたファイルは含まれない
         assert!(!out.contains("b.rs"), "{out}");
         assert!(out.contains("a.rs"));
@@ -844,7 +943,7 @@ mod tests {
         // Given: Rust のファイルと JSON のファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.json", "{}")]);
         // When: 両方に一致する glob で読む
-        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*"), scope: None }]).unwrap();
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*"), scope: None }]).unwrap().0;
         // Then: 言語パッケージのない JSON は飛ばされ、Rust のファイルは読める
         assert!(out.starts_with(&format!("{}\n1\tfn a() {{}}\n", at(&dir, "a.rs"))), "{out}");
         assert!(!out.contains("b.json"), "{out}");
@@ -876,7 +975,7 @@ mod tests {
         // Given: 関数 a を持つファイルと、関数 b を持つファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")]);
         // When: 両方に一致する glob を、スコープ a で読む
-        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*.rs"), scope: Some("a") }]).unwrap();
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*.rs"), scope: Some("a") }]).unwrap().0;
         // Then: a を持つファイルだけが出る
         assert_eq!(out, format!("{}\n1\tfn a() {{}}\n", at(&dir, "a.rs")));
     }
@@ -910,7 +1009,7 @@ mod tests {
         // Given: Rust のファイルと JSON のファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.json", "{}")]);
         // When: glob で読む
-        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*"), scope: None }]).unwrap();
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*"), scope: None }]).unwrap().0;
         // Then: 出力の最後の行に、飛ばした拡張子ごとの件数が MISON で付く
         let last = "skipped=(reason=unsupported_language extensions=(json=1))";
         assert_eq!(out, format!("{}\n1\tfn a() {{}}\n{last}\n", at(&dir, "a.rs")));
