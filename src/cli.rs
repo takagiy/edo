@@ -16,7 +16,7 @@ struct Cli {
 enum Cmd {
     /// Print a file with line numbers and function bodies elided, or the definitions/lines selected by a scope.
     ///
-    /// <TARGET> is <file>, <file>:<identifier> (Foo.bar or Foo::bar), <file>:<N> or <file>:<N-M>. <file> may be a glob.
+    /// <TARGET> is <file>, <file>:<identifier> (Foo.bar or Foo::bar), <file>:<N> or <file>:<N-M>. <file> may be a glob with * and ?.
     /// With several targets, each one's text follows its path.
     Read {
         #[arg(required = true)]
@@ -159,7 +159,7 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages,
                 .map(|(path, scope)| command::ReadItem { path, scope })
                 .collect();
             match command::read(&langs, &items) {
-                Ok(text) => (text, 0),
+                Ok((text, _)) => (text, 0),
                 Err(e) => (crate::report(&e.to_json()), 1),
             }
         }

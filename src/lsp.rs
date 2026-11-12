@@ -1,8 +1,7 @@
 //! A language package's `[package.lsp]`: how to start its language server and where its project is.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use edo_lsp_client::{Client, DiagnosticSeverity, Unavailable};
 use serde::Deserialize;
@@ -11,8 +10,8 @@ use serde_json::{Map, Value, json};
 use crate::command::Written;
 use crate::diagnostic::{Diagnostic, new_errors};
 
-/// How long a write waits for a server's diagnostics on one text.
-const WAIT: Duration = Duration::from_secs(2);
+/// How long a write call waits for servers' diagnostics, shared by the files it writes.
+pub const WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Lsp {
@@ -62,35 +61,59 @@ impl Lsp {
     }
 }
 
-/// The language servers an MCP session started, one per language and project root, kept for later writes.
+/// The language servers an MCP session started, with their languages, kept for later writes. A server that
+/// takes changes to its workspace folders takes every project root of its language; others take one each.
 #[derive(Default)]
 pub struct Servers {
-    clients: HashMap<(String, PathBuf), Client>,
+    clients: Vec<(String, Client)>,
 }
 
 impl Servers {
     /// LSP's warnings on a write, starting the language's server for the file's project when needed:
     /// `new_lsp_errors`, or `lsp: starting` when the diagnostics did not come in time, or `lsp: stopped` when
     /// the server exited, which drops it so that the next write starts it again.
-    /// A language without `[package.lsp]`, or whose server cannot be started, gets none.
-    pub fn check(&mut self, written: &Written) -> Map<String, Value> {
+    /// A language without `[package.lsp]`, or whose server cannot be started, gets none. Waits until `deadline`.
+    pub fn check(&mut self, written: &Written, deadline: Instant) -> Map<String, Value> {
         let (Some(lsp), Ok(path)) = (&written.lang.lsp, std::path::absolute(written.path)) else { return Map::new() };
-        let root = lsp.root(&path);
-        let key = (written.lang.name.clone(), root.clone());
-        if !self.clients.contains_key(&key) {
-            let language_id = lsp.language_id.as_deref().unwrap_or(&written.lang.name);
-            let Ok(client) = Client::start(&lsp.launch(on_path("mise")), &root, language_id) else { return Map::new() };
-            self.clients.insert(key.clone(), client);
-        }
-        let status = match warnings(self.clients.get_mut(&key).expect("just started"), &path, written, WAIT) {
+        let wait = || deadline.saturating_duration_since(Instant::now());
+        let found = match self.server(&written.lang.name, lsp, &lsp.root(&path), wait()) {
+            Ok(Some(at)) => warnings(&mut self.clients[at].1, &path, written, wait()).map_err(|e| (at, e)),
+            Ok(None) => return Map::new(),
+            Err(failed) => Err(failed),
+        };
+        let status = match found {
             Ok(found) => return found,
-            Err(Unavailable::Late) => "starting",
-            Err(Unavailable::Closed) => {
-                self.clients.remove(&key);
+            Err((_, Unavailable::Late)) => "starting",
+            Err((at, Unavailable::Closed)) => {
+                self.clients.remove(at);
                 "stopped"
             }
         };
         Map::from_iter([("lsp".to_string(), json!(status))])
+    }
+
+    /// Where the server of `language` that takes `root` is: one that has it, one that takes it as another
+    /// workspace folder, or one started for it; `None` when none can be started. Fails with the place of a
+    /// server that could not say whether it takes `root`.
+    fn server(
+        &mut self,
+        language: &str,
+        lsp: &Lsp,
+        root: &Path,
+        wait: Duration,
+    ) -> Result<Option<usize>, (usize, Unavailable)> {
+        if let Some(at) = self.clients.iter().position(|(l, c)| l == language && c.serves(root)) {
+            return Ok(Some(at));
+        }
+        for (at, (l, client)) in self.clients.iter_mut().enumerate() {
+            if l == language && client.add_folder(root, wait).map_err(|e| (at, e))? {
+                return Ok(Some(at));
+            }
+        }
+        let language_id = lsp.language_id.as_deref().unwrap_or(language);
+        let Ok(client) = Client::start(&lsp.launch(on_path("mise")), root, language_id) else { return Ok(None) };
+        self.clients.push((language.to_string(), client));
+        Ok(Some(self.clients.len() - 1))
     }
 }
 
@@ -129,6 +152,7 @@ pub fn on_path(program: &str) -> bool {
 mod tests {
     use super::*;
     use crate::diagnostic::Hunk;
+    use crate::language::Language;
 
     fn lsp(distribution: Option<Distribution>) -> Lsp {
         Lsp {
@@ -188,9 +212,14 @@ mod tests {
         assert_eq!(root, dir.path().join("src"));
     }
 
-    /// A language server on another thread that publishes, for each line of a document, an error `bad` where the
-    /// line holds ERR and a warning `meh` where it holds WARN; or, when `silent`, publishes nothing.
     fn fake_server(silent: bool) -> Client {
+        fake_server_with(silent, json!({}))
+    }
+
+    /// A language server on another thread that answers initialize with `capabilities` and publishes, for each
+    /// line of a document, an error `bad` where the line holds ERR and a warning `meh` where it holds WARN; or,
+    /// when `silent`, publishes nothing.
+    fn fake_server_with(silent: bool, capabilities: Value) -> Client {
         use lsp_server::{Message, Notification, Response};
         let (client_reads, server_writes) = std::io::pipe().unwrap();
         let (server_reads, client_writes) = std::io::pipe().unwrap();
@@ -198,7 +227,7 @@ mod tests {
             let (mut reader, mut writer) = (std::io::BufReader::new(server_reads), server_writes);
             while let Ok(Some(message)) = Message::read(&mut reader) {
                 let reply: Message = match message {
-                    Message::Request(r) => Response::new_ok(r.id, json!({"capabilities": {}})).into(),
+                    Message::Request(r) => Response::new_ok(r.id, json!({ "capabilities": capabilities })).into(),
                     Message::Notification(n) if n.method.starts_with("textDocument/did") && !silent => {
                         let text = n.params["contentChanges"][0]["text"].as_str();
                         let text = text.or(n.params["textDocument"]["text"].as_str()).unwrap_or("").to_string();
@@ -312,12 +341,61 @@ mod tests {
         let langs = crate::language::Languages::builtin();
         let lang = langs.for_path(Path::new("a.rs")).unwrap();
         let path = std::path::absolute(std::env::temp_dir().join("a.rs")).unwrap();
-        let root = lang.lsp.as_ref().unwrap().root(&path);
         let mut servers = Servers::default();
-        servers.clients.insert((lang.name.clone(), root), client);
+        servers.clients.push((lang.name.clone(), client));
         let written = Written { lang, path: &path, before: "a\n", after: "b\n", hunks: &[] };
-        let found = Value::Object(servers.check(&written));
+        let found = Value::Object(servers.check(&written, Instant::now() + WAIT));
         (servers, found)
+    }
+
+    /// A write of `<dir>/a.rs`, whose root is `dir` as no Cargo.toml is above it.
+    fn write_in<'a>(lang: &'a Language, dir: &'a Path) -> Written<'a> {
+        Written { lang, path: dir.join("a.rs").leak(), before: "a\n", after: "b\n", hunks: &[] }
+    }
+
+    #[test]
+    fn file_of_another_root_is_checked_by_server_that_takes_folders() {
+        // Given: あるルートの Rust のサーバーで、workspace folder の変更に対応するもの
+        let folders = json!({"workspace": {"workspaceFolders": {"supported": true, "changeNotifications": true}}});
+        let (first, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let langs = crate::language::Languages::builtin();
+        let lang = langs.for_path(Path::new("a.rs")).unwrap();
+        let mut servers = Servers::default();
+        servers.clients.push((lang.name.clone(), fake_server_with(false, folders)));
+        servers.check(&write_in(lang, first.path()), Instant::now() + WAIT);
+        // When: 別のルートの Rust のファイルを書く
+        let found = servers.check(&write_in(lang, other.path()), Instant::now() + WAIT);
+        // Then: そのサーバーにフォルダーを足して確かめ、サーバーは起動しない
+        assert_eq!(Value::Object(found), json!({}));
+        assert_eq!(servers.clients.len(), 1);
+        assert!(servers.clients[0].1.serves(&std::path::absolute(other.path()).unwrap()));
+    }
+
+    #[test]
+    fn file_of_another_root_starts_its_own_server_without_one_that_takes_folders() {
+        // Given: workspace folder の変更に対応しない、あるルートのサーバーと、すぐに終わるコマンドをサーバーにする言語
+        let rust = crate::language::Languages::builtin();
+        let rust = rust.for_path(Path::new("a.rs")).unwrap();
+        let exits = if cfg!(windows) { vec!["cmd", "/c", "exit"] } else { vec!["true"] };
+        let lsp = Lsp { command: exits.into_iter().map(String::from).collect(), distribution: None, ..lsp(None) };
+        let query = tree_sitter::Query::new(&rust.grammar, "").unwrap();
+        let lang = Language {
+            name: rust.name.clone(),
+            extensions: vec![],
+            grammar: rust.grammar.clone(),
+            query,
+            lsp: Some(lsp),
+        };
+        let (first, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut servers = Servers::default();
+        servers.clients.push((lang.name.clone(), fake_server(false)));
+        servers.check(&write_in(&lang, first.path()), Instant::now() + WAIT);
+        // When: 別のルートのファイルを書く
+        let found = servers.check(&write_in(&lang, other.path()), Instant::now() + WAIT);
+        // Then: そのルートのサーバーを起動し（すぐに終わるので stopped になる）、前のサーバーはフォルダーを足されない
+        assert_eq!(Value::Object(found), json!({"lsp": "stopped"}));
+        assert_eq!(servers.clients.len(), 1);
+        assert!(!servers.clients[0].1.serves(&std::path::absolute(other.path()).unwrap()));
     }
 
     #[test]
@@ -328,7 +406,7 @@ mod tests {
         let path = std::env::temp_dir().join("a.md");
         let written = Written { lang, path: &path, before: "a\n", after: "b\n", hunks: &[] };
         // When: 起動したサーバーの一覧に確かめさせる
-        let found = Servers::default().check(&written);
+        let found = Servers::default().check(&written, Instant::now() + WAIT);
         // Then: 何も付かない
         assert!(found.is_empty(), "{found:?}");
     }
