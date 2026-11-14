@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 
 use crate::command::Written;
 use crate::diagnostic::{Diagnostic, new_errors};
+use crate::language::Languages;
 
 /// How long a write call waits for servers' diagnostics, shared by the files it writes.
 pub const WAIT: Duration = Duration::from_secs(2);
@@ -77,7 +78,14 @@ impl Servers {
         let (Some(lsp), Ok(path)) = (&written.lang.lsp, std::path::absolute(written.path)) else { return Map::new() };
         let wait = || deadline.saturating_duration_since(Instant::now());
         let found = match self.server(&written.lang.name, lsp, &lsp.root(&path), wait()) {
-            Ok(Some(at)) => warnings(&mut self.clients[at].1, &path, written, wait()).map_err(|e| (at, e)),
+            Ok(Some(at)) => {
+                let client = &mut self.clients[at].1;
+                let found = warnings(client, &path, written, wait());
+                // A save starts the checks a server runs only on saved files, such as cargo check; their
+                // diagnostics come later, for a read to report.
+                client.saved(&path, written.after);
+                found.map_err(|e| (at, e))
+            }
             Ok(None) => return Map::new(),
             Err(failed) => Err(failed),
         };
@@ -90,6 +98,34 @@ impl Servers {
             }
         };
         Map::from_iter([("lsp".to_string(), json!(status))])
+    }
+
+    /// The errors the servers have sent so far for each of `files`, without waiting, as
+    /// `{"lsp_errors": [{"file", "errors": [{"line", "message"}]}]}`; `None` when none of them has any.
+    /// They come from checks a write started, such as cargo check, which take longer than a write waits.
+    pub fn read_errors(&mut self, langs: &Languages, files: &[String]) -> Option<Value> {
+        let mut found = vec![];
+        let mut seen = std::collections::HashSet::new();
+        for file in files {
+            let (Some(lang), Ok(path)) = (langs.for_path(Path::new(file)), std::path::absolute(file)) else { continue };
+            // A file read in several ranges comes several times.
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let mut known: Vec<Diagnostic> = vec![];
+            for (_, client) in self.clients.iter_mut().filter(|(l, _)| *l == lang.name) {
+                for e in errors(client.known(&path)) {
+                    if !known.contains(&e) {
+                        known.push(e);
+                    }
+                }
+            }
+            if !known.is_empty() {
+                let errors: Vec<Value> = known.iter().map(|e| json!({"line": e.line, "message": e.message})).collect();
+                found.push(json!({"file": file, "errors": errors}));
+            }
+        }
+        (!found.is_empty()).then(|| json!({ "lsp_errors": found }))
     }
 
     /// Where the server of `language` that takes `root` is: one that has it, one that takes it as another
@@ -125,10 +161,6 @@ pub fn warnings(
     written: &Written,
     wait: Duration,
 ) -> Result<Map<String, Value>, Unavailable> {
-    let errors = |diagnostics: Vec<edo_lsp_client::Diagnostic>| -> Vec<Diagnostic> {
-        let errors = diagnostics.into_iter().filter(|d| d.severity == Some(DiagnosticSeverity::ERROR));
-        errors.map(|d| Diagnostic { line: d.range.start.line as usize + 1, message: d.message }).collect()
-    };
     let before = errors(client.diagnostics(path, written.before, wait)?);
     let after = errors(client.diagnostics(path, written.after, wait)?);
     let added = new_errors(&before, after, written.hunks);
@@ -137,6 +169,12 @@ pub fn warnings(
     }
     let added: Vec<Value> = added.iter().map(|e| json!({"line": e.line, "message": e.message})).collect();
     Ok(Map::from_iter([("new_lsp_errors".to_string(), added.into())]))
+}
+
+/// The errors among a server's diagnostics, by line (counting from 1) and message.
+fn errors(diagnostics: Vec<edo_lsp_client::Diagnostic>) -> Vec<Diagnostic> {
+    let errors = diagnostics.into_iter().filter(|d| d.severity == Some(DiagnosticSeverity::ERROR));
+    errors.map(|d| Diagnostic { line: d.range.start.line as usize + 1, message: d.message }).collect()
 }
 
 /// Whether `program` is on PATH, with the extensions PATHEXT lists on Windows.
@@ -218,7 +256,7 @@ mod tests {
 
     /// A language server on another thread that answers initialize with `capabilities` and publishes, for each
     /// line of a document, an error `bad` where the line holds ERR and a warning `meh` where it holds WARN; or,
-    /// when `silent`, publishes nothing.
+    /// when `silent`, publishes nothing. On a save it publishes the error `saved`, as a check would.
     fn fake_server_with(silent: bool, capabilities: Value) -> Client {
         use lsp_server::{Message, Notification, Response};
         let (client_reads, server_writes) = std::io::pipe().unwrap();
@@ -228,6 +266,12 @@ mod tests {
             while let Ok(Some(message)) = Message::read(&mut reader) {
                 let reply: Message = match message {
                     Message::Request(r) => Response::new_ok(r.id, json!({ "capabilities": capabilities })).into(),
+                    Message::Notification(n) if n.method == "textDocument/didSave" => {
+                        let at = json!({"line": 0, "character": 0});
+                        let saved = json!({"range": {"start": at, "end": at}, "severity": 1, "message": "saved"});
+                        let params = json!({"uri": n.params["textDocument"]["uri"], "diagnostics": [saved]});
+                        Notification::new("textDocument/publishDiagnostics".into(), params).into()
+                    }
                     Message::Notification(n) if n.method.starts_with("textDocument/did") && !silent => {
                         let text = n.params["contentChanges"][0]["text"].as_str();
                         let text = text.or(n.params["textDocument"]["text"].as_str()).unwrap_or("").to_string();
@@ -398,6 +442,65 @@ mod tests {
         assert!(!servers.clients[0].1.serves(&std::path::absolute(other.path()).unwrap()));
     }
 
+    #[test]
+    fn written_file_is_told_saved_to_its_server() {
+        // Given: 保存の通知を求め、保存されるとそのファイルにエラー saved を送る、Rust のサーバー
+        let langs = crate::language::Languages::builtin();
+        let lang = langs.for_path(Path::new("a.rs")).unwrap();
+        let mut servers = Servers::default();
+        servers.clients.push((lang.name.clone(), fake_server_with(false, json!({"textDocumentSync": {"save": true}}))));
+        // When: そのサーバーのフォルダーのファイルを書く
+        let temp = std::env::temp_dir();
+        let written = write_in(lang, &temp);
+        servers.check(&written, Instant::now() + WAIT);
+        // Then: そのサーバーに保存が伝わり、saved が届く
+        let path = std::path::absolute(written.path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let saved = loop {
+            let known: Vec<String> = servers.clients[0].1.known(&path).into_iter().map(|d| d.message).collect();
+            if known.contains(&"saved".to_string()) || Instant::now() > deadline {
+                break known;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(saved.contains(&"saved".to_string()), "{saved:?}");
+    }
+
+    #[test]
+    fn errors_known_for_files_read_are_one_line() {
+        // Given: Rust のサーバーが、書き込んだファイルの 1 行目にエラー bad を送ってきた状態
+        let langs = crate::language::Languages::builtin();
+        let lang = langs.for_path(Path::new("a.rs")).unwrap();
+        let mut servers = Servers::default();
+        servers.clients.push((lang.name.clone(), fake_server(false)));
+        let path = std::env::temp_dir().join("a.rs");
+        let written = Written { lang, path: &path, before: "a\n", after: "ERR\n", hunks: &[] };
+        servers.check(&written, Instant::now() + WAIT);
+        // When: そのファイルと、エラーの届いていないファイルと、サーバーのない言語のファイルを読む
+        let files = [path.clone(), std::env::temp_dir().join("b.rs"), std::env::temp_dir().join("c.md")];
+        let files: Vec<String> = files.iter().map(|f| f.to_string_lossy().into_owned()).collect();
+        let found = servers.read_errors(&langs, &files);
+        // Then: エラーのあるファイルだけが、行と文で並ぶ
+        let file = files[0].clone();
+        assert_eq!(found, Some(json!({"lsp_errors": [{"file": file, "errors": [{"line": 1, "message": "bad"}]}]})));
+    }
+
+    #[test]
+    fn errors_of_file_read_twice_are_returned_once() {
+        // Given: Rust のサーバーが、書き込んだファイルの 1 行目にエラー bad を送ってきた状態
+        let langs = crate::language::Languages::builtin();
+        let lang = langs.for_path(Path::new("a.rs")).unwrap();
+        let mut servers = Servers::default();
+        servers.clients.push((lang.name.clone(), fake_server(false)));
+        let path = std::env::temp_dir().join("a.rs");
+        let written = Written { lang, path: &path, before: "a\n", after: "ERR\n", hunks: &[] };
+        servers.check(&written, Instant::now() + WAIT);
+        // When: そのファイルを 2 回読む（別の範囲を読んだときのように）
+        let file = path.to_string_lossy().into_owned();
+        let found = servers.read_errors(&langs, &[file.clone(), file.clone()]);
+        // Then: そのファイルのエラーは 1 回だけ並ぶ
+        assert_eq!(found, Some(json!({"lsp_errors": [{"file": file, "errors": [{"line": 1, "message": "bad"}]}]})));
+    }
     #[test]
     fn language_without_lsp_section_gets_nothing() {
         // Given: [package.lsp] のない言語（Markdown）のファイルの書き込み

@@ -134,8 +134,15 @@ impl Server {
             return error(crate::Error::new("usage", "give path, or reads"));
         }
         match command::read(&self.langs, &items) {
-            Ok((text, files)) => {
+            Ok((mut text, files)) => {
                 files.iter().for_each(|f| self.remember(f));
+                // Errors from checks earlier writes started, which come too late for those writes to wait for.
+                let lock = |s: &Arc<Mutex<Servers>>| {
+                    s.lock().unwrap_or_else(std::sync::PoisonError::into_inner).read_errors(&self.langs, &files)
+                };
+                if let Some(errors) = self.lsp.as_ref().and_then(lock) {
+                    text.push_str(&format!("{}\n", crate::report(&errors)));
+                }
                 CallToolResult::success(vec![ContentBlock::text(text)])
             }
             Err(e) => error(e),
