@@ -487,7 +487,7 @@ impl<'a> Plan<'a> {
         let mut warnings = Map::new();
         let unformatted = text;
         let text = check.format(&written(&unformatted, &[])).unwrap_or_else(|message| {
-            warnings.insert("format".into(), message.into());
+            warnings.insert("format_failed".into(), message.into());
             unformatted.clone()
         });
         let formatted = crate::diagnostic::hunks(&unformatted, &text);
@@ -767,7 +767,7 @@ mod tests {
         // Then: 1 つ目の位置に、1 つ目の要素だとわかる not_found が並び、2 つ目は読まれる。全体は失敗として扱われる
         let lines: Vec<&str> = out.text.lines().collect();
         assert_eq!(lines[0], a);
-        assert!(lines[1].starts_with("ok=false error=not_found") && lines[1].ends_with("item=1"), "{}", out.text);
+        assert!(lines[1].starts_with("error=not_found") && lines[1].ends_with("item=1"), "{}", out.text);
         assert_eq!(lines[2..], [a.as_str(), "1\tfn a() {}"]);
         assert!(!out.ok);
     }
@@ -998,9 +998,10 @@ mod tests {
         let req = WriteRequest { path: &at(&dir, "a.rs"), before: Some("x();"), after: "y();", ..Default::default() };
         // When: 書く
         let reports = write(&Languages::builtin(), &[req], &mut Formatter(|_| Err("syntax error".into()))).unwrap();
-        // Then: 整形せずに書かれ、そのメッセージが警告の format に入る
+        // Then: 書き込みは成功し、整形失敗のメッセージが warnings.format_failed に入る
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    y();\n}\n");
-        assert_eq!(reports[0]["warnings"]["format"], "syntax error");
+        assert_eq!(reports[0]["ok"], true);
+        assert_eq!(reports[0]["warnings"]["format_failed"], "syntax error");
     }
     /// A replace of `before` with `after` in `path`.
     fn swap<'a>(path: &'a str, before: &'a str, after: &'a str) -> WriteRequest<'a> {

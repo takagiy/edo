@@ -341,9 +341,10 @@ mod tests {
         // Given: 呼び出しのある関数
         let (_dir, path) = file("fn a() { x(); }\n");
         // When: 書く
-        let (out, _) = edo(&["write", &path, "x();", "y();"], "");
-        // Then: 報告が MISON で出力される
-        assert_eq!(out, "ok=true replaced=1-1");
+        let (out, code) = edo(&["write", &path, "x();", "y();"], "");
+        // Then: ok を省いた MISON の報告になり、終了コードは 0
+        assert_eq!(out, "replaced=1-1");
+        assert_eq!(code, 0);
     }
 
     #[test]
@@ -351,8 +352,9 @@ mod tests {
         // Given: 呼び出しのない関数
         let (_dir, path) = file("fn a() {}\n");
         // When: 一致しない before で書く
-        let (_, code) = edo(&["write", &path, "x();", "y();"], "");
-        // Then: 終了コードは 1
+        let (out, code) = edo(&["write", &path, "x();", "y();"], "");
+        // Then: ok を省いてもエラーが報告され、終了コードは 1
+        assert!(out.contains("error=not_found") && !out.contains("ok="), "{out}");
         assert_eq!(code, 1);
     }
 
