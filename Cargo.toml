@@ -1,6 +1,6 @@
 [package]
 name = "edo-mcp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 description = "An MCP server and CLI that agents use to read and write code by its syntax tree"
@@ -18,7 +18,7 @@ path = "src/main.rs"
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
 dirs = "7.0.0"
-edo-lsp-client = { version = "0.1.0", path = "crates/edo-lsp-client" }
+edo-lsp-client = { version = "0.2.0", path = "crates/edo-lsp-client" }
 edo-tree-sitter-kotlin = { version = "0.4.8", path = "crates/edo-tree-sitter-kotlin" }
 flate2 = "1.1.10"
 globset = "0.4.21"
@@ -28,6 +28,7 @@ rmcp = { version = "3.8", features = ["server", "macros", "transport-io", "clien
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+similar = "2.7.0"
 streaming-iterator = "0.1.9"
 tar = "0.4.46"
 tempfile = "3.27.0"

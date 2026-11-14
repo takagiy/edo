@@ -13,9 +13,10 @@ use lsp_server::{Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     ClientCapabilities, DiagnosticClientCapabilities, DiagnosticWorkspaceClientCapabilities,
     DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentDiagnosticParams, InitializeParams, PublishDiagnosticsClientCapabilities, PublishDiagnosticsParams,
-    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, Url,
-    VersionedTextDocumentIdentifier, WorkspaceClientCapabilities, WorkspaceFolder, WorkspaceFoldersChangeEvent,
+    DocumentDiagnosticParams, DocumentFormattingClientCapabilities, DocumentFormattingParams, FormattingOptions,
+    InitializeParams, Position, PublishDiagnosticsClientCapabilities, PublishDiagnosticsParams,
+    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, TextEdit,
+    Url, VersionedTextDocumentIdentifier, WorkspaceClientCapabilities, WorkspaceFolder, WorkspaceFoldersChangeEvent,
 };
 use serde_json::Value;
 
@@ -30,8 +31,8 @@ enum Event {
     /// The server answered `initialize` with these capabilities.
     Ready(Value),
     Published(PublishDiagnosticsParams),
-    /// The answer to a diagnostic request: its items, or `None` when it holds none to take.
-    Answered(RequestId, Option<Vec<Diagnostic>>),
+    /// The answer to a request after `initialize`: its result, or the message of its error.
+    Answered(RequestId, Result<Value, String>),
     /// The server says the diagnostics it gave are out of date, as after it loads the project.
     Refresh,
     /// The server registered diagnostic requests under this id, or took the registration back.
@@ -46,6 +47,14 @@ pub enum Unavailable {
     Late,
     /// The server has exited.
     Closed,
+}
+
+/// Why a text was not formatted.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormatError {
+    Unavailable(Unavailable),
+    /// The server answered with an error, such as a formatter failing on a syntax error; its message.
+    Failed(String),
 }
 /// A document as the server has it: the text last sent, its version, and the server's answer for it once asked.
 struct Document {
@@ -67,8 +76,12 @@ pub struct Client {
     /// The registrations under which the server answers diagnostic requests, so they are asked for, not waited
     /// for: `initialize` for its initialize answer, and the ids it registered later.
     pull_ids: HashSet<String>,
+    /// The server formats documents.
+    formats: bool,
     /// Diagnostic requests not answered yet: the document and version each asks about.
     asked: HashMap<RequestId, (String, i32)>,
+    /// Answers to other requests, until the one waiting for each takes it.
+    answers: HashMap<RequestId, Result<Value, String>>,
     next_id: i32,
     language_id: String,
     /// Keyed by `key`, since a server may spell a document's URI differently from the client.
@@ -115,6 +128,7 @@ impl Client {
         let text_document = TextDocumentClientCapabilities {
             publish_diagnostics: Some(diagnostics),
             diagnostic: Some(DiagnosticClientCapabilities { dynamic_registration: Some(true), ..Default::default() }),
+            formatting: Some(DocumentFormattingClientCapabilities { dynamic_registration: Some(false) }),
             ..Default::default()
         };
         #[allow(deprecated)] // root_uri, for servers that predate workspace folders
@@ -142,7 +156,9 @@ impl Client {
             folders,
             saves: None,
             pull_ids: HashSet::new(),
+            formats: false,
             asked: HashMap::new(),
+            answers: HashMap::new(),
             next_id: INITIALIZE + 1,
             language_id: language_id.into(),
             documents: HashMap::new(),
@@ -163,13 +179,63 @@ impl Client {
         while let Ok(event) = self.events.try_recv() {
             self.take(event);
         }
-        match self.documents.get_mut(&key) {
+        self.sync(&key, &uri, text);
+        // Asked in the loop, as a server may register diagnostic requests, or refresh, while the client waits.
+        loop {
+            if let Some(found) = self.found(&key) {
+                return Ok(found);
+            }
+            self.ask(&key, &uri);
+            self.next(deadline)?;
+        }
+    }
+
+    /// `text` formatted by the server as the document at `path`, indenting by `tab_size` columns of spaces or by
+    /// tabs, waiting up to `wait`; `text` as is from a server that does not format.
+    pub fn format(
+        &mut self,
+        path: &Path,
+        text: &str,
+        tab_size: u32,
+        insert_spaces: bool,
+        wait: Duration,
+    ) -> Result<String, FormatError> {
+        let deadline = Instant::now() + wait;
+        let key = Url::from_file_path(path).ok().and_then(|uri| key(&uri).map(|k| (uri, k)));
+        let (uri, key) = key.ok_or(FormatError::Unavailable(Unavailable::Late))?;
+        self.wait_ready(deadline).map_err(FormatError::Unavailable)?;
+        if !self.formats {
+            return Ok(text.into());
+        }
+        self.sync(&key, &uri, text);
+        let id = RequestId::from(self.next_id);
+        self.next_id += 1;
+        let params = DocumentFormattingParams {
+            text_document: TextDocumentIdentifier { uri },
+            options: FormattingOptions { tab_size, insert_spaces, ..Default::default() },
+            work_done_progress_params: Default::default(),
+        };
+        send(&self.writer, Request::new(id.clone(), "textDocument/formatting".into(), params));
+        let answer = loop {
+            if let Some(answer) = self.answers.remove(&id) {
+                break answer;
+            }
+            self.next(deadline).map_err(FormatError::Unavailable)?;
+        };
+        // `null` means nothing to change.
+        let edits: Vec<TextEdit> = serde_json::from_value(answer.map_err(FormatError::Failed)?).unwrap_or_default();
+        Ok(applied(text, edits))
+    }
+
+    /// Gives the server `text` as the document's content: opens the document, or tells it of the change.
+    fn sync(&mut self, key: &str, uri: &Url, text: &str) {
+        match self.documents.get_mut(key) {
             Some(document) if document.text == text => {}
             Some(document) => {
                 document.version += 1;
                 document.text = text.into();
                 document.answered = None;
-                self.published.remove(&key);
+                self.published.remove(key);
                 let change = TextDocumentContentChangeEvent { range: None, range_length: None, text: text.into() };
                 let params = DidChangeTextDocumentParams {
                     text_document: VersionedTextDocumentIdentifier { uri: uri.clone(), version: document.version },
@@ -181,19 +247,10 @@ impl Client {
                 let item = TextDocumentItem::new(uri.clone(), self.language_id.clone(), 1, text.into());
                 let params = DidOpenTextDocumentParams { text_document: item };
                 send(&self.writer, Notification::new("textDocument/didOpen".into(), params));
-                self.documents.insert(key.clone(), Document { version: 1, text: text.into(), answered: None });
+                self.documents.insert(key.to_string(), Document { version: 1, text: text.into(), answered: None });
             }
-        }
-        // Asked in the loop, as a server may register diagnostic requests, or refresh, while the client waits.
-        loop {
-            if let Some(found) = self.found(&key) {
-                return Ok(found);
-            }
-            self.ask(&key, &uri);
-            self.next(deadline)?;
         }
     }
-
     /// What the server has said of `path` so far, without waiting: its answer for the text last asked about, with
     /// what it published for the file, which may be about a file never opened.
     pub fn known(&mut self, path: &Path) -> Vec<Diagnostic> {
@@ -216,19 +273,26 @@ impl Client {
         Some(merged(answered, published))
     }
 
-    /// Tells a server that asks to hear of saves that `path` was saved holding `text`, the text last asked about.
+    /// Tells a server that asks to hear of saves that `path` was saved holding `text`, giving it that text first.
     pub fn saved(&mut self, path: &Path, text: &str) {
         let Some(include_text) = self.saves else { return };
         let Some((uri, key)) = Url::from_file_path(path).ok().and_then(|uri| key(&uri).map(|k| (uri, k))) else {
             return;
         };
-        if self.documents.get(&key).is_some_and(|d| d.text == text) {
-            let params = DidSaveTextDocumentParams {
-                text_document: TextDocumentIdentifier { uri },
-                text: include_text.then(|| text.to_string()),
-            };
-            send(&self.writer, Notification::new("textDocument/didSave".into(), params));
+        self.sync(&key, &uri, text);
+        let params = DidSaveTextDocumentParams {
+            text_document: TextDocumentIdentifier { uri },
+            text: include_text.then(|| text.to_string()),
+        };
+        send(&self.writer, Notification::new("textDocument/didSave".into(), params));
+    }
+
+    /// Whether the server has answered `initialize`, taking in what it sent so far without waiting.
+    pub fn is_ready(&mut self) -> bool {
+        while let Ok(event) = self.events.try_recv() {
+            self.take(event);
         }
+        self.ready
     }
 
     /// Whether the server takes `root`: the folder it started in, or one added since.
@@ -301,6 +365,8 @@ impl Client {
                 // `changeNotifications` is `true`, or the id the server registers the notification under.
                 let changes = &capabilities["workspace"]["workspaceFolders"]["changeNotifications"];
                 self.takes_folders = changes == true || changes.is_string();
+                let formatting = &capabilities["documentFormattingProvider"];
+                self.formats = formatting == true || formatting.is_object();
                 let save = &capabilities["textDocumentSync"]["save"];
                 self.saves = (save == true || save.is_object()).then(|| save["includeText"] == true);
             }
@@ -318,14 +384,20 @@ impl Client {
                     self.published.insert(key, published.diagnostics);
                 }
             }
-            Event::Answered(id, answered) => {
-                if let Some((key, version)) = self.asked.remove(&id)
-                    && current(&self.documents, &key, Some(version))
-                    && let Some(document) = self.documents.get_mut(&key)
-                {
-                    document.answered = answered;
+            // A full diagnostic report holds `items`; an error or an unchanged report, which needs a previous
+            // result id never sent, holds none.
+            Event::Answered(id, result) => match self.asked.remove(&id) {
+                Some((key, version)) => {
+                    if current(&self.documents, &key, Some(version))
+                        && let Some(document) = self.documents.get_mut(&key)
+                    {
+                        document.answered = result.ok().and_then(|r| serde_json::from_value(r["items"].clone()).ok());
+                    }
                 }
-            }
+                None => {
+                    self.answers.insert(id, result);
+                }
+            },
         }
     }
 }
@@ -340,6 +412,27 @@ impl Drop for Client {
     }
 }
 
+/// `text` with `edits` applied; their positions count UTF-16 code units, as LSP does unless told otherwise.
+fn applied(text: &str, mut edits: Vec<TextEdit>) -> String {
+    let offset = |p: Position| {
+        let start: usize = text.split_inclusive('\n').take(p.line as usize).map(str::len).sum();
+        let mut units = 0;
+        for (i, c) in text[start..].char_indices() {
+            if units >= p.character || c == '\n' {
+                return start + i;
+            }
+            units += c.len_utf16() as u32;
+        }
+        text.len()
+    };
+    // From the last edit back, so that the offsets of the earlier ones stay right.
+    edits.sort_by_key(|e| (e.range.start.line, e.range.start.character));
+    let mut out = text.to_string();
+    for e in edits.iter().rev() {
+        out.replace_range(offset(e.range.start)..offset(e.range.end), &e.new_text);
+    }
+    out
+}
 /// An answer with the published diagnostics it does not hold already, as a server that answers may publish the
 /// same ones too, as pyright does.
 fn merged(mut answered: Vec<Diagnostic>, published: Option<&Vec<Diagnostic>>) -> Vec<Diagnostic> {
@@ -385,12 +478,7 @@ fn events_of(message: Message, writer: &Writer) -> Vec<Event> {
             send(writer, Notification::new("initialized".into(), serde_json::json!({})));
             vec![Event::Ready(r.response_result.map_or(Value::Null, |result| result["capabilities"].clone()))]
         }
-        // Only diagnostic requests are sent after initialize. A full report holds `items`; an error or an
-        // unchanged report, which needs a previous result id never sent, holds none.
-        Message::Response(r) => {
-            let items = r.response_result.ok().and_then(|result| serde_json::from_value(result["items"].clone()).ok());
-            vec![Event::Answered(r.id, items)]
-        }
+        Message::Response(r) => vec![Event::Answered(r.id, r.response_result.map_err(|e| e.message))],
         Message::Request(r) => {
             send(writer, Response::new_ok(r.id.clone(), answer(&r)));
             match r.method.as_str() {
@@ -856,6 +944,75 @@ mod tests {
         })
     }
 
+    /// Answers initialize with `documentFormattingProvider` and each formatting request with `answer`, given the
+    /// request's options.
+    fn formatter(answer: fn(&Value) -> Result<Value, String>) -> Handler {
+        Box::new(move |m| match m {
+            Message::Request(r) if r.method == "initialize" => {
+                let capabilities = json!({"documentFormattingProvider": true});
+                vec![Response::new_ok(r.id.clone(), json!({ "capabilities": capabilities })).into()]
+            }
+            Message::Request(r) if r.method == "textDocument/formatting" => match answer(&r.params["options"]) {
+                Ok(edits) => vec![Response::new_ok(r.id.clone(), edits).into()],
+                Err(message) => vec![Response::new_err(r.id.clone(), -32603, message).into()],
+            },
+            _ => vec![],
+        })
+    }
+
+    /// One edit after the first UTF-16 code unit of the first line, writing the options it was asked with.
+    fn insert_options(options: &Value) -> Result<Value, String> {
+        let spaces = if options["insertSpaces"] == true { "spaces" } else { "tabs" };
+        let at = json!({"line": 0, "character": 1});
+        Ok(json!([{"range": {"start": at, "end": at}, "newText": format!("[{} {spaces}]", options["tabSize"])}]))
+    }
+
+    #[test]
+    fn formatting_server_edits_are_applied_counting_utf16() {
+        // Given: 整形するサーバー
+        let (mut client, received) = fake(formatter(insert_options));
+        // When: 1 文字目が 1 つの UTF-16 単位に収まる日本語の内容を、幅 2 のスペースで整形する
+        let formatted = client.format(&doc(), "あい", 2, true, LONG);
+        // Then: 字下げの指定を付けて要求し、UTF-16 で 1 単位目の後ろに編集が当たる
+        assert_eq!(formatted, Ok("あ[2 spaces]い".to_string()));
+        assert!(all_received(&mut client, &received).contains(&"textDocument/formatting".to_string()));
+    }
+
+    #[test]
+    fn server_without_formatting_returns_text_as_is() {
+        // Given: 整形しないサーバー
+        let (mut client, received) = fake(echo());
+        // When: 整形する
+        let formatted = client.format(&doc(), "x", 4, true, LONG);
+        // Then: 内容はそのままで、要求は送らない
+        assert_eq!(formatted, Ok("x".to_string()));
+        assert!(!all_received(&mut client, &received).contains(&"textDocument/formatting".to_string()));
+    }
+
+    #[test]
+    fn refused_formatting_returns_servers_message() {
+        // Given: 整形を断るサーバー
+        let (mut client, _) = fake(formatter(|_| Err("syntax error".into())));
+        // When: 整形する
+        let formatted = client.format(&doc(), "x", 4, true, LONG);
+        // Then: そのメッセージが返る
+        assert_eq!(formatted, Err(FormatError::Failed("syntax error".into())));
+    }
+
+    #[test]
+    fn formatting_not_answered_in_time_is_late() {
+        // Given: 整形の要求に答えないサーバー
+        let mut answers = formatter(|_| Ok(Value::Null));
+        let silent: Handler = Box::new(move |m| match m {
+            Message::Request(r) if r.method == "textDocument/formatting" => vec![],
+            _ => answers(m),
+        });
+        let (mut client, _) = fake(silent);
+        // When: 短く待って整形する
+        let formatted = client.format(&doc(), "x", 4, true, SHORT);
+        // Then: 間に合わなかったと返る
+        assert_eq!(formatted, Err(FormatError::Unavailable(Unavailable::Late)));
+    }
     #[test]
     fn saving_is_told_to_server_that_asks_for_it() {
         // Given: 保存の通知を求めるサーバーに、問い合わせた文書

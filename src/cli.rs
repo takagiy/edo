@@ -193,7 +193,7 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages,
                 })
                 .collect();
             // The CLI runs no language servers; `edo mcp` keeps them running between writes.
-            match command::write(&langs, &reqs, &mut |_| serde_json::Map::new()) {
+            match command::write(&langs, &reqs, &mut ()) {
                 Ok(reports) => {
                     let code = if reports.iter().any(|r| r["ok"] == false) { 1 } else { 0 };
                     (crate::report(&reports.into()), code)

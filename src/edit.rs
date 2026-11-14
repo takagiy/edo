@@ -190,12 +190,12 @@ fn leading_ws(line: &str) -> &str {
     &line[..line.len() - line.trim_start_matches([' ', '\t']).len()]
 }
 
-fn indents<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+pub fn indents<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
     lines.filter(|l| !l.trim().is_empty()).map(leading_ws).collect()
 }
 
 /// The indentation of one level: a tab, or the most common step between consecutive indents.
-fn indent_unit(indents: &[&str]) -> Option<String> {
+pub fn indent_unit(indents: &[&str]) -> Option<String> {
     let tabs = indents.iter().filter(|i| i.starts_with('\t')).count();
     if tabs > indents.iter().filter(|i| i.starts_with(' ')).count() {
         return Some("\t".into());
