@@ -134,13 +134,13 @@ pub fn find(src: &str, leaves: &[Leaf], scope: Range<usize>, before: &str) -> Fo
         leaves.iter().filter(|l| l.skip == Skip::Always).map(|l| &src[l.range.clone()]).collect();
     optional.sort();
     optional.dedup();
-    let leaves: Vec<&Leaf> =
-        leaves.iter().filter(|l| scope.start <= l.range.start && l.range.end <= scope.end).collect();
+    let leaves: Vec<&Leaf> = leaves.iter().filter(|l| l.range.start < scope.end && scope.start < l.range.end).collect();
     let m = Matcher {
         src,
         leaves: &leaves,
         before,
         optional,
+        limit: scope.end,
         start: Cell::new(0),
         best: Cell::new(None),
         failed: Default::default(),
@@ -149,7 +149,7 @@ pub fn find(src: &str, leaves: &[Leaf], scope: Range<usize>, before: &str) -> Fo
     // always from where the last match ended so that matches do not overlap.
     let mut found: Vec<Range<usize>> = vec![];
     for i in 0..leaves.len() {
-        while let Some(range) = m.start_at(i, found.last().map_or(0, |f| f.end)) {
+        while let Some(range) = m.start_at(i, found.last().map_or(scope.start, |f| f.end)) {
             found.push(range);
         }
     }
@@ -214,6 +214,7 @@ struct Matcher<'a> {
     before: &'a str,
     /// Texts of optional leaves in the file; `before` may contain them where the file does not.
     optional: Vec<&'a str>,
+    limit: usize,
     /// Start of the current attempt and the furthest failed attempt so far.
     start: Cell<usize>,
     best: Cell<Option<Progress>>,
@@ -234,7 +235,7 @@ impl Matcher<'_> {
         let text = &self.src[range.clone()];
         let splits_word = |k: usize, c: char| text[..k].chars().next_back().is_some_and(is_word) && is_word(c);
         let starts = text.char_indices().filter(|&(k, c)| k == 0 || !(c.is_whitespace() || splits_word(k, c)));
-        starts.map(|(k, _)| range.start + k).filter(|&start| start >= from).find_map(|start| {
+        starts.map(|(k, _)| range.start + k).filter(|&start| from <= start && start < self.limit).find_map(|start| {
             self.start.set(start);
             Some(start..self.at(i, 0, None)?)
         })
@@ -243,6 +244,9 @@ impl Matcher<'_> {
     /// Matches the rest of `before` from byte `b` against leaves from index `i`.
     /// `end` is where the match so far ends in the file; returns the final end.
     fn at(&self, i: usize, b: usize, end: Option<usize>) -> Option<usize> {
+        if end.is_some_and(|end| end > self.limit) {
+            return None;
+        }
         // Once started, whether the rest matches depends only on (leaf, position in before);
         // optional leaves reach the same state by several paths, so remember the dead ends.
         let state = (i, b);
@@ -314,7 +318,8 @@ impl Matcher<'_> {
                 let tail = rest.trim_end();
                 let next = text.get(tail.len()..)?.chars().next()?;
                 let splits_word = ends_with_word(tail) && is_word(next);
-                (text.starts_with(tail) && !splits_word).then_some(leaf.range.end - text.len() + tail.len())
+                let end = leaf.range.end - text.len() + tail.len();
+                (end <= self.limit && text.starts_with(tail) && !splits_word).then_some(end)
             })
     }
 }
@@ -581,6 +586,84 @@ mod tests {
         let found = find(src, &leaves, 16..src.len(), "x();").matches;
         // Then: スコープの中の一致だけが返る
         assert_eq!(found, vec![25..29]);
+    }
+
+    #[test]
+    fn scoped_comment_matches_without_its_trailing_newline() {
+        // Given: 葉の末尾に改行を含む通常コメントと doc コメント
+        let lang = rust("(line_comment) @match.collapse");
+        for src in ["// hello world\nfn a() {}\n", "/// hello world\nfn a() {}\n"] {
+            let tree = lang.parser().parse(src, None).unwrap();
+            let leaves = leaves(&lang, &tree, src);
+            let scope = crate::scope::line_span(src, 1, 1).unwrap();
+            // When: 改行を除く先頭行の中でコメントの一部を照合する
+            let found = find(src, &leaves, scope, "hello").matches;
+            // Then: コメント内の文字に一致する
+            let start = src.find("hello").unwrap();
+            assert_eq!(found, vec![start..start + "hello".len()]);
+        }
+    }
+
+    #[test]
+    fn scoped_multiline_string_matches_its_middle_and_last_lines() {
+        // Given: 複数行を 1 つの葉で持つ文字列
+        let lang = rust("");
+        let src = "fn a() { let s = \"first\nmiddle\nlast\"; }\n";
+        let tree = lang.parser().parse(src, None).unwrap();
+        let leaves = leaves(&lang, &tree, src);
+        for (line, before) in [(2, "middle"), (3, "last")] {
+            let scope = crate::scope::line_span(src, line, line).unwrap();
+            // When: 文字列の中間行と最終行のスコープ内で照合する
+            let found = find(src, &leaves, scope, before).matches;
+            // Then: その行の文字に一致する
+            let start = src.find(before).unwrap();
+            assert_eq!(found, vec![start..start + before.len()]);
+        }
+    }
+
+    #[test]
+    fn scoped_partial_leaf_never_matches_outside_scope() {
+        // Given: 複数行の文字列の中間行だけを指すスコープ
+        let lang = rust("");
+        let src = "fn a() { let s = \"first\nmiddle\nlast\"; }\n";
+        let tree = lang.parser().parse(src, None).unwrap();
+        let leaves = leaves(&lang, &tree, src);
+        let scope = crate::scope::line_span(src, 2, 2).unwrap();
+        for before in ["first", "last", "middle\nlast", "middle\nlast\";"] {
+            // When: スコープの前後や、終わりを越す文字を照合する
+            let found = find(src, &leaves, scope.clone(), before).matches;
+            // Then: スコープ外には一致しない
+            assert!(found.is_empty(), "{before:?}: {found:?}");
+        }
+    }
+
+    #[test]
+    fn scope_edges_do_not_split_identifier_words() {
+        // Given: コメントの foobar の途中で始まるか終わるスコープ
+        let lang = rust("(line_comment) @match.collapse");
+        let src = "// foobar\n";
+        let tree = lang.parser().parse(src, None).unwrap();
+        let leaves = leaves(&lang, &tree, src);
+        for (scope, before) in [(3..6, "foo"), (6..9, "bar")] {
+            // When: スコープの境界で単語を切る before を照合する
+            let found = find(src, &leaves, scope, before).matches;
+            // Then: 元の葉の単語の境界を守り、一致しない
+            assert!(found.is_empty(), "{before:?}: {found:?}");
+        }
+    }
+
+    #[test]
+    fn scope_bound_rejection_still_allows_an_in_scope_partial_match() {
+        // Given: 葉は改行を含むがスコープは含まないコメントと、末尾空白のある before
+        let lang = rust("(line_comment) @match.collapse");
+        let src = "// hello world\n";
+        let tree = lang.parser().parse(src, None).unwrap();
+        let leaves = leaves(&lang, &tree, src);
+        let scope = crate::scope::line_span(src, 1, 1).unwrap();
+        // When: 葉全体なら改行まで消費してしまう before を照合する
+        let found = find(src, &leaves, scope.clone(), "// hello world ").matches;
+        // Then: 改行を含めない部分一致でスコープの終わりまで一致する
+        assert_eq!(found, vec![scope]);
     }
 
     #[test]

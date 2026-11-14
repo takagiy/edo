@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::Error;
@@ -144,7 +145,9 @@ impl Cache {
         let io = |e: std::io::Error| Error::new("io", format!("{}: {e}", home.display()));
         std::fs::create_dir_all(home).map_err(io)?;
         let text = toml::to_string(self).map_err(|e| Error::new("cache", e.to_string()))?;
-        std::fs::write(home.join(CACHE_FILE), text).map_err(io)
+        let mut file = tempfile::NamedTempFile::new_in(home).map_err(io)?;
+        file.write_all(text.as_bytes()).map_err(io)?;
+        file.persist(home.join(CACHE_FILE)).map(|_| ()).map_err(|e| io(e.error))
     }
 }
 
@@ -305,12 +308,12 @@ pub fn remove(home: &Path, spec: &str) -> Value {
 /// Drops a package from the cache and deletes its directory.
 fn forget(home: &Path, p: &Installed) -> Result<(), Error> {
     let mut cache = Cache::load(home)?;
-    cache.packages.retain(|c| !(c.registry == p.registry && c.name == p.name));
-    cache.save(home)?;
     match std::fs::remove_dir_all(&p.dir) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Error::new("io", e.to_string())),
-        _ => Ok(()),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(Error::new("io", e.to_string())),
+        _ => {}
     }
+    cache.packages.retain(|c| !(c.registry == p.registry && c.name == p.name));
+    cache.save(home)
 }
 
 /// Builtin languages plus the installed ones, which win on shared extensions.
@@ -563,6 +566,23 @@ mod tests {
     }
 
     #[test]
+    fn cache_replacement_preserves_previous_file_contents() {
+        // Given: 空のキャッシュと、そのファイルを参照する別の名前
+        let home = tempfile::tempdir().unwrap();
+        Cache::default().save(home.path()).unwrap();
+        let path = home.path().join(CACHE_FILE);
+        let before = std::fs::read(&path).unwrap();
+        let previous = home.path().join("previous-cache.toml");
+        std::fs::hard_link(&path, &previous).unwrap();
+        let updated = Cache { registries: vec![KnownRegistry::from_id(DEFAULT_REGISTRY).unwrap()], packages: vec![] };
+        // When: キャッシュを更新する
+        updated.save(home.path()).unwrap();
+        // Then: 現在のキャッシュだけが置き換わり、更新前のファイルの内容は変わらない
+        assert_eq!(std::fs::read(previous).unwrap(), before);
+        assert_eq!(Cache::load(home.path()).unwrap(), updated);
+    }
+
+    #[test]
     fn registry_used_for_install_becomes_known_with_its_packages() {
         // Given: 2 つのパッケージを持つレジストリ
         let repo = langs_repo();
@@ -685,6 +705,67 @@ mod tests {
         // When: 削除する
         remove(home.path(), "myrust");
         // Then: edo-cache.toml から消える
+        assert!(Cache::load(home.path()).unwrap().packages.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_package_removal_keeps_record_for_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // Given: インストール済みパッケージのファイルが、削除を許さない形で開かれている
+        let repo = langs_repo();
+        let home = tempfile::tempdir().unwrap();
+        install(home.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
+        let path = home.path().join("packages/github.com/foo/langs/myrust/edo-package.toml");
+        let locked = std::fs::OpenOptions::new().read(true).share_mode(0).open(path).unwrap();
+        // When: パッケージを削除する
+        let report = remove(home.path(), "myrust");
+        // Then: 失敗しても記録は残り、ファイルを閉じれば再試行で削除できる
+        assert_eq!(report["error"], "io", "{report}");
+        assert_eq!(Cache::load(home.path()).unwrap().packages.len(), 1);
+        drop(locked);
+        let report = remove(home.path(), "myrust");
+        assert_eq!(report["ok"], true, "{report}");
+        assert!(Cache::load(home.path()).unwrap().packages.is_empty());
+    }
+
+    #[test]
+    fn package_without_directory_can_be_removed() {
+        // Given: 記録はあるがディレクトリがなくなったパッケージ
+        let repo = langs_repo();
+        let home = tempfile::tempdir().unwrap();
+        install(home.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
+        std::fs::remove_dir_all(home.path().join("packages/github.com/foo/langs/myrust")).unwrap();
+        // When: パッケージを削除する
+        let report = remove(home.path(), "myrust");
+        // Then: 成功して記録も消える
+        assert_eq!(report["ok"], true, "{report}");
+        assert!(Cache::load(home.path()).unwrap().packages.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_cache_save_after_deletion_keeps_record_for_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // Given: インストール済みパッケージと、読み取りだけを共有して開いたキャッシュ
+        let repo = langs_repo();
+        let home = tempfile::tempdir().unwrap();
+        install(home.path(), "foo/langs:myrust", &local(vec![("github.com/foo/langs", &repo)]));
+        let path = home.path().join(CACHE_FILE);
+        let before = std::fs::read(&path).unwrap();
+        let locked = std::fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        // When: ディレクトリの削除後にキャッシュの保存が失敗する
+        let report = remove(home.path(), "myrust");
+        // Then: 更新前の記録は壊れず、ファイルを閉じればディレクトリがなくても再試行できる
+        assert_eq!(report["error"], "io", "{report}");
+        assert!(!home.path().join("packages/github.com/foo/langs/myrust").exists());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(Cache::load(home.path()).unwrap().packages.len(), 1);
+        drop(locked);
+        let report = remove(home.path(), "myrust");
+        assert_eq!(report["ok"], true, "{report}");
         assert!(Cache::load(home.path()).unwrap().packages.is_empty());
     }
 

@@ -149,7 +149,12 @@ impl Servers {
             if pending.format && client.is_ready() {
                 pending.format = false;
                 let (tab_size, spaces) = indentation(&pending.text);
-                match client.format(&path, &pending.text, tab_size, spaces, WAIT) {
+                let found = client.format(&path, &pending.text, tab_size, spaces, WAIT);
+                if std::fs::read_to_string(&path).ok().as_deref() != Some(pending.text.as_str()) {
+                    self.pending.remove(&path);
+                    continue;
+                }
+                match found {
                     Ok(text) if text != pending.text && std::fs::write(&path, &text).is_ok() => {
                         client.saved(&path, &text);
                         let hunks = crate::diagnostic::hunks(&pending.text, &text);
@@ -729,6 +734,59 @@ mod tests {
         assert_eq!((news, rewritten), (None, vec![]));
     }
 
+    #[test]
+    fn file_changed_or_removed_while_formatting_is_left_alone() {
+        use lsp_server::{Message, Response};
+        for removed in [false, true] {
+            // Given: 整形の応答までに、外で変更または削除されるファイル
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.rs");
+            std::fs::write(&path, "fn a() {}\n").unwrap();
+            let changed = path.clone();
+            let (client_reads, server_writes) = std::io::pipe().unwrap();
+            let (server_reads, client_writes) = std::io::pipe().unwrap();
+            std::thread::spawn(move || {
+                let (mut reader, mut writer) = (std::io::BufReader::new(server_reads), server_writes);
+                while let Ok(Some(message)) = Message::read(&mut reader) {
+                    let Message::Request(r) = message else { continue };
+                    let result = if r.method == "initialize" {
+                        json!({"capabilities": {"documentFormattingProvider": true}})
+                    } else {
+                        if removed {
+                            std::fs::remove_file(&changed).unwrap();
+                        } else {
+                            std::fs::write(&changed, "fn b() {}\n").unwrap();
+                        }
+                        let at = json!({"line": 0, "character": 0});
+                        json!([{"range": {"start": at, "end": at}, "newText": "// formatted\n"}])
+                    };
+                    if Message::from(Response::new_ok(r.id, result)).write(&mut writer).is_err() {
+                        return;
+                    }
+                }
+            });
+            let mut client = Client::connect(std::io::BufReader::new(client_reads), client_writes, dir.path(), "rust");
+            assert!(client.add_folder(dir.path(), WAIT).unwrap());
+            let langs = Languages::builtin();
+            let lang = langs.for_path(&path).unwrap();
+            let written = Written { lang, path: &path, before: "", after: "fn a() {}\n", hunks: &[], formatted: &[] };
+            let mut servers = Servers::default();
+            servers.clients.push((lang.name.clone(), client));
+            servers
+                .pending
+                .insert(path.clone(), Pending { format: true, before: Some(vec![]), ..Pending::new(&written) });
+            // When: 整形の応答を待ってから、知らせを求める
+            let found = servers.news(&langs);
+            // Then: 外の変更を上書きせず、予約も整形や診断の報告も残さない
+            if removed {
+                assert!(!path.exists());
+            } else {
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn b() {}\n");
+            }
+            assert_eq!(found, (None, vec![]));
+            assert!(servers.pending.is_empty());
+        }
+    }
     #[test]
     fn errors_a_write_added_that_came_after_it_are_news_once() {
         // Given: 保存されるとエラー saved を送るサーバーで書いたファイル

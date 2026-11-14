@@ -12,6 +12,9 @@
 - [x] 書き換える前の settings.json は `.bak` に残る
 - [x] `--remove` で edo の hook が消え、ほかの hook は残る
 - [x] `--remove` で MCP は `claude mcp remove --scope user` で外れる
+- [x] `--remove` で MCP の削除に失敗したらエラーを返し、hook を変更しない
+- [x] インストール前の既存 MCP 登録の削除に失敗しても、追加が成功すれば hook を入れる
+- [x] MCP の追加に失敗したらエラーを返し、hook を変更しない
 
 ## Codex
 

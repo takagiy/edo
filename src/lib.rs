@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 /// Files a glob matched but edo has no language package for, counted by extension.
 pub type Skipped = BTreeMap<String, usize>;
 
-/// Text of a report for the agent: MISON, which spends fewer tokens than JSON on the same data.
+/// Text of a report for the agent: MISON, omitting internal `ok` flags; error and result fields show the outcome.
 pub fn report(v: &Value) -> String {
     mison::to_string(&Mison(v))
 }
@@ -41,7 +41,9 @@ impl mison::Encode for Mison<'_> {
             Value::Number(n) => w.literal(&n.to_string()),
             Value::String(s) => w.string(s),
             Value::Array(xs) => w.seq(height(self.0), xs.len(), |s| xs.iter().for_each(|x| s.element(&Mison(x)))),
-            Value::Object(m) => w.record(|r| m.iter().for_each(|(k, v)| r.field(k, &Mison(v)))),
+            Value::Object(m) => {
+                w.record(|r| m.iter().filter(|(k, _)| k.as_str() != "ok").for_each(|(k, v)| r.field(k, &Mison(v))))
+            }
         }
     }
 }
@@ -99,10 +101,23 @@ mod tests {
         ]});
         // When: 報告を書く
         // Then: 各レコードが丸括弧で囲まれ、, で区切られる
-        assert_eq!(
-            report(&v),
-            r#"ok=false error=ambiguous matches=(range=2-2 parents="fn a()"),(range=5-5 parents="fn b()")"#
-        );
+        assert_eq!(report(&v), r#"error=ambiguous matches=(range=2-2 parents="fn a()"),(range=5-5 parents="fn b()")"#);
+    }
+
+    #[test]
+    fn report_omits_ok_without_changing_values() {
+        // Given: 成功・失敗と、成功だが installed は false の報告
+        let value = json!({"reports": [
+            {"ok": true, "replaced": ["1-1"]},
+            {"ok": false, "error": "not_found"},
+            {"ok": true, "installed": false}
+        ]});
+        let before = value.clone();
+        // When: 配列内の報告を MISON にする
+        let text = report(&value);
+        // Then: ok だけを省略し、内部の値と installed=false は残る
+        assert_eq!(text, "reports=(replaced=1-1),(error=not_found),(installed=false)");
+        assert_eq!(value, before);
     }
 
     #[test]

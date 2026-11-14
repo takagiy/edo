@@ -280,7 +280,7 @@ impl Server {
         match command::write(&self.langs, &reqs, &mut check) {
             Ok(mut reports) => {
                 for r in reports.iter_mut().filter(|r| r["ok"] == true) {
-                    let file = r["file"].as_str().unwrap_or_default().to_string();
+                    let file = r["file"].as_str().unwrap_or(reqs[0].path).to_string();
                     if std::path::absolute(&file).is_ok_and(|f| stale.contains(&f)) {
                         r["warnings"]["stale"] = json!("modified since last read");
                     }
@@ -430,9 +430,10 @@ mod tests {
         let (_dir, path) = file("fn a() { x(); }\n");
         let client = connect().await;
         // When: write を呼ぶ
-        let (text, _) = tool(&client, "write", json!({"path": path, "before": "x();", "after": "y();"})).await;
-        // Then: CLI と同じ MISON の報告が返る
-        assert_eq!(text, format!("ok=true file={path} replaced=1-1"));
+        let (text, is_error) = tool(&client, "write", json!({"path": path, "before": "x();", "after": "y();"})).await;
+        // Then: CLI と同じく ok を省いた MISON の報告が返り、成功として扱われる
+        assert_eq!(text, "replaced=1-1");
+        assert!(!is_error);
     }
 
     #[tokio::test]
@@ -443,6 +444,23 @@ mod tests {
         let (_, is_error) = tool(&client, "read", json!({"path": "missing.rs"})).await;
         // Then: isError が立つ
         assert!(is_error);
+    }
+
+    #[tokio::test]
+    async fn write_with_failing_item_reports_both_without_ok() {
+        // Given: 呼び出しがあるファイルと MCP クライアント
+        let (_dir, path) = file("fn a() { x(); }\n");
+        let client = connect().await;
+        // When: 一致する編集と一致しない編集を一緒に渡す
+        let args = json!({
+            "path": path, "before": "x();", "after": "y();",
+            "path_0": path, "before_0": "missing();", "after_0": "z();"
+        });
+        let (text, is_error) = tool(&client, "write", args).await;
+        // Then: ok を省いても成功と失敗が分かり、全体は失敗として扱われる
+        assert!(is_error, "{text}");
+        assert!(text.contains("replaced=1-1") && text.contains("error=not_found") && text.contains("item=2"), "{text}");
+        assert!(!text.contains("ok="), "{text}");
     }
 
     #[tokio::test]

@@ -62,8 +62,17 @@ fn lines_of(text: &str, range: &Range<usize>) -> Range<usize> {
     first..through.strip_suffix('\n').unwrap_or(through).matches('\n').count() + 2
 }
 
-pub fn edit(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Place) -> Outcome {
+/// One replacement in the original file, including line expansion and seam cleanup.
+pub(crate) struct Prepared {
+    pub range: Range<usize>,
+    pub after: String,
+    pub lines: (usize, usize),
+    pub hunk: Hunk,
+}
+
+pub(crate) fn prepare(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Place) -> Prepared {
     // A last line without a newline gets one while editing, so that every line ends in one; it goes again after.
+    let original_len = src.len();
     let nl = newline(src);
     let unterminated = !src.is_empty() && !src.ends_with('\n');
     let src = &if unterminated { format!("{src}{nl}") } else { src.to_string() };
@@ -76,7 +85,16 @@ pub fn edit(lang: &Language, src: &str, range: Range<usize>, after: &str, place:
     if unterminated && text.ends_with(nl) {
         text.truncate(text.len() - nl.len());
     }
-    Outcome { text, lines, hunk }
+    let range = replaced.start.min(original_len)..replaced.end.min(original_len);
+    let end = text.len() - (original_len - range.end);
+    Prepared { after: text[range.start..end].to_string(), range, lines, hunk }
+}
+
+pub fn edit(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Place) -> Outcome {
+    let prepared = prepare(lang, src, range, after, place);
+    let mut text = src.to_string();
+    text.replace_range(prepared.range, &prepared.after);
+    Outcome { text, lines: prepared.lines, hunk: prepared.hunk }
 }
 
 /// The newline that lines written into `src` end with: CRLF if the file has any.
@@ -127,15 +145,24 @@ fn apply(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Pl
     // Embed once with plain reindenting, then parse the whole file to find lines inside literals.
     let (draft, at) = build(&[]);
     let protected = literal_lines(lang, &draft, at.start, draft[at.clone()].split('\n').count());
-    let (text, at) = build(&protected);
-    let replaced = lines.unwrap_or(range);
-    (drop_seam_duplicates(lang, text, at), replaced)
+    let (mut text, at) = build(&protected);
+    let mut replaced = lines.unwrap_or(range);
+    let growth = text.len() as isize - src.len() as isize;
+    for drop in seam_duplicates(lang, &text, at.clone()) {
+        if drop.end <= at.start {
+            replaced.start = replaced.start.min(drop.start);
+        } else {
+            replaced.end = replaced.end.max((drop.end as isize - growth) as usize);
+        }
+        text.replace_range(drop, "");
+    }
+    (text, replaced)
 }
 
 /// Removes the file's copy of an optional leaf (such as `;`) that `after` already brings to a seam.
-fn drop_seam_duplicates(lang: &Language, mut text: String, inserted: Range<usize>) -> String {
-    let tree = lang.parser().parse(&text, None).expect("parse");
-    let leaves = crate::matcher::leaves(lang, &tree, &text);
+fn seam_duplicates(lang: &Language, text: &str, inserted: Range<usize>) -> Vec<Range<usize>> {
+    let tree = lang.parser().parse(text, None).expect("parse");
+    let leaves = crate::matcher::leaves(lang, &tree, text);
     let inside = |l: &&crate::matcher::Leaf| inserted.start <= l.range.start && l.range.end <= inserted.end;
     let twins = |a: &crate::matcher::Leaf, b: &crate::matcher::Leaf| {
         a.skip == Skip::Always
@@ -152,10 +179,7 @@ fn drop_seam_duplicates(lang: &Language, mut text: String, inserted: Range<usize
     if let Some((a, _)) = start_seam.filter(|(a, b)| twins(a, b)) {
         drops.push(a.range.clone());
     }
-    for r in drops {
-        text.replace_range(r, "");
-    }
-    text
+    drops
 }
 
 /// The range widened to its whole lines, including the newline, when only whitespace surrounds it on them.

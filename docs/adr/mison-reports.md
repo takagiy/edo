@@ -12,7 +12,7 @@ edo の CLI と MCP は、write の結果やエラーを JSON で返していた
 - 行範囲は `"2-5"` のように `scope` と同じ書き方にする。MISON の範囲の書き方とも同じなので、エージェントは報告の範囲をそのまま `scope` に渡せる。
 - hook の答えは JSON のまま残す。読むのはハーネスで、ハーネスが JSON を求めるため。
 
-報告は次のようになる。複数の報告は 1 行に 1 つずつ並ぶ。
+以下は採用時の報告例。複数の報告は 1 行に 1 つずつ並ぶ。現在の `ok` の省略については、[報告の成否](report-status.md) を参照。
 
 ```
 ok=false file=a.rs error=ambiguous matches=(range=2-2 parents="fn a()" signature="x();"),(range=5-5 parents="fn b()" signature="x();")

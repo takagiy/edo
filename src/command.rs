@@ -1,6 +1,5 @@
 use std::collections::HashSet;
-use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::diagnostic::{Hunk, new_errors};
 use crate::edit::{self, Place};
@@ -139,8 +138,15 @@ pub fn read(langs: &Languages, items: &[ReadItem]) -> Read {
 /// Writes every request, with a panic reported as an `internal` error. All requests are matched against the
 /// files as they were before the call. A request that is not found, is ambiguous or overlaps another is
 /// reported and written nowhere, even in the files a glob found it in; the others are written.
+/// When every request names the same non-glob path, reports omit `file`.
 pub fn write(langs: &Languages, reqs: &[WriteRequest], check: &mut dyn Check) -> Result<Vec<Value>, Error> {
-    guarded(|| Ok(write_requests(langs, reqs, check)))
+    let mut reports = guarded(|| Ok(write_requests(langs, reqs, check)))?;
+    if reqs.first().is_some_and(|first| !is_glob(first.path) && reqs.iter().all(|r| r.path == first.path)) {
+        for report in &mut reports {
+            report.as_object_mut().unwrap().remove("file");
+        }
+    }
+    Ok(reports)
 }
 
 /// Runs `f`, turning a panic into an `internal` error so that a bug answers the agent instead of leaving
@@ -279,6 +285,18 @@ impl Check for () {
     }
 }
 
+/// The file `path` names, the same however the path is spelled: the canonical path of the file, or, for a file
+/// to be created, of the directory it goes in. Hard links to one file stay apart.
+fn identity(path: &str) -> PathBuf {
+    let path = Path::new(path);
+    let in_dir = || {
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        std::fs::canonicalize(dir).map(|d| d.join(path.file_name().unwrap_or_default()))
+    };
+    std::fs::canonicalize(path)
+        .or_else(|_| in_dir())
+        .unwrap_or_else(|_| std::path::absolute(path).unwrap_or(path.into()))
+}
 fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: &mut dyn Check) -> Vec<Value> {
     let several = reqs.len() > 1;
     let mut plans: Vec<Plan> = vec![];
@@ -300,9 +318,10 @@ fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: &mut dyn Chec
         });
         let mut found = false;
         for file in files {
-            let at = match plans.iter().position(|p| p.path == file) {
+            let id = identity(&file);
+            let at = match plans.iter().position(|p| p.id == id) {
                 Some(at) => Ok(at),
-                None => Plan::open(langs, file, req).map(|p| {
+                None => Plan::open(langs, file, id, req).map(|p| {
                     plans.push(p);
                     plans.len() - 1
                 }),
@@ -349,31 +368,32 @@ fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: &mut dyn Chec
     reports
 }
 
-/// One place in a file to put a request's `after`.
-struct Target<'a> {
-    range: Range<usize>,
-    after: &'a str,
-    place: Place,
-    /// The request's index.
+/// One prepared replacement and the request that owns it.
+struct Target {
+    edit: edit::Prepared,
     item: usize,
 }
 
 /// A file to write: its text before the call and the targets the requests found in it.
 struct Plan<'a> {
+    /// The path as first given, for the report.
     path: String,
+    /// The file the path names, however it is spelled (see `identity`).
+    id: PathBuf,
     src: Source<'a>,
-    targets: Vec<Target<'a>>,
+    targets: Vec<Target>,
 }
 
 impl<'a> Plan<'a> {
-    /// Opens `path` for `req`; writing a whole file that does not exist yet is writing over an empty one.
-    fn open(langs: &'a Languages, path: String, req: &WriteRequest) -> Result<Plan<'a>, Value> {
+    /// Opens `path`, the file `id`, for `req`; writing a whole file that does not exist yet is writing over an empty
+    /// one.
+    fn open(langs: &'a Languages, path: String, id: PathBuf, req: &WriteRequest) -> Result<Plan<'a>, Value> {
         let file = Path::new(&path);
         let creating = !file.exists() && req.scope.is_none() && req.before.is_none();
         let src = language(langs, file)
             .and_then(|lang| Ok(Source::new(lang, if creating { String::new() } else { read_text(file)? })))
             .map_err(|e| failure(&path, e))?;
-        Ok(Plan { path, src, targets: vec![] })
+        Ok(Plan { path, id, src, targets: vec![] })
     }
 
     /// Adds the targets `req` finds in the file, or reports why it found none, or too many.
@@ -414,7 +434,7 @@ impl<'a> Plan<'a> {
             let matches: Vec<Value> = hits.iter().map(|t| candidate(src, t)).collect();
             return Err(json!({"ok": false, "file": path, "error": "ambiguous", "matches": matches}));
         }
-        let target = |h: Hit| Target { range: h.range, after: req.after, place: req.place, item };
+        let target = |h: Hit| Target { edit: edit::prepare(src.lang, &src.text, h.range, req.after, req.place), item };
         self.targets.extend(hits.into_iter().map(target));
         Ok(())
     }
@@ -422,20 +442,20 @@ impl<'a> Plan<'a> {
     /// Reports each target that writes over text an earlier one writes, or at the same point, with the requests
     /// of both, sorting the targets by place.
     fn overlaps(&mut self, several: bool) -> Vec<(Value, [usize; 2])> {
-        self.targets.sort_by_key(|t| t.range.start);
+        self.targets.sort_by_key(|t| t.edit.range.start);
         let mut found = vec![];
         // The target reaching furthest so far, which any later target starting before its end overlaps.
         let mut reach: Option<&Target> = None;
         for t in &self.targets {
             match reach {
-                Some(r) if t.range.start < r.range.end.max(r.range.start + 1) => {
+                Some(r) if t.edit.range.start < r.edit.range.end.max(r.edit.range.start + 1) => {
                     let message = format!("items {} and {} write over the same text", r.item + 1, t.item + 1);
                     let mut report = json!({"ok": false, "file": self.path, "error": "overlap", "message": message});
                     if several {
                         report["item"] = (t.item + 1).into();
                     }
                     found.push((report, [r.item, t.item]));
-                    if t.range.end > r.range.end {
+                    if t.edit.range.end > r.edit.range.end {
                         reach = Some(t);
                     }
                 }
@@ -449,25 +469,21 @@ impl<'a> Plan<'a> {
     /// each now holds in the order of the requests, with the lines formatting changed.
     fn write(&self, check: &mut dyn Check) -> Result<Value, Error> {
         let (src, path, file) = (&self.src, &self.path, Path::new(&self.path));
-        // Apply from the last target so earlier ranges stay valid, then shift each one's lines by the edits before it.
+        // Prepared ranges refer to the original file; applying from the end keeps them valid.
         let mut text = src.text.clone();
-        let mut done: Vec<(edit::Outcome, isize)> = vec![];
         for t in self.targets.iter().rev() {
-            let out = edit::edit(src.lang, &text, t.range.clone(), t.after, t.place);
-            let grown = out.text.matches('\n').count() as isize - text.matches('\n').count() as isize;
-            text = out.text.clone();
-            done.push((out, grown));
+            text.replace_range(t.edit.range.clone(), &t.edit.after);
         }
-        done.reverse();
-        // Each edit's lines after it are counted in a text without the edits before it, so shift them past those.
         let mut shift = 0;
         let mut replaced = vec![];
         let mut hunks = vec![];
-        for (t, (out, grown)) in self.targets.iter().zip(done) {
+        for t in &self.targets {
+            let out = &t.edit;
             let at = |line: usize| (line as isize + shift) as usize;
             replaced.push((t.item, (at(out.lines.0), at(out.lines.1))));
-            hunks.push(Hunk { old: out.hunk.old, new: at(out.hunk.new.start)..at(out.hunk.new.end) });
-            shift += grown;
+            hunks.push(Hunk { old: out.hunk.old.clone(), new: at(out.hunk.new.start)..at(out.hunk.new.end) });
+            shift +=
+                out.after.matches('\n').count() as isize - src.text[out.range.clone()].matches('\n').count() as isize;
         }
         let written = |after, formatted| Written {
             lang: src.lang,
@@ -480,7 +496,7 @@ impl<'a> Plan<'a> {
         let mut warnings = Map::new();
         let unformatted = text;
         let text = check.format(&written(&unformatted, &[])).unwrap_or_else(|message| {
-            warnings.insert("format".into(), message.into());
+            warnings.insert("format_failed".into(), message.into());
             unformatted.clone()
         });
         let formatted = crate::diagnostic::hunks(&unformatted, &text);
@@ -520,7 +536,7 @@ fn failure(file: &str, e: Error) -> Value {
     json!({"ok": false, "file": file, "error": e.code, "message": e.message})
 }
 fn line_of(text: &str, byte: usize) -> usize {
-    text[..byte].matches('\n').count() + 1
+    text.as_bytes()[..byte].iter().filter(|&&b| b == b'\n').count() + 1
 }
 
 /// A line range as `scope` spells it, so the agent can pass it back as is.
@@ -558,14 +574,26 @@ fn candidate(src: &Source, target: &Hit) -> Value {
 type Parts<'s> = Vec<(&'s str, Option<Error>)>;
 
 /// The outline of a file, or what the parts of `scope` point at in it, with each part and why it was not
-/// found if it was not. When no part is found, an error naming every part.
+/// found if it was not. When every part fails, an error naming every part. Read line ranges stop at EOF.
 fn read_one<'s>(langs: &Languages, path: &str, scope: Option<&'s str>) -> Result<(String, Parts<'s>), Error> {
     let src = open(langs, Path::new(path))?;
     let Some(scope) = scope else {
         return Ok((view::render(&src.text, &src.defs, 0..src.text.len(), true), vec![]));
     };
+    let lines = src.text.lines().count();
     let (mut hits, mut parts) = (vec![], vec![]);
-    for (part, found) in scope::resolve_each(scope, &src.defs, &src.text) {
+    for part in scope::parts(scope, &src.defs) {
+        let found = match scope::parse_lines(part) {
+            Some((first, last)) if first > 0 && last >= first => {
+                let hits = if first > lines {
+                    vec![]
+                } else {
+                    vec![scope::Hit { range: scope::line_span(&src.text, first, last.min(lines)).unwrap(), def: None }]
+                };
+                Ok(hits)
+            }
+            _ => scope::resolve(part, &src.defs, &src.text),
+        };
         match found {
             Ok(h) => {
                 hits.extend(h);
@@ -574,7 +602,7 @@ fn read_one<'s>(langs: &Languages, path: &str, scope: Option<&'s str>) -> Result
             Err(e) => parts.push((part, Some(e))),
         }
     }
-    if hits.is_empty() {
+    if parts.iter().all(|(_, error)| error.is_some()) {
         return Err(scope::joined(parts.into_iter().filter_map(|(_, e)| e)).expect("a scope has a part"));
     }
     Ok((view::render_hits(&src.text, &src.defs, &hits), parts))
@@ -606,6 +634,108 @@ mod tests {
         let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: None }]).text;
         // Then: ボディを省略したアウトラインが返る
         assert_eq!(out, "1\tfn a() {\n3\t}\n");
+    }
+
+    #[test]
+    fn reading_range_past_end_returns_remaining_lines() {
+        // Given: 2 行の Rust のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\nfn b() {}\n")]);
+        // When: 2 行目から末尾を越える範囲を読む
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: Some("2-10000") }]);
+        // Then: エラーも警告もなく末尾まで返る
+        assert!(out.ok, "{}", out.text);
+        assert_eq!(out.text, "2\tfn b() {}\n");
+    }
+
+    #[test]
+    fn reading_range_starting_past_end_succeeds_empty() {
+        // Given: 末尾に改行がある場合とない場合の 2 行のファイル
+        for text in ["fn a() {}\nfn b() {}\n", "fn a() {}\nfn b() {}"] {
+            let dir = dir_with(&[("a.rs", text)]);
+            let path = at(&dir, "a.rs");
+            // When: 始まりが末尾を越える 1 行指定と行範囲を読む
+            for scope in ["3", "3-10000"] {
+                let out = read(&Languages::builtin(), &[ReadItem { path: &path, scope: Some(scope) }]);
+                // Then: エラーも警告もなく空で成功し、読んだファイルが返る
+                assert!(out.ok, "{}", out.text);
+                assert_eq!(out.text, "");
+                assert_eq!(out.files, std::slice::from_ref(&path));
+            }
+        }
+    }
+
+    #[test]
+    fn reading_range_in_empty_file_succeeds_empty() {
+        // Given: 空の Rust のファイル
+        let dir = dir_with(&[("a.rs", "")]);
+        let path = at(&dir, "a.rs");
+        // When: 1 行目から末尾を越える範囲を読む
+        let out = read(&Languages::builtin(), &[ReadItem { path: &path, scope: Some("1-10000") }]);
+        // Then: エラーも警告もなく空で成功する
+        assert!(out.ok, "{}", out.text);
+        assert_eq!(out.text, "");
+        assert_eq!(out.files, [path]);
+    }
+
+    #[test]
+    fn reading_comma_scope_ignores_outside_line_ranges() {
+        // Given: 関数 a のある 1 行のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
+        // When: 範囲外の行指定の間に、関数 a を指定して読む
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: Some("99, a, 20-30") }]);
+        // Then: 空の部分の警告や余分な空行を挟まず、関数 a だけが返る
+        assert!(out.ok, "{}", out.text);
+        assert_eq!(out.text, "1\tfn a() {}\n");
+    }
+
+    #[test]
+    fn reading_glob_clamps_line_range_for_each_file() {
+        // Given: 1 行と 2 行の Rust のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\nfn c() {}\n")]);
+        let (a, b) = (at(&dir, "a.rs"), at(&dir, "b.rs"));
+        // When: 一部のファイル、または全ファイルで範囲外になる行範囲を読む
+        for (scope, text) in [("2-10000", format!("{a}\n{b}\n2\tfn c() {{}}\n")), ("99", format!("{a}\n{b}\n"))] {
+            let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*.rs"), scope: Some(scope) }]);
+            // Then: ファイルごとに末尾で切り詰め、エラーも警告もなく返る
+            assert!(out.ok, "{}", out.text);
+            assert_eq!(out.text, text);
+            assert_eq!(out.files, [a.clone(), b.clone()]);
+        }
+    }
+
+    #[test]
+    fn reading_zero_or_reversed_line_range_is_error() {
+        // Given: 2 行の Rust のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\nfn b() {}\n")]);
+        // When: 0 や逆順の行範囲で読む
+        for scope in ["0", "0-2", "2-1"] {
+            let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: Some(scope) }]);
+            // Then: 入力エラーになり、読んだファイルには含まれない
+            assert!(!out.ok);
+            assert!(out.text.contains("error=out_of_range"), "{}", out.text);
+            assert!(out.files.is_empty());
+        }
+    }
+
+    #[test]
+    fn writing_range_past_end_errors_without_changing_file() {
+        // Given: 2 行の Rust のファイル
+        let text = "fn a() {}\nfn b() {}\n";
+        let dir = dir_with(&[("a.rs", text)]);
+        let path = at(&dir, "a.rs");
+        // When: 終わりだけ、または始まりも末尾を越える行範囲に書く
+        for scope in ["1-10000", "3"] {
+            let reports = write_all(&[WriteRequest {
+                path: &path,
+                scope: Some(scope),
+                after: "fn c() {}",
+                ..Default::default()
+            }]);
+            // Then: 範囲外のエラーになり、ファイルは変わらない
+            assert_eq!(reports[0]["ok"], false);
+            assert_eq!(reports[0]["error"], "out_of_range");
+            assert_eq!(content(&dir, "a.rs"), text);
+        }
     }
 
     #[test]
@@ -646,7 +776,7 @@ mod tests {
         // Then: 1 つ目の位置に、1 つ目の要素だとわかる not_found が並び、2 つ目は読まれる。全体は失敗として扱われる
         let lines: Vec<&str> = out.text.lines().collect();
         assert_eq!(lines[0], a);
-        assert!(lines[1].starts_with("ok=false error=not_found") && lines[1].ends_with("item=1"), "{}", out.text);
+        assert!(lines[1].starts_with("error=not_found") && lines[1].ends_with("item=1"), "{}", out.text);
         assert_eq!(lines[2..], [a.as_str(), "1\tfn a() {}"]);
         assert!(!out.ok);
     }
@@ -734,7 +864,7 @@ mod tests {
         let reports = write(&Languages::builtin(), &[req], &mut ()).unwrap();
         // Then: 書き込まれ、ok が報告される
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    y();\n}\n");
-        assert_eq!(reports, [serde_json::json!({"ok": true, "file": path, "replaced": ["2-2"]})]);
+        assert_eq!(reports, [serde_json::json!({"ok": true, "replaced": ["2-2"]})]);
     }
 
     fn write_in(dir: &tempfile::TempDir, req: WriteRequest) -> Vec<Value> {
@@ -877,13 +1007,60 @@ mod tests {
         let req = WriteRequest { path: &at(&dir, "a.rs"), before: Some("x();"), after: "y();", ..Default::default() };
         // When: 書く
         let reports = write(&Languages::builtin(), &[req], &mut Formatter(|_| Err("syntax error".into()))).unwrap();
-        // Then: 整形せずに書かれ、そのメッセージが警告の format に入る
+        // Then: 書き込みは成功し、整形失敗のメッセージが warnings.format_failed に入る
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    y();\n}\n");
-        assert_eq!(reports[0]["warnings"]["format"], "syntax error");
+        assert_eq!(reports[0]["ok"], true);
+        assert_eq!(reports[0]["warnings"]["format_failed"], "syntax error");
     }
     /// A replace of `before` with `after` in `path`.
     fn swap<'a>(path: &'a str, before: &'a str, after: &'a str) -> WriteRequest<'a> {
         WriteRequest { path, before: Some(before), after, ..Default::default() }
+    }
+    #[test]
+    fn alias_paths_share_one_file_plan() {
+        // Given: 同じファイルを指す通常のパスと . を含むパス
+        let dir = dir_with(&[("a.rs", "fn a() { x(); y(); }\n")]);
+        let path = at(&dir, "a.rs");
+        let alias = format!("{}/./a.rs", dir.path().to_string_lossy().replace('\\', "/"));
+        // When: 別表記を使って同じファイルの 2 か所を書き換える
+        let reports = write_all(&[swap(&path, "x();", "v();"), swap(&alias, "y();", "w();")]);
+        // Then: どちらも失われず、最初の表記で 1 ファイルとして報告する
+        assert_eq!(content(&dir, "a.rs"), "fn a() { v(); w(); }\n");
+        assert_eq!(reports, [json!({"ok": true, "file": path, "replaced": ["1-1", "1-1"]})]);
+    }
+    #[test]
+    fn same_line_replacement_and_insertion_use_original_positions() {
+        // Given: 同じ行に呼び出しが 2 つある関数
+        let dir = dir_with(&[("a.rs", "fn a() { x(); y(); }\n")]);
+        let path = at(&dir, "a.rs");
+        // When: 前の呼び出しを複数行に置換し、後ろの呼び出しの行の前に挿入する
+        let reports = write_all(&[
+            swap(&path, "x();", "v();\nw();"),
+            WriteRequest {
+                path: &path,
+                before: Some("y();"),
+                after: "fn b() {}",
+                place: Place::InsertBefore,
+                ..Default::default()
+            },
+        ]);
+        // Then: 挿入は元の行頭、置換は元の呼び出しに適用され、行番号は最終結果を指す
+        assert_eq!(content(&dir, "a.rs"), "fn b() {}\nfn a() { v();\nw(); y(); }\n");
+        assert_eq!(reports, [json!({"ok": true, "replaced": ["2-3", "1-1"]})]);
+    }
+    #[test]
+    fn ambiguous_multibyte_matches_report_candidates_without_writing() {
+        // Given: 同じ日本語が複数ある関数
+        let src = "fn a() { f(\"あ\"); g(\"あ\"); }\n";
+        let dir = dir_with(&[("a.rs", src)]);
+        // When: 複数バイトの文字で終わる範囲を書き換える
+        let reports = write_all(&[swap(&at(&dir, "a.rs"), "あ", "い")]);
+        // Then: 内部エラーではなく候補付きの ambiguous が返り、内容は変わらない
+        assert_eq!(reports[0]["error"], "ambiguous");
+        let candidates = reports[0]["matches"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|c| c["range"] == "1-1"));
+        assert_eq!(content(&dir, "a.rs"), src);
     }
 
     #[test]
@@ -895,7 +1072,7 @@ mod tests {
         let reports = write_all(&[swap(&a, "y();", "w();"), swap(&a, "x();", "v();")]);
         // Then: どちらも書かれ、replaced は渡した順に並ぶ
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    v();\n    w();\n}\n");
-        assert_eq!(reports, [json!({"ok": true, "file": a, "replaced": ["3-3", "2-2"]})]);
+        assert_eq!(reports, [json!({"ok": true, "replaced": ["3-3", "2-2"]})]);
     }
 
     #[test]
@@ -909,6 +1086,7 @@ mod tests {
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    v();\n}\n");
         let failure = reports.iter().find(|r| r["ok"] == false).expect("a failure");
         assert_eq!((&failure["error"], &failure["item"]), (&json!("not_found"), &json!(2)));
+        assert!(reports.iter().all(|r| r.get("file").is_none()));
     }
 
     #[test]
@@ -971,6 +1149,7 @@ mod tests {
         );
         // Then: ambiguous が報告され、ファイルは変わらない
         assert_eq!(reports[0]["error"], "ambiguous");
+        assert!(reports[0].get("file").is_none());
         assert_eq!(content(&dir, "a.rs"), src);
     }
 
