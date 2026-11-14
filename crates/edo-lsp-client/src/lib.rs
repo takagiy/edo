@@ -35,6 +35,8 @@ enum Event {
     Answered(RequestId, Result<Value, String>),
     /// The server says the diagnostics it gave are out of date, as after it loads the project.
     Refresh,
+    /// The server is busy, as while it loads the project, or quiescent again (`experimental/serverStatus`).
+    Busy(bool),
     /// The server registered diagnostic requests under this id, or took the registration back.
     Registered(String),
     Unregistered(String),
@@ -86,6 +88,8 @@ pub struct Client {
     pull_ids: HashSet<String>,
     /// The server formats documents.
     formats: bool,
+    /// The server said it is busy and has not said it is quiescent since; a server that never says either is not.
+    busy: bool,
     /// Diagnostic requests not answered yet: the document and version each asks about.
     asked: HashMap<RequestId, (String, i32)>,
     /// One formatting request per file, kept until its answer is used or a new input replaces it.
@@ -151,6 +155,8 @@ impl Client {
                     diagnostic: Some(DiagnosticWorkspaceClientCapabilities { refresh_support: Some(true) }),
                     ..Default::default()
                 }),
+                // rust-analyzer then says when it is busy loading the project and when it is done.
+                experimental: Some(serde_json::json!({"serverStatusNotification": true})),
                 ..Default::default()
             },
             ..Default::default()
@@ -165,6 +171,7 @@ impl Client {
             saves: None,
             pull_ids: HashSet::new(),
             formats: false,
+            busy: false,
             asked: HashMap::new(),
             formatting: HashMap::new(),
             next_id: INITIALIZE + 1,
@@ -243,6 +250,11 @@ impl Client {
                 return Err(FormatError::Unavailable(error));
             }
         };
+        // A server still loading the project, as rust-analyzer says it is first, formats without the project's
+        // settings, such as rustfmt.toml and the edition; its status comes before the answer.
+        if self.busy {
+            return Err(FormatError::Unavailable(Unavailable::Late));
+        }
         // `null` means nothing to change.
         let edits: Vec<TextEdit> = serde_json::from_value(answer.map_err(FormatError::Failed)?).unwrap_or_default();
         Ok(applied(text, edits))
@@ -391,6 +403,7 @@ impl Client {
                 let save = &capabilities["textDocumentSync"]["save"];
                 self.saves = (save == true || save.is_object()).then(|| save["includeText"] == true);
             }
+            Event::Busy(busy) => self.busy = busy,
             Event::Registered(id) => {
                 self.pull_ids.insert(id);
             }
@@ -515,6 +528,9 @@ fn events_of(message: Message, writer: &Writer) -> Vec<Event> {
                 }
                 _ => vec![],
             }
+        }
+        Message::Notification(n) if n.method == "experimental/serverStatus" => {
+            vec![Event::Busy(n.params["quiescent"] == false)]
         }
         Message::Notification(n) if n.method == "textDocument/publishDiagnostics" => {
             serde_json::from_value(n.params).map(Event::Published).into_iter().collect()
@@ -1020,6 +1036,41 @@ mod tests {
         let formatted = client.format(&doc(), "x", 4, true, LONG);
         // Then: そのメッセージが返る
         assert_eq!(formatted, Err(FormatError::Failed("syntax error".into())));
+    }
+
+    /// Like `formatter` with `insert_options`, but tells its status before each formatting answer: busy when
+    /// `quiescent` is false, as rust-analyzer is while it loads the project.
+    fn formatter_with_status(quiescent: bool) -> Handler {
+        let mut answers = formatter(insert_options);
+        Box::new(move |m| {
+            let mut out = vec![];
+            if matches!(m, Message::Request(r) if r.method == "textDocument/formatting") {
+                let params = json!({"health": "ok", "quiescent": quiescent});
+                out.push(Notification::new("experimental/serverStatus".into(), params).into());
+            }
+            out.extend(answers(m));
+            out
+        })
+    }
+
+    #[test]
+    fn formatting_answered_while_server_is_busy_is_late() {
+        // Given: プロジェクトを読み込み中（quiescent が false）と伝えてから整形に答えるサーバー
+        let (mut client, _) = fake(formatter_with_status(false));
+        // When: 整形する
+        let formatted = client.format(&doc(), "あい", 2, true, LONG);
+        // Then: その答えは使わず、間に合わなかったと返る
+        assert_eq!(formatted, Err(FormatError::Unavailable(Unavailable::Late)));
+    }
+
+    #[test]
+    fn formatting_answered_after_server_settles_is_returned() {
+        // Given: 作業を終えた（quiescent が true）と伝えてから整形に答えるサーバー
+        let (mut client, _) = fake(formatter_with_status(true));
+        // When: 整形する
+        let formatted = client.format(&doc(), "あい", 2, true, LONG);
+        // Then: 整形した内容が返る
+        assert_eq!(formatted, Ok("あ[2 spaces]い".to_string()));
     }
 
     #[test]
