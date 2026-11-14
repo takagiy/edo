@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 description = "The brokk-tree-sitter-kotlin grammar (git submodule brokk/), built against current tree-sitter-language"
 repository = "https://github.com/takagiy/edo"
-include = ["build.rs", "src/**", "brokk/LICENSE", "brokk/src/**"]
+include = ["/build.rs", "src/**", "brokk/LICENSE", "brokk/src/**"]
 
 [dependencies]
 tree-sitter-language = "0.1"

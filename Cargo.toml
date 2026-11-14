@@ -1,7 +1,18 @@
 [package]
-name = "edo"
-version = "0.1.0"
+name = "edo-mcp"
+version = "0.2.0"
 edition = "2024"
+license = "MIT"
+description = "An MCP server and CLI that agents use to read and write code by its syntax tree"
+repository = "https://github.com/takagiy/edo"
+include = ["src/**", "languages/**", "Cargo.toml"]
+
+[lib]
+name = "edo"
+
+[[bin]]
+name = "edo"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
