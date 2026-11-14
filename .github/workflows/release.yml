@@ -1,6 +1,6 @@
 name: Release
 
-# Publishes a version tag such as v0.2.0: the binaries to a GitHub release, and the crates to crates.io.
+# Publishes the crates to crates.io when a version tag such as v0.2.0 is pushed.
 on:
   push:
     tags: ["v*"]
@@ -9,7 +9,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v7
@@ -21,10 +21,6 @@ jobs:
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "edo-mcp") | .version')
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME is not v$version"; exit 1; }
       - run: mise run check
-      - run: mise run release
-      - run: gh release create "$GITHUB_REF_NAME" target/edo-*.tar.gz --generate-notes
-        env:
-          GH_TOKEN: ${{ github.token }}
       # Trusted Publishing works only for crates already on crates.io, so their first release uses the
       # CARGO_REGISTRY_TOKEN secret instead.
       - uses: rust-lang/crates-io-auth-action@v1
