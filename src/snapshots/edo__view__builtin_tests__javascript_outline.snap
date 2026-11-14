@@ -1,6 +1,5 @@
 ---
 source: src/view.rs
-assertion_line: 249
 expression: "builtin_outline(\"tests/fixtures/outline/sample.js\")"
 ---
 1	import fs from "fs";
@@ -12,7 +11,7 @@ expression: "builtin_outline(\"tests/fixtures/outline/sample.js\")"
 8	export const twice = (x) => {
 10	};
 11	
-12	const inline = (x) => ...;
+12	const inline = (x) => …;
 13	
 14	// A counter.
 15	export default class Counter {
@@ -20,7 +19,7 @@ expression: "builtin_outline(\"tests/fixtures/outline/sample.js\")"
 18	  }
 19	
 20	  // Increments.
-21	  inc() { ... }
+21	  inc() { … }
 22	}
 23	
 24	describe("x", () => {

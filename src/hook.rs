@@ -35,41 +35,39 @@ pub enum Decision {
     Advise(String),
 }
 
-/// Denies the built-in file tools on files edo has a language for before they run, and notes edo
-/// after a shell command printed such a file. Phrased as facts, as the harnesses' docs advise.
+/// Denies the built-in file tools on files edo has a language for before they run, and tells the agent to use
+/// edo after a shell command printed such a file.
 pub fn decide(phase: Phase, call: &Call, langs: &Languages) -> Decision {
-    let Some(path) = call.paths.iter().find(|p| langs.for_path(p).is_some()) else { return Decision::Allow };
-    let path = path.display();
+    if !call.paths.iter().any(|p| langs.for_path(p).is_some()) {
+        return Decision::Allow;
+    }
     match (phase, call.action) {
-        (Phase::Pre, Action::Read) => Decision::Deny(format!("{path} is a source file edo reads: use mcp__edo__read.")),
-        (Phase::Pre, Action::Edit) => {
-            Decision::Deny(format!("{path} is a source file edo edits: use mcp__edo__write with before and after."))
-        }
-        (Phase::Pre, Action::Write) => Decision::Deny(format!(
-            "{path} is a source file edo writes: use mcp__edo__write without before or scope to write the whole file."
-        )),
-        (Phase::Post, Action::Shell) => {
-            Decision::Advise(format!("The user wants {path} read with mcp__edo__read, which saves context."))
-        }
+        (Phase::Pre, Action::Read) => Decision::Deny("Use mcp__edo__read instead.".into()),
+        (Phase::Pre, Action::Edit | Action::Write) => Decision::Deny("Use mcp__edo__write instead.".into()),
+        (Phase::Post, Action::Shell) => Decision::Advise("Use mcp__edo__read instead.".into()),
         _ => Decision::Allow,
     }
 }
 
-/// Commands that print the files they are given, by their leading words. `rtk read` is what rtk's hook turns
-/// cat, head and tail into before edo's hook sees the command.
-const PRINTERS: [&[&str]; 12] = [
-    &["cat"],
-    &["head"],
-    &["tail"],
-    &["less"],
-    &["more"],
-    &["bat"],
-    &["nl"],
-    &["sed"],
-    &["type"],
-    &["Get-Content"],
-    &["gc"],
-    &["rtk", "read"],
+/// Commands that print the files they are given, by their leading words, with how many of their arguments come
+/// before the files (grep's pattern). `rtk read` and `rtk grep` are what rtk's hook turns cat, head, tail and grep
+/// into before edo's hook sees the command.
+const PRINTERS: [(&[&str], usize); 15] = [
+    (&["cat"], 0),
+    (&["head"], 0),
+    (&["tail"], 0),
+    (&["less"], 0),
+    (&["more"], 0),
+    (&["bat"], 0),
+    (&["nl"], 0),
+    (&["sed"], 0),
+    (&["type"], 0),
+    (&["Get-Content"], 0),
+    (&["gc"], 0),
+    (&["rtk", "read"], 0),
+    (&["grep"], 1),
+    (&["rg"], 1),
+    (&["rtk", "grep"], 1),
 ];
 
 /// The files a shell command prints: the arguments of each printing command between operators.
@@ -78,8 +76,11 @@ const PRINTERS: [&[&str]; 12] = [
 pub fn shown_files(command: &str) -> Vec<PathBuf> {
     let words: Vec<&str> = command.split_whitespace().collect();
     let commands = words.split(|w| matches!(*w, "|" | "||" | "&&" | ";" | ">" | ">>"));
-    let args = commands.filter_map(|c| PRINTERS.iter().find(|p| c.starts_with(p)).map(|p| &c[p.len()..]));
-    args.flatten().filter(|w| !w.starts_with('-')).map(|w| PathBuf::from(w.trim_matches(['"', '\'']))).collect()
+    let args = commands.filter_map(|c| {
+        let (p, skip) = PRINTERS.iter().find(|(p, _)| c.starts_with(p))?;
+        Some(c[p.len()..].iter().filter(|w| !w.starts_with('-')).skip(*skip))
+    });
+    args.flatten().map(|w| PathBuf::from(w.trim_matches(['"', '\'']))).collect()
 }
 
 /// How one harness's hook input becomes a `Call` and a `Decision` becomes its answer.
@@ -206,24 +207,24 @@ mod tests {
     fn reading_source_file_before_run_is_denied_toward_edo_read() {
         // Given / When: 実行前に、対応言語のファイルを読む呼び出しを判断する
         let reason = denial(decide(Phase::Pre, &call(Action::Read, "src/a.rs"), &langs()));
-        // Then: 止められ、mcp__edo__read が理由になる
-        assert!(reason.contains("mcp__edo__read"), "{reason}");
+        // Then: 止められ、mcp__edo__read を使うよう指示される
+        assert!(reason.starts_with("Use mcp__edo__read"), "{reason}");
     }
 
     #[test]
-    fn editing_source_file_before_run_is_denied_toward_edo_write_with_before() {
+    fn editing_source_file_before_run_is_denied_toward_edo_write() {
         // Given / When: 実行前に、対応言語のファイルを編集する呼び出しを判断する
         let reason = denial(decide(Phase::Pre, &call(Action::Edit, "src/a.rs"), &langs()));
-        // Then: 止められ、before と after を使う mcp__edo__write が理由になる
-        assert!(reason.contains("mcp__edo__write") && reason.contains("before"), "{reason}");
+        // Then: 止められ、mcp__edo__write を使うよう指示される
+        assert!(reason.starts_with("Use mcp__edo__write"), "{reason}");
     }
 
     #[test]
-    fn writing_source_file_before_run_is_denied_toward_whole_file_edo_write() {
+    fn writing_source_file_before_run_is_denied_toward_edo_write() {
         // Given / When: 実行前に、対応言語のファイルを書く呼び出しを判断する
         let reason = denial(decide(Phase::Pre, &call(Action::Write, "src/a.rs"), &langs()));
-        // Then: 止められ、ファイル全体を書く mcp__edo__write が理由になる
-        assert!(reason.contains("mcp__edo__write") && reason.contains("whole file"), "{reason}");
+        // Then: 止められ、mcp__edo__write を使うよう指示される
+        assert!(reason.starts_with("Use mcp__edo__write"), "{reason}");
     }
 
     #[test]
@@ -243,14 +244,34 @@ mod tests {
     }
 
     #[test]
-    fn shell_showing_source_file_after_run_is_advised_edo() {
+    fn shell_showing_source_file_after_run_is_told_to_use_edo_read() {
         // Given / When: 実行後に、対応言語のファイルを表示したシェルの呼び出しを判断する
         let shell = Call { action: Action::Shell, paths: shown_files("cat src/a.rs | head -5") };
-        // Then: edo が使えるという文が添えられる
+        // Then: mcp__edo__read を使うよう指示する文が添えられ、エージェントの知っているパスは繰り返さない
         match decide(Phase::Post, &shell, &langs()) {
-            Decision::Advise(note) => assert!(note.contains("src/a.rs") && note.contains("mcp__edo__read"), "{note}"),
+            Decision::Advise(note) => {
+                assert!(note.starts_with("Use mcp__edo__read") && !note.contains("src/a.rs"), "{note}")
+            }
             other => panic!("expected advice, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn grep_showing_source_file_after_run_is_advised_edo() {
+        // Given / When: 実行後に、grep、rg、rtk grep で対応言語のファイルを表示した呼び出しを判断する
+        for command in ["grep -n main -A5 src/a.rs", "rg main src/a.rs", "rtk grep main src/a.rs"] {
+            let shell = Call { action: Action::Shell, paths: shown_files(command) };
+            // Then: 文が添えられる
+            assert!(matches!(decide(Phase::Post, &shell, &langs()), Decision::Advise(_)), "{command}");
+        }
+    }
+
+    #[test]
+    fn grep_pattern_is_not_a_shown_file() {
+        // Given / When: 対応言語のファイル名に見えるパターンで、対応していないファイルを grep する
+        let files = shown_files("grep main.rs Cargo.toml");
+        // Then: パターンは表示したファイルに含まれない
+        assert_eq!(files, [PathBuf::from("Cargo.toml")]);
     }
 
     #[test]
@@ -315,7 +336,7 @@ mod tests {
         // When: 実行後の hook に渡す
         let out = claude("PostToolUse", input);
         // Then: command のシェルの呼び出しについての判断になる
-        assert!(out["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("src/a.rs"), "{out}");
+        assert!(out["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("mcp__edo__read"), "{out}");
     }
 
     #[test]
@@ -365,22 +386,20 @@ mod tests {
     fn codex_patch_updating_file_is_editing_it() {
         // Given: Codex の、src/a.rs を更新する apply_patch の入力
         let input = patch("*** Update File: src/a.rs\n@@\n-fn a() {}\n+fn b() {}\n");
-        // When: 実行前の hook に渡す
-        let out = codex("PreToolUse", input);
-        // Then: src/a.rs を編集する呼び出しとして止められる
-        let reason = out["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
-        assert!(reason.contains("src/a.rs") && reason.contains("before and after"), "{out}");
+        // When: 呼び出しとして読む
+        let call = codex_call(&input);
+        // Then: src/a.rs を編集する呼び出しになる
+        assert_eq!(call, Some(Call { action: Action::Edit, paths: vec![PathBuf::from("src/a.rs")] }));
     }
 
     #[test]
     fn codex_patch_adding_file_is_writing_it() {
         // Given: Codex の、src/a.rs を追加する apply_patch の入力
         let input = patch("*** Add File: src/a.rs\n+fn a() {}\n");
-        // When: 実行前の hook に渡す
-        let out = codex("PreToolUse", input);
-        // Then: src/a.rs を書く呼び出しとして止められる
-        let reason = out["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
-        assert!(reason.contains("src/a.rs") && reason.contains("whole file"), "{out}");
+        // When: 呼び出しとして読む
+        let call = codex_call(&input);
+        // Then: src/a.rs を書く呼び出しになる
+        assert_eq!(call, Some(Call { action: Action::Write, paths: vec![PathBuf::from("src/a.rs")] }));
     }
 
     #[test]
@@ -400,7 +419,7 @@ mod tests {
         // When: 実行後の hook に渡す
         let out = codex("PostToolUse", input);
         // Then: additionalContext で edo を勧める
-        assert!(out["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("src/a.rs"), "{out}");
+        assert!(out["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("mcp__edo__read"), "{out}");
     }
 
     fn cursor(event: &str, input: Value) -> Value {
@@ -446,7 +465,7 @@ mod tests {
         // When: 実行後の hook に渡す
         let out = cursor("postToolUse", input);
         // Then: additional_context で edo を勧める
-        assert!(out["additional_context"].as_str().unwrap().contains("a.rs"), "{out}");
+        assert!(out["additional_context"].as_str().unwrap().contains("mcp__edo__read"), "{out}");
     }
 
     #[test]

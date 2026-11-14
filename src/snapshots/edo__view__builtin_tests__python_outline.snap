@@ -1,6 +1,5 @@
 ---
 source: src/view.rs
-assertion_line: 255
 expression: "builtin_outline(\"tests/fixtures/outline/sample.py\")"
 ---
 1	import os
@@ -23,7 +22,7 @@ expression: "builtin_outline(\"tests/fixtures/outline/sample.py\")"
 19	        """
 22	
 23	    @staticmethod
-24	    def zero(): ...
+24	    def zero(): …
 25	
 26	
 27	def main():
