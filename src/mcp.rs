@@ -185,8 +185,9 @@ impl Server {
         self.stamps.lock().unwrap().get(&key).is_some_and(|s| stamp(path).as_ref() != Some(s))
     }
 
-    #[tool(description = "Read a source file. Function and method bodies are hidden or shown as `...`; pass \
-    `scope` to see one in full.\n\n\
+    #[tool(description = "Read a source file.\n\n\
+        Pass `path` to see an overview of the file. Pass `scope` to see a definition or a line range \
+        in full.\n\n\
         To read several files or scopes in one call, number them: `path_0`, `scope_0`, `path_1`, and so on.")]
     fn read(&self, Parameters(p): Parameters<ReadParams>) -> CallToolResult {
         let first = p.path.as_deref().map(|path| command::ReadItem { path, scope: p.scope.as_deref() });
