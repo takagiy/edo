@@ -280,7 +280,7 @@ impl Server {
         match command::write(&self.langs, &reqs, &mut check) {
             Ok(mut reports) => {
                 for r in reports.iter_mut().filter(|r| r["ok"] == true) {
-                    let file = r["file"].as_str().unwrap_or_default().to_string();
+                    let file = r["file"].as_str().unwrap_or(reqs[0].path).to_string();
                     if std::path::absolute(&file).is_ok_and(|f| stale.contains(&f)) {
                         r["warnings"]["stale"] = json!("modified since last read");
                     }
@@ -432,7 +432,7 @@ mod tests {
         // When: write を呼ぶ
         let (text, _) = tool(&client, "write", json!({"path": path, "before": "x();", "after": "y();"})).await;
         // Then: CLI と同じ MISON の報告が返る
-        assert_eq!(text, format!("ok=true file={path} replaced=1-1"));
+        assert_eq!(text, "ok=true replaced=1-1");
     }
 
     #[tokio::test]

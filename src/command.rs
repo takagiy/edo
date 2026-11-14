@@ -139,8 +139,15 @@ pub fn read(langs: &Languages, items: &[ReadItem]) -> Read {
 /// Writes every request, with a panic reported as an `internal` error. All requests are matched against the
 /// files as they were before the call. A request that is not found, is ambiguous or overlaps another is
 /// reported and written nowhere, even in the files a glob found it in; the others are written.
+/// When every request names the same non-glob path, reports omit `file`.
 pub fn write(langs: &Languages, reqs: &[WriteRequest], check: &mut dyn Check) -> Result<Vec<Value>, Error> {
-    guarded(|| Ok(write_requests(langs, reqs, check)))
+    let mut reports = guarded(|| Ok(write_requests(langs, reqs, check)))?;
+    if reqs.first().is_some_and(|first| !is_glob(first.path) && reqs.iter().all(|r| r.path == first.path)) {
+        for report in &mut reports {
+            report.as_object_mut().unwrap().remove("file");
+        }
+    }
+    Ok(reports)
 }
 
 /// Runs `f`, turning a panic into an `internal` error so that a bug answers the agent instead of leaving
@@ -848,7 +855,7 @@ mod tests {
         let reports = write(&Languages::builtin(), &[req], &mut ()).unwrap();
         // Then: 書き込まれ、ok が報告される
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    y();\n}\n");
-        assert_eq!(reports, [serde_json::json!({"ok": true, "file": path, "replaced": ["2-2"]})]);
+        assert_eq!(reports, [serde_json::json!({"ok": true, "replaced": ["2-2"]})]);
     }
 
     fn write_in(dir: &tempfile::TempDir, req: WriteRequest) -> Vec<Value> {
@@ -1009,7 +1016,7 @@ mod tests {
         let reports = write_all(&[swap(&a, "y();", "w();"), swap(&a, "x();", "v();")]);
         // Then: どちらも書かれ、replaced は渡した順に並ぶ
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    v();\n    w();\n}\n");
-        assert_eq!(reports, [json!({"ok": true, "file": a, "replaced": ["3-3", "2-2"]})]);
+        assert_eq!(reports, [json!({"ok": true, "replaced": ["3-3", "2-2"]})]);
     }
 
     #[test]
@@ -1023,6 +1030,7 @@ mod tests {
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    v();\n}\n");
         let failure = reports.iter().find(|r| r["ok"] == false).expect("a failure");
         assert_eq!((&failure["error"], &failure["item"]), (&json!("not_found"), &json!(2)));
+        assert!(reports.iter().all(|r| r.get("file").is_none()));
     }
 
     #[test]
@@ -1085,6 +1093,7 @@ mod tests {
         );
         // Then: ambiguous が報告され、ファイルは変わらない
         assert_eq!(reports[0]["error"], "ambiguous");
+        assert!(reports[0].get("file").is_none());
         assert_eq!(content(&dir, "a.rs"), src);
     }
 

@@ -343,7 +343,7 @@ mod tests {
         // When: 書く
         let (out, _) = edo(&["write", &path, "x();", "y();"], "");
         // Then: 報告が MISON で出力される
-        assert_eq!(out, format!("ok=true file={path} replaced=1-1"));
+        assert_eq!(out, "ok=true replaced=1-1");
     }
 
     #[test]
