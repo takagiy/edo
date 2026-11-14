@@ -558,14 +558,26 @@ fn candidate(src: &Source, target: &Hit) -> Value {
 type Parts<'s> = Vec<(&'s str, Option<Error>)>;
 
 /// The outline of a file, or what the parts of `scope` point at in it, with each part and why it was not
-/// found if it was not. When no part is found, an error naming every part.
+/// found if it was not. When every part fails, an error naming every part. Read line ranges stop at EOF.
 fn read_one<'s>(langs: &Languages, path: &str, scope: Option<&'s str>) -> Result<(String, Parts<'s>), Error> {
     let src = open(langs, Path::new(path))?;
     let Some(scope) = scope else {
         return Ok((view::render(&src.text, &src.defs, 0..src.text.len(), true), vec![]));
     };
+    let lines = src.text.lines().count();
     let (mut hits, mut parts) = (vec![], vec![]);
-    for (part, found) in scope::resolve_each(scope, &src.defs, &src.text) {
+    for part in scope::parts(scope, &src.defs) {
+        let found = match scope::parse_lines(part) {
+            Some((first, last)) if first > 0 && last >= first => {
+                let hits = if first > lines {
+                    vec![]
+                } else {
+                    vec![scope::Hit { range: scope::line_span(&src.text, first, last.min(lines)).unwrap(), def: None }]
+                };
+                Ok(hits)
+            }
+            _ => scope::resolve(part, &src.defs, &src.text),
+        };
         match found {
             Ok(h) => {
                 hits.extend(h);
@@ -574,7 +586,7 @@ fn read_one<'s>(langs: &Languages, path: &str, scope: Option<&'s str>) -> Result
             Err(e) => parts.push((part, Some(e))),
         }
     }
-    if hits.is_empty() {
+    if parts.iter().all(|(_, error)| error.is_some()) {
         return Err(scope::joined(parts.into_iter().filter_map(|(_, e)| e)).expect("a scope has a part"));
     }
     Ok((view::render_hits(&src.text, &src.defs, &hits), parts))
@@ -606,6 +618,108 @@ mod tests {
         let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: None }]).text;
         // Then: ボディを省略したアウトラインが返る
         assert_eq!(out, "1\tfn a() {\n3\t}\n");
+    }
+
+    #[test]
+    fn reading_range_past_end_returns_remaining_lines() {
+        // Given: 2 行の Rust のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\nfn b() {}\n")]);
+        // When: 2 行目から末尾を越える範囲を読む
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: Some("2-10000") }]);
+        // Then: エラーも警告もなく末尾まで返る
+        assert!(out.ok, "{}", out.text);
+        assert_eq!(out.text, "2\tfn b() {}\n");
+    }
+
+    #[test]
+    fn reading_range_starting_past_end_succeeds_empty() {
+        // Given: 末尾に改行がある場合とない場合の 2 行のファイル
+        for text in ["fn a() {}\nfn b() {}\n", "fn a() {}\nfn b() {}"] {
+            let dir = dir_with(&[("a.rs", text)]);
+            let path = at(&dir, "a.rs");
+            // When: 始まりが末尾を越える 1 行指定と行範囲を読む
+            for scope in ["3", "3-10000"] {
+                let out = read(&Languages::builtin(), &[ReadItem { path: &path, scope: Some(scope) }]);
+                // Then: エラーも警告もなく空で成功し、読んだファイルが返る
+                assert!(out.ok, "{}", out.text);
+                assert_eq!(out.text, "");
+                assert_eq!(out.files, std::slice::from_ref(&path));
+            }
+        }
+    }
+
+    #[test]
+    fn reading_range_in_empty_file_succeeds_empty() {
+        // Given: 空の Rust のファイル
+        let dir = dir_with(&[("a.rs", "")]);
+        let path = at(&dir, "a.rs");
+        // When: 1 行目から末尾を越える範囲を読む
+        let out = read(&Languages::builtin(), &[ReadItem { path: &path, scope: Some("1-10000") }]);
+        // Then: エラーも警告もなく空で成功する
+        assert!(out.ok, "{}", out.text);
+        assert_eq!(out.text, "");
+        assert_eq!(out.files, [path]);
+    }
+
+    #[test]
+    fn reading_comma_scope_ignores_outside_line_ranges() {
+        // Given: 関数 a のある 1 行のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
+        // When: 範囲外の行指定の間に、関数 a を指定して読む
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: Some("99, a, 20-30") }]);
+        // Then: 空の部分の警告や余分な空行を挟まず、関数 a だけが返る
+        assert!(out.ok, "{}", out.text);
+        assert_eq!(out.text, "1\tfn a() {}\n");
+    }
+
+    #[test]
+    fn reading_glob_clamps_line_range_for_each_file() {
+        // Given: 1 行と 2 行の Rust のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\nfn c() {}\n")]);
+        let (a, b) = (at(&dir, "a.rs"), at(&dir, "b.rs"));
+        // When: 一部のファイル、または全ファイルで範囲外になる行範囲を読む
+        for (scope, text) in [("2-10000", format!("{a}\n{b}\n2\tfn c() {{}}\n")), ("99", format!("{a}\n{b}\n"))] {
+            let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*.rs"), scope: Some(scope) }]);
+            // Then: ファイルごとに末尾で切り詰め、エラーも警告もなく返る
+            assert!(out.ok, "{}", out.text);
+            assert_eq!(out.text, text);
+            assert_eq!(out.files, [a.clone(), b.clone()]);
+        }
+    }
+
+    #[test]
+    fn reading_zero_or_reversed_line_range_is_error() {
+        // Given: 2 行の Rust のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\nfn b() {}\n")]);
+        // When: 0 や逆順の行範囲で読む
+        for scope in ["0", "0-2", "2-1"] {
+            let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: Some(scope) }]);
+            // Then: 入力エラーになり、読んだファイルには含まれない
+            assert!(!out.ok);
+            assert!(out.text.contains("error=out_of_range"), "{}", out.text);
+            assert!(out.files.is_empty());
+        }
+    }
+
+    #[test]
+    fn writing_range_past_end_errors_without_changing_file() {
+        // Given: 2 行の Rust のファイル
+        let text = "fn a() {}\nfn b() {}\n";
+        let dir = dir_with(&[("a.rs", text)]);
+        let path = at(&dir, "a.rs");
+        // When: 終わりだけ、または始まりも末尾を越える行範囲に書く
+        for scope in ["1-10000", "3"] {
+            let reports = write_all(&[WriteRequest {
+                path: &path,
+                scope: Some(scope),
+                after: "fn c() {}",
+                ..Default::default()
+            }]);
+            // Then: 範囲外のエラーになり、ファイルは変わらない
+            assert_eq!(reports[0]["ok"], false);
+            assert_eq!(reports[0]["error"], "out_of_range");
+            assert_eq!(content(&dir, "a.rs"), text);
+        }
     }
 
     #[test]
