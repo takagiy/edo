@@ -1,6 +1,5 @@
 ---
 source: src/view.rs
-assertion_line: 231
 expression: "builtin_outline(\"tests/fixtures/outline/sample.rs\")"
 ---
 1	use std::fmt;
@@ -18,7 +17,7 @@ expression: "builtin_outline(\"tests/fixtures/outline/sample.rs\")"
 13	    pub fn new(x: i32) -> Self {
 15	    }
 16	
-17	    fn get(&self) -> i32 { ... }
+17	    fn get(&self) -> i32 { … }
 18	}
 19	
 20	pub trait Shape {

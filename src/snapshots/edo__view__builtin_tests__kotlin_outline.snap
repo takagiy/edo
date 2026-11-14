@@ -1,6 +1,5 @@
 ---
 source: src/view.rs
-assertion_line: 273
 expression: "builtin_outline(\"tests/fixtures/outline/sample.kt\")"
 ---
 1	package demo
@@ -10,7 +9,7 @@ expression: "builtin_outline(\"tests/fixtures/outline/sample.kt\")"
 5	/** A data object. */
 6	@Suppress("unused")
 7	data object Foo {
-8	  fun hoge() = ...
+8	  fun hoge() = …
 9	  fun fuga() {
 11	  }
 12	}
@@ -28,7 +27,7 @@ expression: "builtin_outline(\"tests/fixtures/outline/sample.kt\")"
 25	  }
 26	
 27	  companion object {
-28	    fun unit() = ...
+28	    fun unit() = …
 29	  }
 30	}
 31	

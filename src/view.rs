@@ -54,7 +54,8 @@ fn truncate(line: &str) -> String {
     }
 }
 
-/// Replaces each run of hidden text in a line with `...`, keeping the whitespace around it.
+/// Replaces each run of hidden text in a line with `…`, which code rarely holds as `...` does, keeping the
+/// whitespace around it.
 fn collapse_hidden(text: &str, start: usize, is_hidden: &impl Fn(usize) -> bool) -> String {
     let mut out = String::new();
     let mut run = String::new();
@@ -65,7 +66,7 @@ fn collapse_hidden(text: &str, start: usize, is_hidden: &impl Fn(usize) -> bool)
         } else {
             let lead = &run[..run.len() - run.trim_start().len()];
             let trail = &run[run.trim_end().len()..];
-            out.push_str(&format!("{lead}...{trail}"));
+            out.push_str(&format!("{lead}…{trail}"));
         }
         run.clear();
     };
@@ -139,8 +140,8 @@ mod tests {
         let src = "def a(): return 1\n";
         // When: 表示する
         let out = python_outline(src);
-        // Then: ボディの部分が ... になる
-        assert_eq!(out, "1\tdef a(): ...\n");
+        // Then: ボディの部分が、Python の ... と見分けられる … になる
+        assert_eq!(out, "1\tdef a(): …\n");
     }
 
     #[test]
@@ -150,7 +151,7 @@ mod tests {
         // When: 表示する
         let out = outline(src);
         // Then: 区切り記号の { と } は表示される
-        assert_eq!(out, "1\tfn a() {\n3\t}\n4\tfn b() { ... }\n");
+        assert_eq!(out, "1\tfn a() {\n3\t}\n4\tfn b() { … }\n");
     }
 
     #[test]
