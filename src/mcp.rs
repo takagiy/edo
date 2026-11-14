@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -6,7 +6,7 @@ use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
 
 use crate::command::{self, Mode, WriteRequest, Written};
 use crate::language::Languages;
@@ -34,7 +34,8 @@ pub struct ReadTarget {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
+// Unknown arguments are rejected by `Numbered`, which takes every argument the others do not.
+#[schemars(extend("additionalProperties" = false))]
 pub struct WriteParams {
     /// File path or glob.
     pub path: Option<String>,
@@ -53,6 +54,9 @@ pub struct WriteParams {
     /// More edits in the same call, after the one given by `path`.
     #[serde(default)]
     pub edits: Vec<EditParams>,
+    /// More edits given by number, as `path_0`, `before_0` and so on; they come after `path` and before `edits`.
+    #[serde(flatten)]
+    pub numbered: Numbered,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -84,6 +88,55 @@ impl EditParams {
             all_matches: self.all_matches,
             place: self.mode.into(),
         }
+    }
+}
+
+/// Edits given as `path_0`, `before_0` and so on, by number. A client that writes string arguments
+/// without JSON, such as Claude Code, can then pass code without escaping its line breaks and quotes.
+#[derive(Debug, Default)]
+pub struct Numbered(BTreeMap<u64, Map<String, Value>>);
+
+impl<'de> Deserialize<'de> for Numbered {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut edits: BTreeMap<u64, Map<String, Value>> = BTreeMap::new();
+        for (key, value) in Map::<String, Value>::deserialize(d)? {
+            let numbered = key.rsplit_once('_').and_then(|(field, n)| Some((field, n.parse().ok()?)));
+            let Some((field, n)) = numbered else {
+                const FIELDS: &[&str] = &["path", "scope", "before", "after", "all_matches", "mode", "edits"];
+                return Err(serde::de::Error::unknown_field(&key, FIELDS));
+            };
+            // A client that sends arguments missing from `properties` as strings sends `true` as "true".
+            let value = match (field, value) {
+                ("all_matches", Value::String(s)) if s == "true" || s == "false" => Value::Bool(s == "true"),
+                (_, value) => value,
+            };
+            edits.entry(n).or_default().insert(field.to_string(), value);
+        }
+        Ok(Numbered(edits))
+    }
+}
+
+impl schemars::JsonSchema for Numbered {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Numbered".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let edit = EditParams::json_schema(generator);
+        let fields = edit.get("properties").and_then(Value::as_object).cloned().unwrap_or_default();
+        let patterns: Map<String, Value> =
+            fields.into_iter().map(|(name, s)| (format!("^{name}_[0-9]+$"), s)).collect();
+        schemars::json_schema!({ "type": "object", "patternProperties": patterns, "additionalProperties": false })
+    }
+}
+
+impl Numbered {
+    fn edits(self) -> Result<Vec<EditParams>, crate::Error> {
+        let edit = |(n, fields)| {
+            serde_json::from_value(Value::Object(fields))
+                .map_err(|e| crate::Error::new("usage", format!("in the arguments ending in _{n}: {e}")))
+        };
+        self.0.into_iter().map(edit).collect()
     }
 }
 
@@ -162,7 +215,8 @@ impl Server {
         `after` is re-indented to fit, so its indentation does not need to match the file. An empty `after` deletes \
         the target.\n\n\
         On success, `replaced` gives the line ranges that now hold `after`; there is no need to read the file back.\n\n\
-        To make several edits in one call, list them in `edits` with the same fields. All of them are matched \
+        To make several edits in one call, give each the same fields with its own number, as `path_0`, `before_0`, \
+        `after_0`, `path_1` and so on, or list them in `edits`. All of them are matched \
         against the files as they are now, and if any is not found, is ambiguous or overlaps another, nothing is written.")]
     fn write(&self, Parameters(p): Parameters<WriteParams>) -> CallToolResult {
         let first = match (p.path, p.after) {
@@ -177,7 +231,11 @@ impl Server {
             (None, None) => None,
             _ => return error(crate::Error::new("usage", "give path and after together")),
         };
-        let edits: Vec<&EditParams> = first.iter().chain(&p.edits).collect();
+        let numbered = match p.numbered.edits() {
+            Ok(numbered) => numbered,
+            Err(e) => return error(e),
+        };
+        let edits: Vec<&EditParams> = first.iter().chain(&numbered).chain(&p.edits).collect();
         if edits.is_empty() {
             return error(crate::Error::new("usage", "give path and after, or edits"));
         }
@@ -394,6 +452,66 @@ mod tests {
         assert!(write_failed && write.contains("lines"), "{write}");
         assert!(read_failed && read.contains("range"), "{read}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {}\n");
+    }
+
+    #[tokio::test]
+    async fn numbered_arguments_are_edits_after_path_in_number_order() {
+        // Given: 呼び出しが 3 つある関数
+        let (_dir, path) = file("fn a() {\n    x();\n    y();\n    z();\n}\n");
+        let client = connect().await;
+        // When: path の分に加えて、_1 と _0 の番号付きの引数で編集を渡す
+        let args = json!({
+            "path": path, "before": "x();", "after": "u();",
+            "path_1": path, "before_1": "z();", "after_1": "w();",
+            "path_0": path, "before_0": "y();", "after_0": "v();",
+        });
+        let (text, is_error) = tool(&client, "write", args).await;
+        // Then: すべて書かれ、replaced は path の分、_0 の分、_1 の分の順に並ぶ
+        assert!(!is_error, "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    u();\n    v();\n    w();\n}\n");
+        let replaced: Vec<&str> = text.split("replaced=").nth(1).unwrap_or_default().split(',').collect();
+        assert_eq!(replaced, ["2-2", "3-3", "4-4"], "{text}");
+    }
+
+    #[tokio::test]
+    async fn numbered_edit_without_after_is_an_error_naming_its_number() {
+        // Given: 関数が 1 つあるファイル
+        let (_dir, path) = file("fn a() {}\n");
+        let client = connect().await;
+        // When: after_0 のない _0 の編集を渡す
+        let (text, is_error) = tool(&client, "write", json!({"path_0": path, "before_0": "a"})).await;
+        // Then: その番号を挙げたエラーになり、ファイルはそのまま
+        assert!(is_error && text.contains("_0") && text.contains("after"), "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {}\n");
+    }
+
+    #[tokio::test]
+    async fn numbered_all_matches_takes_true_as_a_string() {
+        // Given: 同じ呼び出しが 2 つある関数
+        let (_dir, path) = file("fn a() {\n    x();\n    x();\n}\n");
+        let client = connect().await;
+        // When: 型を変換しないクライアントのように、all_matches_0 を文字列の "true" で渡す
+        let args = json!({"path_0": path, "before_0": "x();", "after_0": "y();", "all_matches_0": "true"});
+        let (text, is_error) = tool(&client, "write", args).await;
+        // Then: 真偽値の true と同じく、両方が書き換わる
+        assert!(!is_error, "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    y();\n    y();\n}\n");
+    }
+
+    #[tokio::test]
+    async fn write_schema_shows_numbered_names_of_each_edit_field_as_patterns() {
+        // Given: MCP サーバーにつないだクライアント
+        let client = connect().await;
+        // When: write ツールのスキーマを見る
+        let tools = client.list_all_tools().await.unwrap();
+        let write = tools.iter().find(|t| t.name == "write").unwrap();
+        let schema = Value::Object(write.input_schema.as_ref().clone());
+        let patterns = schema["patternProperties"].as_object().cloned().unwrap_or_default();
+        // Then: edits の各フィールドに、その名前の番号付きの形を示すパターンがあり、ほかの名前は許さない
+        for field in ["path", "scope", "before", "after", "all_matches", "mode"] {
+            assert!(patterns.keys().any(|p| p.contains(field)), "{field}: {patterns:?}");
+        }
+        assert_eq!(schema["additionalProperties"], json!(false), "{schema}");
     }
 
     #[tokio::test]
