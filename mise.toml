@@ -2,8 +2,8 @@
 # rustup picks the host from its own default, which differs per machine. Windows needs the GNU
 # host because build scripts are built for the host, and zig cannot stand in for MSVC.
 rust = [
-    { version = "1.99", os = ["linux", "macos"], targets = "{{ vars.release_targets }}" },
-    { version = "1.99-x86_64-pc-windows-gnu", os = ["windows"], targets = "{{ vars.release_targets }}" },
+    { version = "1.99", os = ["linux", "macos"], targets = "{{ vars.release_targets }}", components = "rustfmt,clippy" },
+    { version = "1.99-x86_64-pc-windows-gnu", os = ["windows"], targets = "{{ vars.release_targets }}", components = "rustfmt,clippy" },
 ]
 # tree-sitter's wasm feature runs cmake in wasmtime-c-api-impl's build script.
 cmake = "4"
