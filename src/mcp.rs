@@ -17,7 +17,7 @@ use crate::lsp::Servers;
 pub struct ReadParams {
     /// File path or glob.
     pub path: Option<String>,
-    /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M).
+    /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M), or several separated by commas.
     pub scope: Option<String>,
     /// More to read in the same call, after `path`.
     #[serde(default)]
@@ -29,7 +29,7 @@ pub struct ReadParams {
 pub struct ReadTarget {
     /// File path or glob.
     pub path: String,
-    /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M).
+    /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M), or several separated by commas.
     pub scope: Option<String>,
 }
 
@@ -39,7 +39,7 @@ pub struct ReadTarget {
 pub struct WriteParams {
     /// File path or glob.
     pub path: Option<String>,
-    /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M).
+    /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M), or several separated by commas.
     pub scope: Option<String>,
     /// Code to find. Omit to target the whole `scope` (or the whole file).
     pub before: Option<String>,
@@ -64,7 +64,7 @@ pub struct WriteParams {
 pub struct EditParams {
     /// File path or glob.
     pub path: String,
-    /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M).
+    /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M), or several separated by commas.
     pub scope: Option<String>,
     /// Code to find. Omit to target the whole `scope` (or the whole file).
     pub before: Option<String>,
@@ -140,6 +140,11 @@ impl Numbered {
     }
 }
 
+/// Whether a part of `scope` is a line range. A definition named with a comma is split here too, but its
+/// parts are not line ranges unless the name is digits.
+fn has_line_range(scope: &str) -> bool {
+    crate::scope::parts(scope, &[]).into_iter().any(|p| crate::scope::parse_lines(p).is_some())
+}
 /// What a file looked like when it was last read or written through this server.
 type Stamp = (Option<SystemTime>, u64);
 
@@ -180,9 +185,9 @@ impl Server {
     #[tool(description = "Read a source file with line numbers (`N<TAB>line`). Function and method bodies are \
         hidden: they leave gaps in the line numbers, or show as `...` when they share a line with other code.\n\n\
         To see more, pass `scope`: an identifier such as `Foo.bar` or `Foo::bar` (a function shows in full; a class \
-        shows its members with bodies hidden), or a line range `N` or `N-M` (shown in full). `path` may be a glob with `*` and `?`.\n\n\
+        shows its members with bodies hidden), or a line range `N` or `N-M` (shown in full). Separate several scopes with commas; parts not found are listed in `scope_errors`. `path` may be a glob with `*` and `?`.\n\n\
         To read several things in one call, list them in `reads` as `{path, scope}`; each one's text follows its \
-        path.")]
+        path. One that fails has its error there instead, and the others are still read.")]
     fn read(&self, Parameters(p): Parameters<ReadParams>) -> CallToolResult {
         let first = p.path.as_deref().map(|path| command::ReadItem { path, scope: p.scope.as_deref() });
         let rest = p.reads.iter().map(|r| command::ReadItem { path: &r.path, scope: r.scope.as_deref() });
@@ -190,20 +195,17 @@ impl Server {
         if items.is_empty() {
             return error(crate::Error::new("usage", "give path, or reads"));
         }
-        match command::read(&self.langs, &items) {
-            Ok((mut text, files)) => {
-                files.iter().for_each(|f| self.remember(f));
-                // Errors from checks earlier writes started, which come too late for those writes to wait for.
-                let lock = |s: &Arc<Mutex<Servers>>| {
-                    s.lock().unwrap_or_else(std::sync::PoisonError::into_inner).read_errors(&self.langs, &files)
-                };
-                if let Some(errors) = self.lsp.as_ref().and_then(lock) {
-                    text.push_str(&format!("{}\n", crate::report(&errors)));
-                }
-                CallToolResult::success(vec![ContentBlock::text(text)])
-            }
-            Err(e) => error(e),
+        let command::Read { mut text, files, ok } = command::read(&self.langs, &items);
+        files.iter().for_each(|f| self.remember(f));
+        // Errors from checks earlier writes started, which come too late for those writes to wait for.
+        let lock = |s: &Arc<Mutex<Servers>>| {
+            s.lock().unwrap_or_else(std::sync::PoisonError::into_inner).read_errors(&self.langs, &files)
+        };
+        if let Some(errors) = self.lsp.as_ref().and_then(lock) {
+            text.push_str(&format!("{}\n", crate::report(&errors)));
         }
+        let text = vec![ContentBlock::text(text)];
+        if ok { CallToolResult::success(text) } else { CallToolResult::error(text) }
     }
 
     #[tool(description = "Edit a source file: find `before` and replace it with `after`, or insert `after` next \
@@ -217,7 +219,8 @@ impl Server {
         On success, `replaced` gives the line ranges that now hold `after`; there is no need to read the file back.\n\n\
         To make several edits in one call, give each the same fields with its own number, as `path_0`, `before_0`, \
         `after_0`, `path_1` and so on, or list them in `edits`. All of them are matched \
-        against the files as they are now, and if any is not found, is ambiguous or overlaps another, nothing is written.")]
+        against the files as they are now. One that is not found, is ambiguous or overlaps another is reported and \
+        written nowhere; the others are written.")]
     fn write(&self, Parameters(p): Parameters<WriteParams>) -> CallToolResult {
         let first = match (p.path, p.after) {
             (Some(path), Some(after)) => Some(EditParams {
@@ -243,7 +246,7 @@ impl Server {
         // Line numbers in a line range scope may be wrong in a file that changed since it was last read.
         let stale: Vec<std::path::PathBuf> = reqs
             .iter()
-            .filter(|r| r.scope.and_then(crate::scope::parse_lines).is_some() && self.is_stale(r.path))
+            .filter(|r| r.scope.is_some_and(has_line_range) && self.is_stale(r.path))
             .filter_map(|r| std::path::absolute(r.path).ok())
             .collect();
         // shortcut: waits for diagnostics on the runtime's only thread; fine while one agent writes at a time.
@@ -374,6 +377,19 @@ mod tests {
         let (text, _) = tool(&client, "read", args).await;
         // Then: path の分、reads の分の順に、それぞれパスの行の後に並ぶ
         assert_eq!(text, format!("{path}\n1\tfn a() {{}}\n{path}\n2\tfn b() {{}}\n"));
+    }
+
+    #[tokio::test]
+    async fn read_tool_with_failing_item_returns_the_rest_as_error() {
+        // Given: 関数が 1 つあるファイル
+        let (_dir, path) = file("fn a() {}\n");
+        let client = connect().await;
+        // When: ない定義と、ファイル全体を、1 回で読む
+        let args = json!({"path": path, "scope": "zzz", "reads": [{"path": path}]});
+        let (text, is_error) = tool(&client, "read", args).await;
+        // Then: ファイル全体の内容と not_found のエラーが返り、isError が立つ
+        assert!(is_error, "{text}");
+        assert!(text.contains("error=not_found") && text.contains("1\tfn a() {}"), "{text}");
     }
 
     #[tokio::test]
@@ -536,6 +552,20 @@ mod tests {
         std::fs::write(&path, "fn a() {}\nfn b() {}\n").unwrap();
         // When: 行範囲のスコープで書く
         let (text, _) = tool(&client, "write", json!({"path": path, "scope": "2", "after": "fn c() {}"})).await;
+        // Then: stale の警告が付く
+        assert!(text.contains("warnings=(stale=\"modified since last read\")"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn comma_scope_with_line_range_to_file_changed_since_read_warns_stale() {
+        // Given: read した後に外で書き換えられたファイル
+        let (_dir, path) = file("fn a() {}\n");
+        let client = connect().await;
+        tool(&client, "read", json!({"path": path})).await;
+        std::fs::write(&path, "fn a() {}\nfn b() {}\n").unwrap();
+        // When: 名前と行範囲を , で区切ったスコープに書く
+        let args = json!({"path": path, "scope": "a, 2", "before": "fn", "after": "pub fn", "all_matches": true});
+        let (text, _) = tool(&client, "write", args).await;
         // Then: stale の警告が付く
         assert!(text.contains("warnings=(stale=\"modified since last read\")"), "{text}");
     }

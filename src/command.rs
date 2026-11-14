@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 
@@ -103,30 +104,43 @@ pub struct ReadItem<'a> {
     pub scope: Option<&'a str>,
 }
 
-/// Reads each item in turn, with a panic reported as an `internal` error. With several items, each one's
-/// text follows its path, as a glob's files do, and the first failure fails the whole read.
-/// Returns the text and the files read, in order.
-pub fn read(langs: &Languages, items: &[ReadItem]) -> Result<(String, Vec<String>), Error> {
+/// What `read` returns: the text of every item, the files read, and whether every item was read.
+pub struct Read {
+    pub text: String,
+    pub files: Vec<String>,
+    pub ok: bool,
+}
+
+/// Reads each item in turn. With several items, each one's text follows its path, as a glob's files do. An item
+/// that fails, or panics as an `internal` error, has its error in its place instead, and the others are still read.
+pub fn read(langs: &Languages, items: &[ReadItem]) -> Read {
     let several = items.len() > 1;
-    guarded(|| {
-        let (mut out, mut files) = (String::new(), vec![]);
-        for (i, item) in items.iter().enumerate() {
-            let (text, read) =
-                read_files(langs, item.path, item.scope).map_err(|e| Error { item: several.then_some(i + 1), ..e })?;
-            if several && !is_glob(item.path) {
-                out.push_str(&format!("{}\n", item.path));
-            }
-            out.push_str(&text);
-            files.extend(read);
+    let mut read = Read { text: String::new(), files: vec![], ok: true };
+    for (i, item) in items.iter().enumerate() {
+        // A glob's text has a path line for each of its files already.
+        if several && !is_glob(item.path) {
+            read.text.push_str(&format!("{}\n", item.path));
         }
-        Ok((out, files))
-    })
+        match guarded(|| read_files(langs, item.path, item.scope)) {
+            Ok((text, files)) => {
+                read.text.push_str(&text);
+                read.files.extend(files);
+            }
+            Err(e) => {
+                let e = Error { item: several.then_some(i + 1), ..e };
+                read.text.push_str(&format!("{}\n", crate::report(&e.to_json())));
+                read.ok = false;
+            }
+        }
+    }
+    read
 }
 
 /// Writes every request, with a panic reported as an `internal` error. All requests are matched against the
-/// files as they were before the call, and if any is not found, is ambiguous or overlaps another, nothing is written and the failures are reported.
+/// files as they were before the call. A request that is not found, is ambiguous or overlaps another is
+/// reported and written nowhere, even in the files a glob found it in; the others are written.
 pub fn write(langs: &Languages, reqs: &[WriteRequest], check: Check) -> Result<Vec<Value>, Error> {
-    guarded(|| write_requests(langs, reqs, check))
+    guarded(|| Ok(write_requests(langs, reqs, check)))
 }
 
 /// Runs `f`, turning a panic into an `internal` error so that a bug answers the agent instead of leaving
@@ -139,9 +153,11 @@ fn guarded<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
 }
 
 /// Reads a file (or glob) as an outline, or the definitions/lines selected by `scope`, with the files read.
+/// Parts of `scope` that no file has are listed in a `scope_errors` line at the end.
 fn read_files(langs: &Languages, path: &str, scope: Option<&str>) -> Result<(String, Vec<String>), Error> {
     if !is_glob(path) {
-        return Ok((read_one(langs, path, scope)?, vec![path.to_string()]));
+        let (text, parts) = read_one(langs, path, scope)?;
+        return Ok((text + &scope_errors(&parts), vec![path.to_string()]));
     }
     let files = expand(path)?;
     if files.is_empty() {
@@ -154,11 +170,20 @@ fn read_files(langs: &Languages, path: &str, scope: Option<&str>) -> Result<(Str
         return Err(err);
     }
     let (mut out, mut read) = (String::new(), vec![]);
+    // Each part of the scope, with why it was not found, until a file has it.
+    let mut missing: Parts = vec![];
     for file in files {
         match read_one(langs, &file, scope) {
-            Ok(text) => {
+            Ok((text, parts)) => {
                 out.push_str(&format!("{file}\n{text}"));
                 read.push(file);
+                for (part, error) in parts {
+                    match missing.iter_mut().find(|(p, _)| *p == part) {
+                        Some(entry) if error.is_none() => entry.1 = None,
+                        Some(_) => {}
+                        None => missing.push((part, error)),
+                    }
+                }
             }
             // Like write, a file that the scope does not resolve in is left out.
             Err(e) if e.code == "not_found" => {}
@@ -170,6 +195,7 @@ fn read_files(langs: &Languages, path: &str, scope: Option<&str>) -> Result<(Str
         err.skipped = skipped;
         return Err(err);
     }
+    out.push_str(&scope_errors(&missing));
     if !skipped.is_empty() {
         out.push_str(&format!("{}\n", crate::report(&skipped_line(&skipped))));
     }
@@ -179,6 +205,15 @@ fn read_files(langs: &Languages, path: &str, scope: Option<&str>) -> Result<(Str
 /// `{"skipped":{...}}`, the note a glob ends with when it skipped files.
 fn skipped_line(skipped: &Skipped) -> Value {
     json!({"skipped": crate::skipped_json(skipped)})
+}
+/// `scope_errors=(scope=… error=… message=…)`, the line a read ends with when parts of its scope were not
+/// found, or nothing when all were.
+fn scope_errors(parts: &[(&str, Option<Error>)]) -> String {
+    let errors: Vec<Value> = parts
+        .iter()
+        .filter_map(|(part, e)| e.as_ref().map(|e| json!({"scope": part, "error": e.code, "message": e.message})))
+        .collect();
+    if errors.is_empty() { String::new() } else { format!("{}\n", crate::report(&json!({ "scope_errors": errors }))) }
 }
 
 /// What `write` does with each match (or the whole target without `before`), for both the CLI and MCP.
@@ -226,18 +261,26 @@ pub struct Written<'a> {
 /// Adds warnings to a written file's report, such as the errors a language server found.
 pub type Check<'a> = &'a mut dyn FnMut(&Written) -> Map<String, Value>;
 
-/// Finds every request's targets, then writes each file once; reports per file, or only the failures.
-fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: Check) -> Result<Vec<Value>, Error> {
+fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: Check) -> Vec<Value> {
     let several = reqs.len() > 1;
     let mut plans: Vec<Plan> = vec![];
     let mut failures: Vec<Value> = vec![];
+    // The requests that failed somewhere, which are written nowhere.
+    let mut failed: HashSet<usize> = HashSet::new();
     let mut skipped = Skipped::new();
     for (item, req) in reqs.iter().enumerate() {
         let glob = is_glob(req.path);
-        let (files, missed) =
-            if glob { supported(langs, expand(req.path)?) } else { (vec![req.path.into()], Skipped::new()) };
-        let mut found = false;
+        let expanded = if glob {
+            expand(req.path).map(|f| supported(langs, f))
+        } else {
+            Ok((vec![req.path.into()], Skipped::new()))
+        };
         let mut reports = vec![];
+        let (files, missed) = expanded.unwrap_or_else(|e| {
+            reports.push(e.to_json());
+            Default::default()
+        });
+        let mut found = false;
         for file in files {
             let at = match plans.iter().position(|p| p.path == file) {
                 Some(at) => Ok(at),
@@ -259,23 +302,33 @@ fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: Check) -> Res
         for (ext, n) in missed {
             *skipped.entry(ext).or_default() += n;
         }
+        if !reports.is_empty() {
+            failed.insert(item);
+        }
         if several {
             reports.iter_mut().for_each(|r| r["item"] = (item + 1).into());
         }
         failures.extend(reports);
     }
-    plans.retain(|p| !p.targets.is_empty());
-    failures.extend(plans.iter_mut().filter_map(|p| p.overlap(several)));
-    if !failures.is_empty() {
-        return Ok(failures);
+    for plan in &mut plans {
+        plan.targets.retain(|t| !failed.contains(&t.item));
     }
+    // Targets of failed requests are gone first, so that only requests still to be written can overlap.
+    for (report, items) in plans.iter_mut().flat_map(|p| p.overlaps(several)) {
+        failures.push(report);
+        failed.extend(items);
+    }
+    for plan in &mut plans {
+        plan.targets.retain(|t| !failed.contains(&t.item));
+    }
+    plans.retain(|p| !p.targets.is_empty());
     // A file that cannot be written fails alone: the files before it are written, and their reports say so.
-    let mut reports: Vec<Value> =
-        plans.iter().map(|p| p.write(check).unwrap_or_else(|e| failure(&p.path, e))).collect();
+    let mut reports = failures;
+    reports.extend(plans.iter().map(|p| p.write(check).unwrap_or_else(|e| failure(&p.path, e))));
     if !skipped.is_empty() {
         reports.push(skipped_line(&skipped));
     }
-    Ok(reports)
+    reports
 }
 
 /// One place in a file to put a request's `after`.
@@ -348,20 +401,30 @@ impl<'a> Plan<'a> {
         Ok(())
     }
 
-    /// Sorts the targets by place, and reports two that write over the same text, or at the same point.
-    fn overlap(&mut self, several: bool) -> Option<Value> {
+    /// Reports each target that writes over text an earlier one writes, or at the same point, with the requests
+    /// of both, sorting the targets by place.
+    fn overlaps(&mut self, several: bool) -> Vec<(Value, [usize; 2])> {
         self.targets.sort_by_key(|t| t.range.start);
-        let (a, b) = self
-            .targets
-            .windows(2)
-            .map(|w| (&w[0], &w[1]))
-            .find(|(a, b)| b.range.start < a.range.end.max(a.range.start + 1))?;
-        let message = format!("items {} and {} write over the same text", a.item + 1, b.item + 1);
-        let mut report = json!({"ok": false, "file": self.path, "error": "overlap", "message": message});
-        if several {
-            report["item"] = (b.item + 1).into();
+        let mut found = vec![];
+        // The target reaching furthest so far, which any later target starting before its end overlaps.
+        let mut reach: Option<&Target> = None;
+        for t in &self.targets {
+            match reach {
+                Some(r) if t.range.start < r.range.end.max(r.range.start + 1) => {
+                    let message = format!("items {} and {} write over the same text", r.item + 1, t.item + 1);
+                    let mut report = json!({"ok": false, "file": self.path, "error": "overlap", "message": message});
+                    if several {
+                        report["item"] = (t.item + 1).into();
+                    }
+                    found.push((report, [r.item, t.item]));
+                    if t.range.end > r.range.end {
+                        reach = Some(t);
+                    }
+                }
+                _ => reach = Some(t),
+            }
         }
-        Some(report)
+        found
     }
 
     /// Writes the targets, sorted by place, and reports the lines each now holds in the order of the requests.
@@ -448,12 +511,30 @@ fn candidate(src: &Source, target: &Hit) -> Value {
     json!({"range": lines(line_of(text, range.start), last), "parents": parents, "signature": signature})
 }
 
-fn read_one(langs: &Languages, path: &str, scope: Option<&str>) -> Result<String, Error> {
+/// Each part of a scope, with why it was not found if it was not.
+type Parts<'s> = Vec<(&'s str, Option<Error>)>;
+
+/// The outline of a file, or what the parts of `scope` point at in it, with each part and why it was not
+/// found if it was not. When no part is found, an error naming every part.
+fn read_one<'s>(langs: &Languages, path: &str, scope: Option<&'s str>) -> Result<(String, Parts<'s>), Error> {
     let src = open(langs, Path::new(path))?;
-    match scope {
-        None => Ok(view::render(&src.text, &src.defs, 0..src.text.len(), true)),
-        Some(scope) => Ok(view::render_hits(&src.text, &src.defs, &scope::resolve(scope, &src.defs, &src.text)?)),
+    let Some(scope) = scope else {
+        return Ok((view::render(&src.text, &src.defs, 0..src.text.len(), true), vec![]));
+    };
+    let (mut hits, mut parts) = (vec![], vec![]);
+    for (part, found) in scope::resolve_each(scope, &src.defs, &src.text) {
+        match found {
+            Ok(h) => {
+                hits.extend(h);
+                parts.push((part, None));
+            }
+            Err(e) => parts.push((part, Some(e))),
+        }
     }
+    if hits.is_empty() {
+        return Err(scope::joined(parts.into_iter().filter_map(|(_, e)| e)).expect("a scope has a part"));
+    }
+    Ok((view::render_hits(&src.text, &src.defs, &hits), parts))
 }
 
 #[cfg(test)]
@@ -479,7 +560,7 @@ mod tests {
         // Given: 関数のある Rust のファイル
         let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n}\n")]);
         // When: ファイルを読む
-        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: None }]).unwrap().0;
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: None }]).text;
         // Then: ボディを省略したアウトラインが返る
         assert_eq!(out, "1\tfn a() {\n3\t}\n");
     }
@@ -489,7 +570,7 @@ mod tests {
         // Given: 2 つの Rust のファイル
         let dir = dir_with(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
         // When: glob で読む
-        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "src/*.rs"), scope: None }]).unwrap().0;
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "src/*.rs"), scope: None }]).text;
         // Then: ファイルごとにパスの行が前に付く
         assert_eq!(
             out,
@@ -506,22 +587,62 @@ mod tests {
         let out =
             read(&Languages::builtin(), &[ReadItem { path: &a, scope: Some("b") }, ReadItem { path: &b, scope: None }]);
         // Then: 要素ごとに、パスの行の後にその内容が並ぶ
-        assert_eq!(out.unwrap().0, format!("{a}\n2\tfn b() {{}}\n{b}\n1\tfn c() {{}}\n"));
+        assert_eq!(out.text, format!("{a}\n2\tfn b() {{}}\n{b}\n1\tfn c() {{}}\n"));
     }
 
     #[test]
-    fn failing_item_fails_whole_read_with_its_number() {
+    fn failing_item_is_reported_in_its_place_and_others_are_read() {
         // Given: 関数が 1 つある Rust のファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
         let a = at(&dir, "a.rs");
-        // When: ファイル全体と、ない定義を、1 回で読む
-        let err = read(
+        // When: ない定義、ファイル全体の順に、1 回で読む
+        let out = read(
             &Languages::builtin(),
-            &[ReadItem { path: &a, scope: None }, ReadItem { path: &a, scope: Some("zzz") }],
+            &[ReadItem { path: &a, scope: Some("zzz") }, ReadItem { path: &a, scope: None }],
         );
-        // Then: 全体が not_found になり、2 つ目の要素だとわかる
-        let err = err.unwrap_err();
-        assert_eq!((err.code, err.item), ("not_found", Some(2)));
+        // Then: 1 つ目の位置に、1 つ目の要素だとわかる not_found が並び、2 つ目は読まれる。全体は失敗として扱われる
+        let lines: Vec<&str> = out.text.lines().collect();
+        assert_eq!(lines[0], a);
+        assert!(lines[1].starts_with("ok=false error=not_found") && lines[1].ends_with("item=1"), "{}", out.text);
+        assert_eq!(lines[2..], [a.as_str(), "1\tfn a() {}"]);
+        assert!(!out.ok);
+    }
+
+    #[test]
+    fn reading_comma_scope_with_missing_part_returns_found_and_appends_its_error() {
+        // Given: 関数が 2 つある Rust のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\nfn b() {}\n")]);
+        // When: a と、ない名前 zzz を , で区切ったスコープで読む
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: Some("a, zzz") }]);
+        // Then: a が返り、zzz のエラーが scope_errors として後ろに付く
+        let out = out.text;
+        let (text, errors) = out.split_once("scope_errors=").unwrap_or((&out, ""));
+        assert_eq!(text, "1\tfn a() {}\n");
+        assert!(errors.contains("scope=zzz") && errors.contains("not_found"), "{out}");
+    }
+
+    #[test]
+    fn reading_comma_scope_with_no_part_found_is_error_naming_each() {
+        // Given: 関数が 1 つある Rust のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
+        // When: ない名前 yyy と zzz を , で区切ったスコープで読む
+        let err = read_files(&Languages::builtin(), &at(&dir, "a.rs"), Some("yyy, zzz")).unwrap_err();
+        // Then: yyy と zzz の両方を挙げた not_found になる
+        assert_eq!(err.code, "not_found");
+        assert!(err.message.contains("yyy") && err.message.contains("zzz"), "{}", err.message);
+    }
+
+    #[test]
+    fn reading_glob_with_comma_scope_lists_only_parts_no_file_has() {
+        // Given: 関数 a のあるファイルと、関数 b のあるファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")]);
+        // When: glob で、a、b、ない名前 zzz を , で区切ったスコープで読む
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*.rs"), scope: Some("a,b,zzz") }]);
+        // Then: 両方のファイルが返り、scope_errors には zzz だけが挙がる
+        let out = out.text;
+        let (text, errors) = out.split_once("scope_errors=").unwrap_or((&out, ""));
+        assert!(text.contains("fn a() {}") && text.contains("fn b() {}"), "{out}");
+        assert!(errors.contains("scope=zzz") && !errors.contains("scope=a") && !errors.contains("scope=b"), "{out}");
     }
 
     fn read_error(files: &[(&str, &[u8])], name: &str) -> &'static str {
@@ -529,7 +650,7 @@ mod tests {
         for (n, bytes) in files {
             std::fs::write(dir.path().join(n), bytes).unwrap();
         }
-        read(&Languages::builtin(), &[ReadItem { path: &at(&dir, name), scope: None }]).unwrap_err().code
+        read_files(&Languages::builtin(), &at(&dir, name), None).unwrap_err().code
     }
 
     #[test]
@@ -607,7 +728,7 @@ mod tests {
         // When: [ と ] を含むパスで読む
         let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "app/[id]/page.tsx"), scope: None }]);
         // Then: そのファイルだけが読まれる
-        assert_eq!(out.unwrap().0, "1\texport function A() {}\n");
+        assert_eq!(out.text, "1\texport function A() {}\n");
     }
 
     #[test]
@@ -630,8 +751,7 @@ mod tests {
         // Given: 名前に [ と ] を含むディレクトリのファイルと、[id] の文字に一致するディレクトリのファイル
         let dir = bracket_dirs();
         // When: [ と ] を含む glob で読む
-        let (_, files) =
-            read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "app/[id]/*.tsx"), scope: None }]).unwrap();
+        let files = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "app/[id]/*.tsx"), scope: None }]).files;
         // Then: [ と ] は文字どおりに一致する
         assert_eq!(files, [at(&dir, "app/[id]/page.tsx")]);
     }
@@ -643,7 +763,7 @@ mod tests {
         let dir = dir_with(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
         // When: \ 区切りの glob で読む
         let glob = format!("{}\\src\\*.rs", dir.path().display());
-        let (_, files) = read(&Languages::builtin(), &[ReadItem { path: &glob, scope: None }]).unwrap();
+        let files = read(&Languages::builtin(), &[ReadItem { path: &glob, scope: None }]).files;
         // Then: / 区切りのときと同じファイルに一致する
         assert_eq!(files, [at(&dir, "src/a.rs"), at(&dir, "src/b.rs")]);
     }
@@ -657,7 +777,7 @@ mod tests {
             ReadItem { path: &at(&dir, "src/*.rs"), scope: None },
             ReadItem { path: &at(&dir, "src/a.rs"), scope: None },
         ];
-        let (_, files) = read(&Languages::builtin(), &items).unwrap();
+        let files = read(&Languages::builtin(), &items).files;
         // Then: 読んだファイルが、要素の順に並ぶ
         assert_eq!(files, [at(&dir, "src/a.rs"), at(&dir, "src/b.rs"), at(&dir, "src/a.rs")]);
     }
@@ -699,27 +819,30 @@ mod tests {
     }
 
     #[test]
-    fn failing_item_writes_nothing_and_has_its_number() {
+    fn failing_item_is_reported_with_its_number_and_others_are_written() {
         // Given: 呼び出しのある関数
         let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n}\n")]);
         let a = at(&dir, "a.rs");
         // When: 一致する書き換えと、一致しない書き換えを 1 回で渡す
         let reports = write_all(&[swap(&a, "x();", "v();"), swap(&a, "zzz();", "w();")]);
-        // Then: 何も書かれず、2 つ目の要素の not_found が報告される
-        assert_eq!(content(&dir, "a.rs"), "fn a() {\n    x();\n}\n");
-        assert_eq!((&reports[0]["error"], &reports[0]["item"]), (&json!("not_found"), &json!(2)));
+        // Then: 一致した方は書かれ、2 つ目の要素の not_found が報告される
+        assert_eq!(content(&dir, "a.rs"), "fn a() {\n    v();\n}\n");
+        let failure = reports.iter().find(|r| r["ok"] == false).expect("a failure");
+        assert_eq!((&failure["error"], &failure["item"]), (&json!("not_found"), &json!(2)));
     }
 
     #[test]
-    fn overlapping_items_write_nothing() {
-        // Given: 呼び出しが 2 つある関数
-        let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n    y();\n}\n")]);
+    fn overlapping_items_are_all_left_unwritten_and_others_are_written() {
+        // Given: 呼び出しが 3 つある関数
+        let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n    y();\n    z();\n}\n")]);
         let a = at(&dir, "a.rs");
-        // When: 書き換える範囲が重なる 2 つの書き換えを 1 回で渡す
-        let reports = write_all(&[swap(&a, "x();", "v();"), swap(&a, "x();\ny();", "w();")]);
-        // Then: overlap になり、何も書かれない
-        assert_eq!(reports[0]["error"], "overlap", "{reports:?}");
-        assert_eq!(content(&dir, "a.rs"), "fn a() {\n    x();\n    y();\n}\n");
+        // When: 範囲が重なる 2 つの書き換えと、重ならない書き換えを 1 回で渡す
+        let reports = write_all(&[swap(&a, "x();", "v();"), swap(&a, "x();\ny();", "w();"), swap(&a, "z();", "u();")]);
+        // Then: 重なった 2 つは書かれずに overlap と報告され、重ならない 1 つは書かれる
+        assert_eq!(content(&dir, "a.rs"), "fn a() {\n    x();\n    y();\n    u();\n}\n");
+        let overlap = reports.iter().find(|r| r["error"] == "overlap").expect("an overlap report");
+        let message = overlap["message"].as_str().unwrap_or_default();
+        assert!(message.contains('1') && message.contains('2'), "{reports:?}");
     }
 
     #[test]
@@ -735,13 +858,24 @@ mod tests {
     }
 
     #[test]
-    fn failure_in_one_file_writes_no_file() {
+    fn failure_in_one_file_leaves_items_for_other_files_written() {
         // Given: 呼び出しのある 2 つのファイル
         let dir = dir_with(&[("a.rs", "fn a() { x(); }\n"), ("b.rs", "fn b() { x(); }\n")]);
         let (a, b) = (at(&dir, "a.rs"), at(&dir, "b.rs"));
         // When: 一致する書き換えと、別のファイルで一致しない書き換えを 1 回で渡す
         write_all(&[swap(&a, "x();", "v();"), swap(&b, "zzz();", "w();")]);
-        // Then: どちらのファイルも書かれない
+        // Then: 一致した方のファイルは書かれる
+        assert_eq!(content(&dir, "a.rs"), "fn a() { v(); }\n");
+    }
+
+    #[test]
+    fn glob_item_failing_in_one_file_is_written_to_no_file() {
+        // Given: 呼び出しが 1 つのファイルと、同じ呼び出しが 2 つあるファイル
+        let dir = dir_with(&[("a.rs", "fn a() { x(); }\n"), ("b.rs", "fn b() { x(); x(); }\n")]);
+        // When: glob で両方のファイルに書く
+        let reports = write_all(&[swap(&at(&dir, "*.rs"), "x();", "v();")]);
+        // Then: b.rs で ambiguous になり、a.rs にも書かれない
+        assert!(reports.iter().any(|r| r["error"] == "ambiguous"), "{reports:?}");
         assert_eq!(content(&dir, "a.rs"), "fn a() { x(); }\n");
     }
 
@@ -778,6 +912,20 @@ mod tests {
                 {"range": "9-10", "parents": ["class Bar"], "signature": "fun bar(s: String)"},
             ])
         );
+    }
+
+    #[test]
+    fn write_to_comma_scope_with_missing_part_writes_nothing() {
+        // Given: 関数が 1 つある Rust のファイル
+        let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
+        // When: a と、ない名前 zzz を , で区切ったスコープに、all_matches で書く
+        let req =
+            WriteRequest { path: &at(&dir, "a.rs"), scope: Some("a, zzz"), after: "fn b() {}", ..Default::default() };
+        let reports = write_in(&dir, WriteRequest { all_matches: true, ..req });
+        // Then: zzz を挙げた not_found になり、ファイルはそのまま
+        assert_eq!(reports[0]["error"], "not_found");
+        assert!(reports[0]["message"].as_str().unwrap_or_default().contains("zzz"), "{reports:?}");
+        assert_eq!(content(&dir, "a.rs"), "fn a() {}\n");
     }
 
     #[test]
@@ -932,7 +1080,7 @@ mod tests {
         // Given: .gitignore で target/ を除外したディレクトリ
         let dir = dir_with(&[(".gitignore", "target/\n"), ("a.rs", "fn a() {}\n"), ("target/b.rs", "fn b() {}\n")]);
         // When: ** の glob で読む
-        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "**/*.rs"), scope: None }]).unwrap().0;
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "**/*.rs"), scope: None }]).text;
         // Then: 除外されたファイルは含まれない
         assert!(!out.contains("b.rs"), "{out}");
         assert!(out.contains("a.rs"));
@@ -943,7 +1091,7 @@ mod tests {
         // Given: Rust のファイルと JSON のファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.json", "{}")]);
         // When: 両方に一致する glob で読む
-        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*"), scope: None }]).unwrap().0;
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*"), scope: None }]).text;
         // Then: 言語パッケージのない JSON は飛ばされ、Rust のファイルは読める
         assert!(out.starts_with(&format!("{}\n1\tfn a() {{}}\n", at(&dir, "a.rs"))), "{out}");
         assert!(!out.contains("b.json"), "{out}");
@@ -954,7 +1102,7 @@ mod tests {
         // Given: Rust のファイルだけがあるディレクトリ
         let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
         // When: どのファイルにも一致しない glob で読む
-        let err = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*.kt"), scope: None }]).unwrap_err();
+        let err = read_files(&Languages::builtin(), &at(&dir, "*.kt"), None).unwrap_err();
         // Then: not_found になる
         assert_eq!(err.code, "not_found");
     }
@@ -964,7 +1112,7 @@ mod tests {
         // Given: 関数 a だけがある Rust のファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
         // When: スコープ b で読む
-        let err = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "a.rs"), scope: Some("b") }]).unwrap_err();
+        let err = read_files(&Languages::builtin(), &at(&dir, "a.rs"), Some("b")).unwrap_err();
         // Then: スコープの名前を挙げた not_found になる
         assert_eq!(err.code, "not_found");
         assert!(err.message.contains("b"), "{}", err.message);
@@ -975,7 +1123,7 @@ mod tests {
         // Given: 関数 a を持つファイルと、関数 b を持つファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")]);
         // When: 両方に一致する glob を、スコープ a で読む
-        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*.rs"), scope: Some("a") }]).unwrap().0;
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*.rs"), scope: Some("a") }]).text;
         // Then: a を持つファイルだけが出る
         assert_eq!(out, format!("{}\n1\tfn a() {{}}\n", at(&dir, "a.rs")));
     }
@@ -985,7 +1133,7 @@ mod tests {
         // Given: 関数 a だけを持つファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n")]);
         // When: glob を、どのファイルにもないスコープ b で読む
-        let err = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*.rs"), scope: Some("b") }]).unwrap_err();
+        let err = read_files(&Languages::builtin(), &at(&dir, "*.rs"), Some("b")).unwrap_err();
         // Then: not_found になる
         assert_eq!(err.code, "not_found");
     }
@@ -995,7 +1143,7 @@ mod tests {
         // Given: 言語パッケージのないファイルだけがあるディレクトリ
         let dir = dir_with(&[("a.json", "{}"), ("b.json", "{}"), ("c.yaml", "a: 1\n")]);
         // When: glob で読む
-        let err = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*"), scope: None }]).unwrap_err();
+        let err = read_files(&Languages::builtin(), &at(&dir, "*"), None).unwrap_err();
         // Then: unsupported_language になり、飛ばした拡張子ごとの件数を持つ
         assert_eq!(err.code, "unsupported_language");
         assert_eq!(
@@ -1009,7 +1157,7 @@ mod tests {
         // Given: Rust のファイルと JSON のファイル
         let dir = dir_with(&[("a.rs", "fn a() {}\n"), ("b.json", "{}")]);
         // When: glob で読む
-        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*"), scope: None }]).unwrap().0;
+        let out = read(&Languages::builtin(), &[ReadItem { path: &at(&dir, "*"), scope: None }]).text;
         // Then: 出力の最後の行に、飛ばした拡張子ごとの件数が MISON で付く
         let last = "skipped=(reason=unsupported_language extensions=(json=1))";
         assert_eq!(out, format!("{}\n1\tfn a() {{}}\n{last}\n", at(&dir, "a.rs")));
