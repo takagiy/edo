@@ -216,7 +216,6 @@ fn scope_errors(parts: &[(&str, Option<Error>)]) -> String {
     if errors.is_empty() { String::new() } else { format!("{}\n", crate::report(&json!({ "scope_errors": errors }))) }
 }
 
-/// What `write` does with each match (or the whole target without `before`), for both the CLI and MCP.
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {

@@ -42,14 +42,14 @@ pub struct WriteParams {
     pub path: Option<String>,
     /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M), or several separated by commas.
     pub scope: Option<String>,
-    /// Code to find. Omit to target the whole `scope` (or the whole file).
+    /// Code to find. Omit to target the whole `scope`, or the whole file without `scope`.
     pub before: Option<String>,
     /// Code to write. Empty deletes the target.
     pub after: Option<String>,
     /// Edit every match instead of failing as ambiguous.
     #[serde(default)]
     pub all_matches: bool,
-    /// What to do with each match (or with the whole target when `before` is omitted).
+    /// Where to put `after`; it replaces each match by default.
     #[serde(default)]
     pub mode: Mode,
     /// More edits, given by number as `path_0`, `before_0` and so on, after the one given by `path`.
@@ -64,14 +64,14 @@ pub struct EditParams {
     pub path: String,
     /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M), or several separated by commas.
     pub scope: Option<String>,
-    /// Code to find. Omit to target the whole `scope` (or the whole file).
+    /// Code to find. Omit to target the whole `scope`, or the whole file without `scope`.
     pub before: Option<String>,
     /// Code to write. Empty deletes the target.
     pub after: String,
     /// Edit every match instead of failing as ambiguous.
     #[serde(default)]
     pub all_matches: bool,
-    /// What to do with each match (or with the whole target when `before` is omitted).
+    /// Where to put `after`; it replaces each match by default.
     #[serde(default)]
     pub mode: Mode,
 }
@@ -185,12 +185,9 @@ impl Server {
         self.stamps.lock().unwrap().get(&key).is_some_and(|s| stamp(path).as_ref() != Some(s))
     }
 
-    #[tool(description = "Read a source file with line numbers (`N<TAB>line`). Function and method bodies are \
-        hidden: they leave gaps in the line numbers, or show as `...` when they share a line with other code.\n\n\
-        To see more, pass `scope`: an identifier such as `Foo.bar` or `Foo::bar` (a function shows in full; a class \
-        shows its members with bodies hidden), or a line range `N` or `N-M` (shown in full). Separate several scopes with commas; parts not found are listed in `scope_errors`. `path` may be a glob with `*` and `?`.\n\n\
-To read several things in one call, give each a `path` and `scope` with its own number, as `path_0`, \
-        `scope_0`, `path_1` and so on; each one's text follows its path. One that fails has its error there instead, and the others are still read.")]
+    #[tool(description = "Read a source file. Function and method bodies are hidden or shown as `...`; pass \
+    `scope` to see one in full.\n\n\
+        To read several files or scopes in one call, number them: `path_0`, `scope_0`, `path_1`, and so on.")]
     fn read(&self, Parameters(p): Parameters<ReadParams>) -> CallToolResult {
         let first = p.path.as_deref().map(|path| command::ReadItem { path, scope: p.scope.as_deref() });
         let rest = p.numbered.0.iter().map(|r| command::ReadItem { path: &r.path, scope: r.scope.as_deref() });
@@ -211,18 +208,12 @@ To read several things in one call, give each a `path` and `scope` with its own 
         if ok { CallToolResult::success(text) } else { CallToolResult::error(text) }
     }
 
-    #[tool(description = "Edit a source file: find `before` and replace it with `after`, or insert `after` next \
-        to it (see `mode`).\n\n\
-        `before` is matched ignoring indentation, line breaks and spacing, and must match exactly once in `scope` \
-        unless `all_matches` is set; if it is ambiguous, re-run with a candidate's line range as `scope`. Without \
-        `before`, the target is the whole `scope` (a definition with its docs, or a line range), or the whole file \
-        without `scope` (created if missing).\n\n\
-        `after` is re-indented to fit, so its indentation does not need to match the file. An empty `after` deletes \
-        the target.\n\n\
-        On success, `replaced` gives the line ranges that now hold `after`; there is no need to read the file back.\n\n\
-        To make several edits in one call, give each the same fields with its own number, as `path_0`, `before_0`, \
-`after_0`, `path_1` and so on. All of them are matched against the files as they are now. One that is not found, is ambiguous or overlaps another is reported and \
-        written nowhere; the others are written.")]
+    #[tool(description = "Edit or create a source file.\n\n\
+        Pass `scope` to replace a definition or a line range. Pass `before` to replace the code that matches it on \
+        the AST, searched within `scope` if given.\n\n\
+        A successful write needs no read-back.\n\n\
+        To make several edits in one call, number them: `path_0`, `before_0`, `after_0`, `path_1`, and so on. All \
+        are matched against the files before any is written.")]
     fn write(&self, Parameters(p): Parameters<WriteParams>) -> CallToolResult {
         let first = match (p.path, p.after) {
             (Some(path), Some(after)) => Some(EditParams {
