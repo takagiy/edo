@@ -1,0 +1,46 @@
+name: Release
+
+# Publishes a version tag such as v0.2.0: the binaries to a GitHub release, and the crates to crates.io.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: jdx/mise-action@v5
+      - name: Check that the tag matches the version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "edo-mcp") | .version')
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME is not v$version"; exit 1; }
+      - run: mise run check
+      - run: mise run release
+      - run: gh release create "$GITHUB_REF_NAME" target/edo-*.tar.gz --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+      # Trusted Publishing works only for crates already on crates.io, so their first release uses the
+      # CARGO_REGISTRY_TOKEN secret instead.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+        continue-on-error: true
+      # brokk's own Cargo.toml makes cargo leave the grammar out of edo-tree-sitter-kotlin as another package.
+      - run: rm crates/edo-tree-sitter-kotlin/brokk/Cargo.toml
+      - name: Publish the crates whose versions are not on crates.io yet
+        run: |
+          for crate in edo-lsp-client edo-tree-sitter-kotlin edo-mcp; do
+            version=$(cargo metadata --no-deps --format-version 1 | jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version')
+            if curl -sf "https://index.crates.io/${crate:0:2}/${crate:2:2}/$crate" | grep -qF "\"vers\":\"$version\""; then
+              echo "$crate $version is already on crates.io"
+            else
+              cargo publish -p "$crate" --allow-dirty
+            fi
+          done
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
