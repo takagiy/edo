@@ -13,6 +13,7 @@ use crate::language::Languages;
 use crate::lsp::Servers;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadParams {
     /// File path or glob.
     pub path: Option<String>,
@@ -24,6 +25,7 @@ pub struct ReadParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadTarget {
     /// File path or glob.
     pub path: String,
@@ -32,6 +34,7 @@ pub struct ReadTarget {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WriteParams {
     /// File path or glob.
     pub path: Option<String>,
@@ -53,6 +56,7 @@ pub struct WriteParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EditParams {
     /// File path or glob.
     pub path: String,
@@ -358,6 +362,38 @@ mod tests {
         let (_, is_error) = tool(&client, "read", json!({"path": "missing.rs"})).await;
         // Then: isError が立つ
         assert!(is_error);
+    }
+
+    #[tokio::test]
+    async fn unknown_argument_is_an_error_naming_it() {
+        // Given: 関数が 1 つあるファイル
+        let (_dir, path) = file("fn a() {}\n");
+        let client = connect().await;
+        // When: 綴りを誤った引数 (befor) を付けて write を呼ぶ
+        let (error, is_error) = tool(&client, "write", json!({"path": path, "befor": "a", "after": "b"})).await;
+        // Then: その名前を挙げたエラーになり、ファイルはそのまま
+        assert!(is_error && error.contains("befor"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {}\n");
+    }
+
+    #[tokio::test]
+    async fn unknown_argument_in_edits_or_reads_is_an_error() {
+        // Given: 関数が 1 つあるファイル
+        let (_dir, path) = file("fn a() {}\n");
+        let client = connect().await;
+        // When: edits と reads の要素に知らない引数を付けて呼ぶ
+        let (write, write_failed) = tool(
+            &client,
+            "write",
+            json!({"path": path, "after": "x", "edits": [{"path": path, "after": "y", "lines": "1"}]}),
+        )
+        .await;
+        let (read, read_failed) =
+            tool(&client, "read", json!({"path": path, "reads": [{"path": path, "range": "1"}]})).await;
+        // Then: どちらもその名前を挙げたエラーになり、ファイルはそのまま
+        assert!(write_failed && write.contains("lines"), "{write}");
+        assert!(read_failed && read.contains("range"), "{read}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {}\n");
     }
 
     #[tokio::test]
