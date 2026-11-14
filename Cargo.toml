@@ -1,6 +1,6 @@
 [package]
 name = "edo-mcp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "An MCP server and CLI that agents use to read and write code by its syntax tree"

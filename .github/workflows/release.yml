@@ -21,11 +21,8 @@ jobs:
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "edo-mcp") | .version')
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME is not v$version"; exit 1; }
       - run: mise run check
-      # Trusted Publishing works only for crates already on crates.io, so their first release uses the
-      # CARGO_REGISTRY_TOKEN secret instead.
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
-        continue-on-error: true
       # brokk's own Cargo.toml makes cargo leave the grammar out of edo-tree-sitter-kotlin as another package.
       - run: rm crates/edo-tree-sitter-kotlin/brokk/Cargo.toml
       - name: Publish the crates whose versions are not on crates.io yet
@@ -39,4 +36,4 @@ jobs:
             fi
           done
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
