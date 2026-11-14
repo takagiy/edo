@@ -1,9 +1,10 @@
 //! A language package's `[package.lsp]`: how to start its language server and where its project is.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use edo_lsp_client::{Client, DiagnosticSeverity, Unavailable};
+use edo_lsp_client::{Client, DiagnosticSeverity, FormatError, Unavailable};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -67,6 +68,29 @@ impl Lsp {
 #[derive(Default)]
 pub struct Servers {
     clients: Vec<(String, Client)>,
+    /// What is still owed to the agent about each file written, by absolute path.
+    pending: HashMap<PathBuf, Pending>,
+}
+
+/// What edo still owes the agent about a file it wrote: the formatting its server was not ready for, and the
+/// errors the write added that come after it.
+struct Pending {
+    /// The path as the write was given it, for the report.
+    file: String,
+    /// The file's text as edo left it; a file holding something else changed since, and is left alone.
+    text: String,
+    format: bool,
+    /// The errors before the write, at their lines in `text`; `None` when the server did not give them in time.
+    before: Option<Vec<Diagnostic>>,
+    /// The errors the write added that the agent has heard of.
+    told: Vec<Diagnostic>,
+}
+
+impl Pending {
+    fn new(written: &Written) -> Pending {
+        let file = written.path.to_string_lossy().into_owned();
+        Pending { file, text: written.after.into(), format: false, before: None, told: vec![] }
+    }
 }
 
 impl Servers {
@@ -80,17 +104,23 @@ impl Servers {
         let found = match self.server(&written.lang.name, lsp, &lsp.root(&path), wait()) {
             Ok(Some(at)) => {
                 let client = &mut self.clients[at].1;
-                let found = warnings(client, &path, written, wait());
+                let found = added_errors(client, &path, written, wait());
                 // A save starts the checks a server runs only on saved files, such as cargo check; their
-                // diagnostics come later, for a read to report.
+                // diagnostics come later, for the next call's news.
                 client.saved(&path, written.after);
+                let pending = self.pending.entry(path.clone()).or_insert_with(|| Pending::new(written));
+                pending.text = written.after.into();
+                (pending.before, pending.told) = match &found {
+                    Ok((before, added)) => (Some(before.clone()), added.clone()),
+                    Err(_) => (None, vec![]),
+                };
                 found.map_err(|e| (at, e))
             }
             Ok(None) => return Map::new(),
             Err(failed) => Err(failed),
         };
         let status = match found {
-            Ok(found) => return found,
+            Ok((_, added)) => return reported(&added),
             Err((_, Unavailable::Late)) => "starting",
             Err((at, Unavailable::Closed)) => {
                 self.clients.remove(at);
@@ -100,6 +130,89 @@ impl Servers {
         Map::from_iter([("lsp".to_string(), json!(status))])
     }
 
+    /// What happened since the last call to the files edo wrote, for the agent to hear once: the formatting their
+    /// server was not ready for at the write, done now that it is, and the errors the write added that came after
+    /// it. Returns the report, `None` when nothing happened, and the files formatting rewrote.
+    pub fn news(&mut self, langs: &Languages) -> (Option<Value>, Vec<String>) {
+        let (mut formatted, mut refused, mut late_errors, mut rewritten) = (vec![], vec![], vec![], vec![]);
+        let paths: Vec<PathBuf> = self.pending.keys().cloned().collect();
+        for path in paths {
+            let on_disk = std::fs::read_to_string(&path).ok();
+            if on_disk.as_deref() != Some(self.pending[&path].text.as_str()) {
+                self.pending.remove(&path);
+                continue;
+            }
+            let Some((lang, lsp)) = langs.for_path(&path).and_then(|l| Some((l, l.lsp.as_ref()?))) else { continue };
+            let root = lsp.root(&path);
+            let Some(at) = self.clients.iter().position(|(l, c)| *l == lang.name && c.serves(&root)) else { continue };
+            let (client, pending) = (&mut self.clients[at].1, self.pending.get_mut(&path).expect("listed"));
+            if pending.format && client.is_ready() {
+                pending.format = false;
+                let (tab_size, spaces) = indentation(&pending.text);
+                match client.format(&path, &pending.text, tab_size, spaces, WAIT) {
+                    Ok(text) if text != pending.text && std::fs::write(&path, &text).is_ok() => {
+                        client.saved(&path, &text);
+                        let hunks = crate::diagnostic::hunks(&pending.text, &text);
+                        let changed = hunks.iter().filter(|h| !h.new.is_empty());
+                        let lines: Vec<String> =
+                            changed.map(|h| format!("{}-{}", h.new.start, h.new.end - 1)).collect();
+                        formatted.push(json!({"file": pending.file, "lines": lines}));
+                        rewritten.push(pending.file.clone());
+                        let moved = |errors: &[Diagnostic]| -> Vec<Diagnostic> {
+                            let at = |e: &Diagnostic| crate::diagnostic::moved(&hunks, e.line);
+                            errors
+                                .iter()
+                                .filter_map(|e| Some(Diagnostic { line: at(e)?, message: e.message.clone() }))
+                                .collect()
+                        };
+                        pending.before = pending.before.as_deref().map(moved);
+                        pending.told = moved(&pending.told);
+                        pending.text = text;
+                    }
+                    Ok(_) => {}
+                    Err(FormatError::Failed(message)) => {
+                        refused.push(json!({"file": pending.file, "message": message}))
+                    }
+                    Err(FormatError::Unavailable(_)) => pending.format = true,
+                }
+            }
+            if let Some(before) = &pending.before {
+                let added = new_errors(before, errors(client.known(&path)), Some);
+                let new: Vec<Diagnostic> = added.into_iter().filter(|e| !pending.told.contains(e)).collect();
+                if !new.is_empty() {
+                    let found: Vec<Value> = new.iter().map(|e| json!({"line": e.line, "message": e.message})).collect();
+                    late_errors.push(json!({"file": pending.file, "errors": found}));
+                    pending.told.extend(new);
+                }
+            }
+        }
+        let news: Map<String, Value> =
+            [("formatted", formatted), ("format_refused", refused), ("new_lsp_errors", late_errors)]
+                .into_iter()
+                .filter(|(_, found)| !found.is_empty())
+                .map(|(key, found)| (key.to_string(), found.into()))
+                .collect();
+        ((!news.is_empty()).then(|| news.into()), rewritten)
+    }
+
+    /// `written.after` formatted by the language's server, indented as the file is, waiting until `deadline`; as is
+    /// when the language has no server, or the server's message when it refused. A server not ready yet formats the
+    /// file for a later call's news.
+    pub fn format(&mut self, written: &Written, deadline: Instant) -> Result<String, String> {
+        let as_is = || Ok(written.after.to_string());
+        let (Some(lsp), Ok(path)) = (&written.lang.lsp, std::path::absolute(written.path)) else { return as_is() };
+        let wait = || deadline.saturating_duration_since(Instant::now());
+        let Ok(Some(at)) = self.server(&written.lang.name, lsp, &lsp.root(&path), wait()) else { return as_is() };
+        let (tab_size, spaces) = indentation(written.after);
+        let found = self.clients[at].1.format(&path, written.after, tab_size, spaces, wait());
+        let pending = self.pending.entry(path).or_insert_with(|| Pending::new(written));
+        pending.format = found == Err(FormatError::Unavailable(Unavailable::Late));
+        match found {
+            Ok(text) => Ok(text),
+            Err(FormatError::Failed(message)) => Err(message),
+            Err(FormatError::Unavailable(_)) => as_is(),
+        }
+    }
     /// The errors the servers have sent so far for each of `files`, without waiting, as
     /// `{"lsp_errors": [{"file", "errors": [{"line", "message"}]}]}`; `None` when none of them has any.
     /// They come from checks a write started, such as cargo check, which take longer than a write waits.
@@ -161,14 +274,42 @@ pub fn warnings(
     written: &Written,
     wait: Duration,
 ) -> Result<Map<String, Value>, Unavailable> {
+    added_errors(client, path, written, wait).map(|(_, added)| reported(&added))
+}
+
+/// The errors before a write, moved to their lines after it, and the errors the write added.
+fn added_errors(
+    client: &mut Client,
+    path: &Path,
+    written: &Written,
+    wait: Duration,
+) -> Result<(Vec<Diagnostic>, Vec<Diagnostic>), Unavailable> {
     let before = errors(client.diagnostics(path, written.before, wait)?);
     let after = errors(client.diagnostics(path, written.after, wait)?);
-    let added = new_errors(&before, after, written.hunks);
+    let moved =
+        |l| crate::diagnostic::moved(written.hunks, l).and_then(|l| crate::diagnostic::moved(written.formatted, l));
+    let before: Vec<Diagnostic> =
+        before.into_iter().filter_map(|d| Some(Diagnostic { line: moved(d.line)?, message: d.message })).collect();
+    let added = new_errors(&before, after, Some);
+    Ok((before, added))
+}
+
+/// `new_lsp_errors` for the errors a write added, or nothing when it added none.
+fn reported(added: &[Diagnostic]) -> Map<String, Value> {
     if added.is_empty() {
-        return Ok(Map::new());
+        return Map::new();
     }
     let added: Vec<Value> = added.iter().map(|e| json!({"line": e.line, "message": e.message})).collect();
-    Ok(Map::from_iter([("new_lsp_errors".to_string(), added.into())]))
+    Map::from_iter([("new_lsp_errors".to_string(), added.into())])
+}
+
+/// LSP formatting options for a file indented as `text` is: columns per level, and whether by spaces.
+fn indentation(text: &str) -> (u32, bool) {
+    match crate::edit::indent_unit(&crate::edit::indents(text.lines())) {
+        Some(unit) if unit == "\t" => (4, false),
+        Some(unit) => (unit.len() as u32, true),
+        None => (4, true),
+    }
 }
 
 /// The errors among a server's diagnostics, by line (counting from 1) and message.
@@ -256,16 +397,40 @@ mod tests {
 
     /// A language server on another thread that answers initialize with `capabilities` and publishes, for each
     /// line of a document, an error `bad` where the line holds ERR and a warning `meh` where it holds WARN; or,
-    /// when `silent`, publishes nothing. On a save it publishes the error `saved`, as a check would.
+    /// when `silent`, publishes nothing. On a save it publishes the error `saved`, as a check would. It formats a
+    /// document by adding a first line with the options it was asked with, and refuses one holding REFUSE.
     fn fake_server_with(silent: bool, capabilities: Value) -> Client {
+        gated_server(silent, capabilities, None)
+    }
+
+    /// Like `fake_server_with`, but answers initialize only once `gate` opens, when there is one.
+    fn gated_server(silent: bool, capabilities: Value, gate: Option<std::sync::mpsc::Receiver<()>>) -> Client {
         use lsp_server::{Message, Notification, Response};
         let (client_reads, server_writes) = std::io::pipe().unwrap();
         let (server_reads, client_writes) = std::io::pipe().unwrap();
         std::thread::spawn(move || {
             let (mut reader, mut writer) = (std::io::BufReader::new(server_reads), server_writes);
+            let mut document = String::new();
             while let Ok(Some(message)) = Message::read(&mut reader) {
+                if let Message::Notification(n) = &message {
+                    let text = n.params["contentChanges"][0]["text"].as_str();
+                    document = text.or(n.params["textDocument"]["text"].as_str()).unwrap_or(&document).to_string();
+                }
                 let reply: Message = match message {
-                    Message::Request(r) => Response::new_ok(r.id, json!({ "capabilities": capabilities })).into(),
+                    Message::Request(r) if r.method == "textDocument/formatting" && document.contains("REFUSE") => {
+                        Response::new_err(r.id, -32603, "cannot format".into()).into()
+                    }
+                    Message::Request(r) if r.method == "textDocument/formatting" => {
+                        let (o, at) = (&r.params["options"], json!({"line": 0, "character": 0}));
+                        let line = format!("// {} {}\n", o["tabSize"], o["insertSpaces"]);
+                        Response::new_ok(r.id, json!([{"range": {"start": at, "end": at}, "newText": line}])).into()
+                    }
+                    Message::Request(r) => {
+                        if let Some(gate) = &gate {
+                            let _ = gate.recv();
+                        }
+                        Response::new_ok(r.id, json!({ "capabilities": capabilities })).into()
+                    }
                     Message::Notification(n) if n.method == "textDocument/didSave" => {
                         let at = json!({"line": 0, "character": 0});
                         let saved = json!({"range": {"start": at, "end": at}, "severity": 1, "message": "saved"});
@@ -306,7 +471,7 @@ mod tests {
         let langs = crate::language::Languages::builtin();
         let lang = langs.for_path(Path::new("a.rs")).unwrap();
         let path = std::env::temp_dir().join("a.rs");
-        let written = Written { lang, path: &path, before, after, hunks };
+        let written = Written { lang, path: &path, before, after, hunks, formatted: &[] };
         Value::Object(warnings(client, &path, &written, Duration::from_secs(5)).unwrap())
     }
 
@@ -371,7 +536,7 @@ mod tests {
         let langs = crate::language::Languages::builtin();
         let lang = langs.for_path(Path::new("a.rs")).unwrap();
         let path = std::env::temp_dir().join("a.rs");
-        let written = Written { lang, path: &path, before: "a\n", after: "b\n", hunks: &[] };
+        let written = Written { lang, path: &path, before: "a\n", after: "b\n", hunks: &[], formatted: &[] };
         // When: 待つ時間を 300ms にして LSP の警告を求める
         let start = std::time::Instant::now();
         let found = warnings(&mut client, &path, &written, Duration::from_millis(300));
@@ -387,14 +552,14 @@ mod tests {
         let path = std::path::absolute(std::env::temp_dir().join("a.rs")).unwrap();
         let mut servers = Servers::default();
         servers.clients.push((lang.name.clone(), client));
-        let written = Written { lang, path: &path, before: "a\n", after: "b\n", hunks: &[] };
+        let written = Written { lang, path: &path, before: "a\n", after: "b\n", hunks: &[], formatted: &[] };
         let found = Value::Object(servers.check(&written, Instant::now() + WAIT));
         (servers, found)
     }
 
     /// A write of `<dir>/a.rs`, whose root is `dir` as no Cargo.toml is above it.
     fn write_in<'a>(lang: &'a Language, dir: &'a Path) -> Written<'a> {
-        Written { lang, path: dir.join("a.rs").leak(), before: "a\n", after: "b\n", hunks: &[] }
+        Written { lang, path: dir.join("a.rs").leak(), before: "a\n", after: "b\n", hunks: &[], formatted: &[] }
     }
 
     #[test]
@@ -467,6 +632,124 @@ mod tests {
     }
 
     #[test]
+    fn formatting_server_formats_with_files_indentation() {
+        // Given: 整形する Rust のサーバー
+        let langs = crate::language::Languages::builtin();
+        let lang = langs.for_path(Path::new("a.rs")).unwrap();
+        let mut servers = Servers::default();
+        servers.clients.push((lang.name.clone(), fake_server_with(false, json!({"documentFormattingProvider": true}))));
+        // When: 2 スペースで字下げしたファイルを書く前に整形させる
+        let after = "fn a() {\n  x();\n}\n";
+        let temp = std::env::temp_dir();
+        let written = Written { after, ..write_in(lang, &temp) };
+        let formatted = servers.format(&written, Instant::now() + WAIT);
+        // Then: 幅 2 のスペースで整形させた内容が返る
+        assert_eq!(formatted, Ok(format!("// 2 true\n{after}")));
+    }
+
+    #[test]
+    fn refused_formatting_returns_servers_message() {
+        // Given: 整形する Rust のサーバー
+        let langs = crate::language::Languages::builtin();
+        let lang = langs.for_path(Path::new("a.rs")).unwrap();
+        let mut servers = Servers::default();
+        servers.clients.push((lang.name.clone(), fake_server_with(false, json!({"documentFormattingProvider": true}))));
+        // When: サーバーが整形を断るファイルを整形させる
+        let temp = std::env::temp_dir();
+        let written = Written { after: "REFUSE\n", ..write_in(lang, &temp) };
+        let formatted = servers.format(&written, Instant::now() + WAIT);
+        // Then: サーバーのメッセージが返る
+        assert_eq!(formatted, Err("cannot format".to_string()));
+    }
+
+    /// A file of `text` straight in the temporary directory, which the fake servers take as their folder.
+    fn temp_file(name: &str, text: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// The news, asked for until it holds `key` or a few seconds pass, as servers answer on their own time.
+    fn news_with(servers: &mut Servers, key: &str) -> (Option<Value>, Vec<String>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let news = servers.news(&crate::language::Languages::builtin());
+            if news.0.as_ref().is_some_and(|n| !n[key].is_null()) || Instant::now() > deadline {
+                return news;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn file_written_before_server_was_ready_is_formatted_at_next_news() {
+        // Given: 整形するが、まだ準備ができていない Rust のサーバーで書いたファイル
+        let langs = crate::language::Languages::builtin();
+        let lang = langs.for_path(Path::new("a.rs")).unwrap();
+        let (open, gate) = std::sync::mpsc::channel();
+        let mut servers = Servers::default();
+        let capabilities = json!({"documentFormattingProvider": true});
+        servers.clients.push((lang.name.clone(), gated_server(false, capabilities, Some(gate))));
+        let path = temp_file("edo-news-format.rs", "fn a() {}\n");
+        let written = Written { lang, path: &path, before: "", after: "fn a() {}\n", hunks: &[], formatted: &[] };
+        let soon = Instant::now() + Duration::from_millis(50);
+        assert_eq!(servers.format(&written, soon), Ok("fn a() {}\n".to_string()));
+        servers.check(&written, soon);
+        // When: サーバーの準備ができてから、知らせを求める
+        open.send(()).unwrap();
+        let (news, rewritten) = news_with(&mut servers, "formatted");
+        // Then: ファイルが整形され、変わった 1 行目と、書き換えたファイルが返る
+        let file = path.to_string_lossy().into_owned();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "// 4 true\nfn a() {}\n");
+        assert_eq!(news.map(|n| n["formatted"].clone()), Some(json!([{"file": file, "lines": ["1-1"]}])));
+        assert_eq!(rewritten, [file]);
+    }
+
+    #[test]
+    fn file_changed_before_news_is_not_formatted() {
+        // Given: 準備ができていないサーバーで書いた後に、外で書き換えられたファイル
+        let langs = crate::language::Languages::builtin();
+        let lang = langs.for_path(Path::new("a.rs")).unwrap();
+        let (open, gate) = std::sync::mpsc::channel();
+        let mut servers = Servers::default();
+        let capabilities = json!({"documentFormattingProvider": true});
+        servers.clients.push((lang.name.clone(), gated_server(false, capabilities, Some(gate))));
+        let path = temp_file("edo-news-changed.rs", "fn a() {}\n");
+        let written = Written { lang, path: &path, before: "", after: "fn a() {}\n", hunks: &[], formatted: &[] };
+        let soon = Instant::now() + Duration::from_millis(50);
+        servers.format(&written, soon).unwrap();
+        servers.check(&written, soon);
+        std::fs::write(&path, "fn b() {}\n").unwrap();
+        // When: サーバーの準備ができてから、知らせを求める
+        open.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let (news, rewritten) = servers.news(&langs);
+        // Then: 整形されず、何も返らない
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn b() {}\n");
+        assert_eq!((news, rewritten), (None, vec![]));
+    }
+
+    #[test]
+    fn errors_a_write_added_that_came_after_it_are_news_once() {
+        // Given: 保存されるとエラー saved を送るサーバーで書いたファイル
+        let langs = crate::language::Languages::builtin();
+        let lang = langs.for_path(Path::new("a.rs")).unwrap();
+        let mut servers = Servers::default();
+        servers.clients.push((lang.name.clone(), fake_server_with(false, json!({"textDocumentSync": {"save": true}}))));
+        let path = temp_file("edo-news-errors.rs", "b\n");
+        let written = Written { lang, path: &path, before: "a\n", after: "b\n", hunks: &[], formatted: &[] };
+        servers.check(&written, Instant::now() + WAIT);
+        // When: 知らせを 2 回求める
+        let (first, _) = news_with(&mut servers, "new_lsp_errors");
+        let (second, _) = servers.news(&langs);
+        // Then: 1 回目にだけ、そのエラーが返る
+        let file = path.to_string_lossy().into_owned();
+        let errors = json!([{"file": file, "errors": [{"line": 1, "message": "saved"}]}]);
+        assert_eq!(first.map(|n| n["new_lsp_errors"].clone()), Some(errors));
+        assert_eq!(second, None);
+    }
+
+    #[test]
     fn errors_known_for_files_read_are_one_line() {
         // Given: Rust のサーバーが、書き込んだファイルの 1 行目にエラー bad を送ってきた状態
         let langs = crate::language::Languages::builtin();
@@ -474,7 +757,7 @@ mod tests {
         let mut servers = Servers::default();
         servers.clients.push((lang.name.clone(), fake_server(false)));
         let path = std::env::temp_dir().join("a.rs");
-        let written = Written { lang, path: &path, before: "a\n", after: "ERR\n", hunks: &[] };
+        let written = Written { lang, path: &path, before: "a\n", after: "ERR\n", hunks: &[], formatted: &[] };
         servers.check(&written, Instant::now() + WAIT);
         // When: そのファイルと、エラーの届いていないファイルと、サーバーのない言語のファイルを読む
         let files = [path.clone(), std::env::temp_dir().join("b.rs"), std::env::temp_dir().join("c.md")];
@@ -493,7 +776,7 @@ mod tests {
         let mut servers = Servers::default();
         servers.clients.push((lang.name.clone(), fake_server(false)));
         let path = std::env::temp_dir().join("a.rs");
-        let written = Written { lang, path: &path, before: "a\n", after: "ERR\n", hunks: &[] };
+        let written = Written { lang, path: &path, before: "a\n", after: "ERR\n", hunks: &[], formatted: &[] };
         servers.check(&written, Instant::now() + WAIT);
         // When: そのファイルを 2 回読む（別の範囲を読んだときのように）
         let file = path.to_string_lossy().into_owned();
@@ -507,7 +790,7 @@ mod tests {
         let langs = crate::language::Languages::builtin();
         let lang = langs.for_path(Path::new("a.md")).unwrap();
         let path = std::env::temp_dir().join("a.md");
-        let written = Written { lang, path: &path, before: "a\n", after: "b\n", hunks: &[] };
+        let written = Written { lang, path: &path, before: "a\n", after: "b\n", hunks: &[], formatted: &[] };
         // When: 起動したサーバーの一覧に確かめさせる
         let found = Servers::default().check(&written, Instant::now() + WAIT);
         // Then: 何も付かない

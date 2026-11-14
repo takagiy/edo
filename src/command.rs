@@ -139,7 +139,7 @@ pub fn read(langs: &Languages, items: &[ReadItem]) -> Read {
 /// Writes every request, with a panic reported as an `internal` error. All requests are matched against the
 /// files as they were before the call. A request that is not found, is ambiguous or overlaps another is
 /// reported and written nowhere, even in the files a glob found it in; the others are written.
-pub fn write(langs: &Languages, reqs: &[WriteRequest], check: Check) -> Result<Vec<Value>, Error> {
+pub fn write(langs: &Languages, reqs: &[WriteRequest], check: &mut dyn Check) -> Result<Vec<Value>, Error> {
     guarded(|| Ok(write_requests(langs, reqs, check)))
 }
 
@@ -255,12 +255,31 @@ pub struct Written<'a> {
     pub before: &'a str,
     pub after: &'a str,
     pub hunks: &'a [Hunk],
+    /// The places formatting then changed, from `after` unformatted to `after`.
+    pub formatted: &'a [Hunk],
 }
 
-/// Adds warnings to a written file's report, such as the errors a language server found.
-pub type Check<'a> = &'a mut dyn FnMut(&Written) -> Map<String, Value>;
+/// What a write asks of a language server for each file: to format the text before it is written, and to check
+/// the text written.
+pub trait Check {
+    /// The text to write in place of `written.after`, or why it could not be formatted.
+    fn format(&mut self, written: &Written) -> Result<String, String>;
+    /// Warnings for the written file's report, such as the errors the server found.
+    fn check(&mut self, written: &Written) -> Map<String, Value>;
+}
 
-fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: Check) -> Vec<Value> {
+/// No language server: nothing is formatted or checked.
+impl Check for () {
+    fn format(&mut self, written: &Written) -> Result<String, String> {
+        Ok(written.after.to_string())
+    }
+
+    fn check(&mut self, _: &Written) -> Map<String, Value> {
+        Map::new()
+    }
+}
+
+fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: &mut dyn Check) -> Vec<Value> {
     let several = reqs.len() > 1;
     let mut plans: Vec<Plan> = vec![];
     let mut failures: Vec<Value> = vec![];
@@ -323,7 +342,7 @@ fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: Check) -> Vec
     plans.retain(|p| !p.targets.is_empty());
     // A file that cannot be written fails alone: the files before it are written, and their reports say so.
     let mut reports = failures;
-    reports.extend(plans.iter().map(|p| p.write(check).unwrap_or_else(|e| failure(&p.path, e))));
+    reports.extend(plans.iter().map(|p| p.write(&mut *check).unwrap_or_else(|e| failure(&p.path, e))));
     if !skipped.is_empty() {
         reports.push(skipped_line(&skipped));
     }
@@ -426,8 +445,9 @@ impl<'a> Plan<'a> {
         found
     }
 
-    /// Writes the targets, sorted by place, and reports the lines each now holds in the order of the requests.
-    fn write(&self, check: Check) -> Result<Value, Error> {
+    /// Writes the targets, sorted by place, formatted when a language server formats the file, and reports the lines
+    /// each now holds in the order of the requests, with the lines formatting changed.
+    fn write(&self, check: &mut dyn Check) -> Result<Value, Error> {
         let (src, path, file) = (&self.src, &self.path, Path::new(&self.path));
         // Apply from the last target so earlier ranges stay valid, then shift each one's lines by the edits before it.
         let mut text = src.text.clone();
@@ -445,25 +465,49 @@ impl<'a> Plan<'a> {
         let mut hunks = vec![];
         for (t, (out, grown)) in self.targets.iter().zip(done) {
             let at = |line: usize| (line as isize + shift) as usize;
-            replaced.push((t.item, lines(at(out.lines.0), at(out.lines.1))));
+            replaced.push((t.item, (at(out.lines.0), at(out.lines.1))));
             hunks.push(Hunk { old: out.hunk.old, new: at(out.hunk.new.start)..at(out.hunk.new.end) });
             shift += grown;
         }
+        let written = |after, formatted| Written {
+            lang: src.lang,
+            path: file,
+            before: &src.text,
+            after,
+            hunks: &hunks,
+            formatted,
+        };
+        let mut warnings = Map::new();
+        let unformatted = text;
+        let text = check.format(&written(&unformatted, &[])).unwrap_or_else(|message| {
+            warnings.insert("format".into(), message.into());
+            unformatted.clone()
+        });
+        let formatted = crate::diagnostic::hunks(&unformatted, &text);
         replaced.sort_by_key(|(item, _)| *item);
-        let replaced: Vec<Value> = replaced.into_iter().map(|(_, r)| r).collect();
-        let syntax =
-            new_errors(&edit::syntax_errors(src.lang, &src.text), edit::syntax_errors(src.lang, &text), &hunks);
+        let replaced: Vec<Value> = replaced
+            .into_iter()
+            .map(|(_, (first, last))| {
+                let (first, last) = crate::diagnostic::moved_lines(&formatted, first, last);
+                lines(first, last)
+            })
+            .collect();
+        let moved = |l| crate::diagnostic::moved(&hunks, l).and_then(|l| crate::diagnostic::moved(&formatted, l));
+        let syntax = new_errors(&edit::syntax_errors(src.lang, &src.text), edit::syntax_errors(src.lang, &text), moved);
         let line_text = |line: usize| text.lines().nth(line - 1).unwrap_or("").trim().to_string();
         let errors: Vec<Value> = syntax.iter().map(|e| json!({"line": e.line, "text": line_text(e.line)})).collect();
         let io = |e: std::io::Error| Error::new("io", format!("{path}: {e}"));
         std::fs::create_dir_all(file.parent().unwrap_or(Path::new("."))).map_err(io)?;
         std::fs::write(file, &text).map_err(io)?;
-        let mut warnings =
-            check(&Written { lang: src.lang, path: file, before: &src.text, after: &text, hunks: &hunks });
+        warnings.extend(check.check(&written(&text, &formatted)));
         if !errors.is_empty() {
             warnings.insert("new_syntax_errors".into(), errors.into());
         }
         let mut report = json!({"ok": true, "file": path, "replaced": replaced});
+        if !formatted.is_empty() {
+            let changed = formatted.iter().filter(|h| !h.new.is_empty()).map(|h| lines(h.new.start, h.new.end - 1));
+            report["formatted"] = changed.collect::<Vec<Value>>().into();
+        }
         if !warnings.is_empty() {
             report["warnings"] = warnings.into();
         }
@@ -687,7 +731,7 @@ mod tests {
         let path = at(&dir, "a.rs");
         // When: その呼び出しを before にして書く
         let req = WriteRequest { path: &path, before: Some("x();"), after: "y();", ..Default::default() };
-        let reports = write(&Languages::builtin(), &[req], &mut |_| Map::new()).unwrap();
+        let reports = write(&Languages::builtin(), &[req], &mut ()).unwrap();
         // Then: 書き込まれ、ok が報告される
         assert_eq!(content(&dir, "a.rs"), "fn a() {\n    y();\n}\n");
         assert_eq!(reports, [serde_json::json!({"ok": true, "file": path, "replaced": ["2-2"]})]);
@@ -697,7 +741,7 @@ mod tests {
         let path = req.path.to_string();
         let req = WriteRequest { path: &path, ..req };
         let _ = dir;
-        write(&Languages::builtin(), &[req], &mut |_| Map::new()).unwrap()
+        write(&Languages::builtin(), &[req], &mut ()).unwrap()
     }
 
     #[test]
@@ -706,13 +750,13 @@ mod tests {
         let dir = dir_with(&[("a.rs", "fn a() { x(); }\n")]);
         let req = WriteRequest { path: &at(&dir, "a.rs"), before: Some("x();"), after: "y();", ..Default::default() };
         // When: 書く
-        let err = write(&Languages::builtin(), &[req], &mut |_| panic!("boom")).unwrap_err();
+        let err = write(&Languages::builtin(), &[req], &mut Formatter(|_| panic!("boom"))).unwrap_err();
         // Then: panic の内容を持つ internal エラーが返る
         assert_eq!((err.code, err.message.as_str()), ("internal", "boom"));
     }
 
     fn write_all(reqs: &[WriteRequest]) -> Vec<Value> {
-        write(&Languages::builtin(), reqs, &mut |_| Map::new()).unwrap()
+        write(&Languages::builtin(), reqs, &mut ()).unwrap()
     }
 
     /// `app/[id]/page.tsx` and `app/d/page.tsx`, which `[id]` would match as a glob character class.
@@ -800,6 +844,43 @@ mod tests {
         );
     }
 
+    /// Formats as `format` does, as a language server would, and checks nothing.
+    struct Formatter(fn(&str) -> Result<String, String>);
+
+    impl Check for Formatter {
+        fn format(&mut self, written: &Written) -> Result<String, String> {
+            (self.0)(written.after)
+        }
+
+        fn check(&mut self, _: &Written) -> Map<String, Value> {
+            Map::new()
+        }
+    }
+
+    #[test]
+    fn formatting_that_changes_text_is_written_and_reported_by_lines_after_it() {
+        // Given: 呼び出しのある関数と、先頭に 1 行足す整形
+        let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n}\n")]);
+        let req = WriteRequest { path: &at(&dir, "a.rs"), before: Some("x();"), after: "y();", ..Default::default() };
+        // When: 書く
+        let reports =
+            write(&Languages::builtin(), &[req], &mut Formatter(|t| Ok(format!("// formatted\n{t}")))).unwrap();
+        // Then: 整形した内容が書かれ、整形で変わった 1 行目が formatted に、書いた行は整形後の 3 行目で返る
+        assert_eq!(content(&dir, "a.rs"), "// formatted\nfn a() {\n    y();\n}\n");
+        assert_eq!((&reports[0]["replaced"], &reports[0]["formatted"]), (&json!(["3-3"]), &json!(["1-1"])));
+    }
+
+    #[test]
+    fn failed_formatting_writes_text_as_is_with_its_message() {
+        // Given: 呼び出しのある関数と、失敗する整形
+        let dir = dir_with(&[("a.rs", "fn a() {\n    x();\n}\n")]);
+        let req = WriteRequest { path: &at(&dir, "a.rs"), before: Some("x();"), after: "y();", ..Default::default() };
+        // When: 書く
+        let reports = write(&Languages::builtin(), &[req], &mut Formatter(|_| Err("syntax error".into()))).unwrap();
+        // Then: 整形せずに書かれ、そのメッセージが警告の format に入る
+        assert_eq!(content(&dir, "a.rs"), "fn a() {\n    y();\n}\n");
+        assert_eq!(reports[0]["warnings"]["format"], "syntax error");
+    }
     /// A replace of `before` with `after` in `path`.
     fn swap<'a>(path: &'a str, before: &'a str, after: &'a str) -> WriteRequest<'a> {
         WriteRequest { path, before: Some(before), after, ..Default::default() }

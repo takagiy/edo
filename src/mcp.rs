@@ -8,7 +8,7 @@ use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router}
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::command::{self, Mode, WriteRequest, Written};
+use crate::command::{self, Check, Mode, WriteRequest, Written};
 use crate::language::Languages;
 use crate::lsp::Servers;
 
@@ -143,6 +143,27 @@ impl<T: schemars::JsonSchema> schemars::JsonSchema for Numbered<T> {
     }
 }
 
+/// The language servers a write asks to format and check its files, until `deadline`; none in tests.
+struct LanguageServers<'a> {
+    servers: Option<&'a Mutex<Servers>>,
+    deadline: std::time::Instant,
+}
+
+impl Check for LanguageServers<'_> {
+    fn format(&mut self, written: &Written) -> Result<String, String> {
+        let lock = |s: &Mutex<Servers>| lock(s).format(written, self.deadline);
+        self.servers.map_or_else(|| Ok(written.after.to_string()), lock)
+    }
+
+    fn check(&mut self, written: &Written) -> Map<String, Value> {
+        self.servers.map_or_else(Map::new, |s| lock(s).check(written, self.deadline))
+    }
+}
+
+/// The servers, recovered from a check that panicked while holding them.
+fn lock(servers: &Mutex<Servers>) -> std::sync::MutexGuard<'_, Servers> {
+    servers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 /// Whether a part of `scope` is a line range. A definition named with a comma is split here too, but its
 /// parts are not line ranges unless the name is digits.
 fn has_line_range(scope: &str) -> bool {
@@ -185,6 +206,13 @@ impl Server {
         self.stamps.lock().unwrap().get(&key).is_some_and(|s| stamp(path).as_ref() != Some(s))
     }
 
+    /// The servers' news of earlier writes (see `Servers::news`), with the files it rewrote remembered as edo's own.
+    fn news(&self) -> Option<Value> {
+        let (news, rewritten) = self.lsp.as_deref().map_or((None, vec![]), |s| lock(s).news(&self.langs));
+        rewritten.iter().for_each(|f| self.remember(f));
+        news
+    }
+
     #[tool(description = "Read a source file.\n\n\
         Pass `path` to see an overview of the file. Pass `scope` to see a definition or a line range \
         in full.\n\n\
@@ -196,14 +224,16 @@ impl Server {
         if items.is_empty() {
             return error(crate::Error::new("usage", "give path, or numbered ones such as path_0"));
         }
+        // Before reading, so that a file formatted late is read as it is now.
+        let news = self.news();
         let command::Read { mut text, files, ok } = command::read(&self.langs, &items);
         files.iter().for_each(|f| self.remember(f));
         // Errors from checks earlier writes started, which come too late for those writes to wait for.
-        let lock = |s: &Arc<Mutex<Servers>>| {
-            s.lock().unwrap_or_else(std::sync::PoisonError::into_inner).read_errors(&self.langs, &files)
-        };
-        if let Some(errors) = self.lsp.as_ref().and_then(lock) {
+        if let Some(errors) = self.lsp.as_deref().and_then(|s| lock(s).read_errors(&self.langs, &files)) {
             text.push_str(&format!("{}\n", crate::report(&errors)));
+        }
+        if let Some(news) = news {
+            text.push_str(&format!("{}\n", crate::report(&news)));
         }
         let text = vec![ContentBlock::text(text)];
         if ok { CallToolResult::success(text) } else { CallToolResult::error(text) }
@@ -246,12 +276,7 @@ impl Server {
         // A check that panicked leaves the lock poisoned; a client cut off mid-request recovers on its next one.
         // The files of one call share one wait, so a glob over many files waits no longer than one file.
         let deadline = std::time::Instant::now() + crate::lsp::WAIT;
-        let mut check = |written: &Written| {
-            let servers = self.lsp.as_ref();
-            servers.map_or_else(Map::new, |s| {
-                s.lock().unwrap_or_else(std::sync::PoisonError::into_inner).check(written, deadline)
-            })
-        };
+        let mut check = LanguageServers { servers: self.lsp.as_deref(), deadline };
         match command::write(&self.langs, &reqs, &mut check) {
             Ok(mut reports) => {
                 for r in reports.iter_mut().filter(|r| r["ok"] == true) {
@@ -261,6 +286,8 @@ impl Server {
                     }
                     self.remember(&file);
                 }
+                // After writing, so that a file this call wrote is not formatted under the lines it was given.
+                reports.extend(self.news());
                 let ok = !reports.iter().any(|r| r["ok"] == false);
                 let text = vec![ContentBlock::text(crate::report(&reports.into()))];
                 if ok { CallToolResult::success(text) } else { CallToolResult::error(text) }
