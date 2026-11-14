@@ -63,6 +63,14 @@ struct Document {
     answered: Option<Vec<Diagnostic>>,
 }
 
+/// A formatting request and its answer, independent of diagnostics' document versions.
+struct Formatting {
+    id: RequestId,
+    text: String,
+    options: FormattingOptions,
+    answer: Option<Result<Value, String>>,
+}
+
 pub struct Client {
     writer: Writer,
     events: Receiver<Event>,
@@ -80,8 +88,8 @@ pub struct Client {
     formats: bool,
     /// Diagnostic requests not answered yet: the document and version each asks about.
     asked: HashMap<RequestId, (String, i32)>,
-    /// Answers to other requests, until the one waiting for each takes it.
-    answers: HashMap<RequestId, Result<Value, String>>,
+    /// One formatting request per file, kept until its answer is used or a new input replaces it.
+    formatting: HashMap<String, Formatting>,
     next_id: i32,
     language_id: String,
     /// Keyed by `key`, since a server may spell a document's URI differently from the client.
@@ -158,7 +166,7 @@ impl Client {
             pull_ids: HashSet::new(),
             formats: false,
             asked: HashMap::new(),
-            answers: HashMap::new(),
+            formatting: HashMap::new(),
             next_id: INITIALIZE + 1,
             language_id: language_id.into(),
             documents: HashMap::new(),
@@ -208,19 +216,32 @@ impl Client {
             return Ok(text.into());
         }
         self.sync(&key, &uri, text);
-        let id = RequestId::from(self.next_id);
-        self.next_id += 1;
-        let params = DocumentFormattingParams {
-            text_document: TextDocumentIdentifier { uri },
-            options: FormattingOptions { tab_size, insert_spaces, ..Default::default() },
-            work_done_progress_params: Default::default(),
-        };
-        send(&self.writer, Request::new(id.clone(), "textDocument/formatting".into(), params));
+        let options = FormattingOptions { tab_size, insert_spaces, ..Default::default() };
+        if self.formatting.get(&key).is_none_or(|f| f.text != text || f.options != options) {
+            let id = RequestId::from(self.next_id);
+            self.next_id += 1;
+            self.formatting.insert(
+                key.clone(),
+                Formatting { id: id.clone(), text: text.into(), options: options.clone(), answer: None },
+            );
+            let params = DocumentFormattingParams {
+                text_document: TextDocumentIdentifier { uri },
+                options,
+                work_done_progress_params: Default::default(),
+            };
+            send(&self.writer, Request::new(id, "textDocument/formatting".into(), params));
+        }
         let answer = loop {
-            if let Some(answer) = self.answers.remove(&id) {
+            if let Some(answer) = self.formatting.get_mut(&key).and_then(|f| f.answer.take()) {
+                self.formatting.remove(&key);
                 break answer;
             }
-            self.next(deadline).map_err(FormatError::Unavailable)?;
+            if let Err(error) = self.next(deadline) {
+                if error == Unavailable::Closed {
+                    self.formatting.remove(&key);
+                }
+                return Err(FormatError::Unavailable(error));
+            }
         };
         // `null` means nothing to change.
         let edits: Vec<TextEdit> = serde_json::from_value(answer.map_err(FormatError::Failed)?).unwrap_or_default();
@@ -395,7 +416,9 @@ impl Client {
                     }
                 }
                 None => {
-                    self.answers.insert(id, result);
+                    if let Some(formatting) = self.formatting.values_mut().find(|f| f.id == id) {
+                        formatting.answer = Some(result);
+                    }
                 }
             },
         }
@@ -1012,6 +1035,103 @@ mod tests {
         let formatted = client.format(&doc(), "x", 4, true, SHORT);
         // Then: 間に合わなかったと返る
         assert_eq!(formatted, Err(FormatError::Unavailable(Unavailable::Late)));
+    }
+    #[test]
+    fn late_formatting_answer_is_reused_once_across_diagnostics() {
+        // Given: 最初の整形だけ、こちらが許してから応答するサーバー
+        let (open, gate) = mpsc::channel();
+        let mut first = true;
+        let mut formats = formatter(insert_options);
+        let mut echo = echo();
+        let (mut client, received) = fake(Box::new(move |message| {
+            if matches!(message, Message::Request(r) if r.method == "textDocument/formatting") {
+                if !first {
+                    return vec![];
+                }
+                first = false;
+                gate.recv().unwrap();
+            }
+            let mut replies = formats(message);
+            if matches!(message, Message::Notification(_)) {
+                replies.extend(echo(message));
+            }
+            replies
+        }));
+        assert_eq!(client.format(&doc(), "x", 4, true, SHORT), Err(FormatError::Unavailable(Unavailable::Late)));
+        // When: 遅れた応答を届け、診断で内容を行き来させた後、同じ内容を整形する
+        open.send(()).unwrap();
+        client.diagnostics(&doc(), "before", LONG).unwrap();
+        client.diagnostics(&doc(), "x", LONG).unwrap();
+        let formatted = client.format(&doc(), "x", 4, true, SHORT);
+        // Then: 要求を送り直さずに最初の答えを受け取り、使った答えは残さない
+        assert_eq!(formatted, Ok("x[4 spaces]".into()));
+        assert_eq!(received.lock().unwrap().iter().filter(|m| *m == "textDocument/formatting").count(), 1);
+        assert_eq!(client.format(&doc(), "x", 4, true, SHORT), Err(FormatError::Unavailable(Unavailable::Late)));
+        assert_eq!(received.lock().unwrap().iter().filter(|m| *m == "textDocument/formatting").count(), 2);
+    }
+    #[test]
+    fn changed_formatting_input_supersedes_the_old_request() {
+        for (text, tab_size, spaces, expected) in
+            [("y", 4, true, "y[4 spaces]"), ("x", 2, true, "x[2 spaces]"), ("x", 4, false, "x[4 tabs]")]
+        {
+            // Given: 最初の整形の応答を、次の整形要求まで送らないサーバー
+            let mut waiting = None;
+            let mut formats = formatter(insert_options);
+            let (mut client, received) = fake(Box::new(move |message| {
+                let mut replies = vec![];
+                if let Message::Request(r) = message
+                    && r.method == "textDocument/formatting"
+                {
+                    let Some(old) = waiting.take() else {
+                        waiting = Some(r.id.clone());
+                        return replies;
+                    };
+                    let at = json!({"line": 0, "character": 1});
+                    let stale = json!([{"range": {"start": at, "end": at}, "newText": "[stale]"}]);
+                    replies.push(Response::new_ok(old, stale.clone()).into());
+                    replies.push(Response::new_ok(999.into(), stale).into());
+                }
+                replies.extend(formats(message));
+                replies
+            }));
+            assert_eq!(client.format(&doc(), "x", 4, true, SHORT), Err(FormatError::Unavailable(Unavailable::Late)));
+            // When: 内容または字下げを変えて、もう一度整形する
+            let formatted = client.format(&doc(), text, tab_size, spaces, LONG);
+            // Then: 新しい要求の答えだけを使い、古い応答や不明な応答は残さない
+            assert_eq!(formatted, Ok(expected.into()));
+            assert_eq!(received.lock().unwrap().iter().filter(|m| *m == "textDocument/formatting").count(), 2);
+            assert!(client.formatting.is_empty());
+        }
+    }
+    #[test]
+    fn pending_formatting_requests_are_independent_per_file() {
+        // Given: 最初のファイルの整形には、別のファイルの整形を求められてから応答するサーバー
+        let mut waiting = None;
+        let mut formats = formatter(insert_options);
+        let (mut client, received) = fake(Box::new(move |message| {
+            if let Message::Request(r) = message
+                && r.method == "textDocument/formatting"
+            {
+                let Some(first) = waiting.take() else {
+                    waiting = Some(message.clone());
+                    return vec![];
+                };
+                let mut replies = formats(&first);
+                replies.extend(formats(message));
+                return replies;
+            }
+            formats(message)
+        }));
+        assert_eq!(client.format(&doc(), "x", 2, true, SHORT), Err(FormatError::Unavailable(Unavailable::Late)));
+        // When: 別のファイルを整形してから、最初のファイルの整形をもう一度求める
+        let other = std::env::temp_dir().join("b.rs");
+        let second = client.format(&other, "y", 4, false, LONG);
+        let first = client.format(&doc(), "x", 2, true, LONG);
+        // Then: それぞれの答えを取り違えず、各要求は 1 回だけ送る
+        assert_eq!(second, Ok("y[4 tabs]".into()));
+        assert_eq!(first, Ok("x[2 spaces]".into()));
+        assert_eq!(received.lock().unwrap().iter().filter(|m| *m == "textDocument/formatting").count(), 2);
+        assert!(client.formatting.is_empty());
     }
     #[test]
     fn saving_is_told_to_server_that_asks_for_it() {

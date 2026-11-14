@@ -121,8 +121,10 @@ fn install(env: &Env, harness: &Harness, dir: &Path, remove: bool) -> Result<(),
                 (env.run)(program, &args).map_err(|e| Error::new("harness", e))
             };
             // Also takes out an earlier registration, so installing again replaces it; there may be none.
-            let _ = mcp("remove", &["edo"]);
-            if !remove {
+            let removed = mcp("remove", &["edo"]);
+            if remove {
+                removed?;
+            } else {
                 mcp("add", &["edo", "--", &exe, "mcp"])?;
             }
         }
@@ -388,6 +390,55 @@ mod tests {
         let calls = f.calls.borrow();
         assert!(calls.contains(&"claude mcp remove --scope user edo".to_string()), "{calls:?}");
         assert!(!calls.iter().any(|c| c.contains("mcp add")), "{calls:?}");
+    }
+
+    #[test]
+    fn failed_mcp_removal_reports_error_and_keeps_hooks() {
+        // Given: edo を入れたハーネスと、削除に失敗する CLI
+        let f = Fixture::new();
+        f.init(EDO, &["ClaudeCode"], false);
+        let before = std::fs::read_to_string(f.settings_path()).unwrap();
+        let run = |_: &str, _: &[String]| Err("permission denied while removing MCP".into());
+        let env = Env { home: f.home.path().to_path_buf(), exe: PathBuf::from(EDO), run: &run };
+        // When: 明示的に外す
+        let reports = init(&env, &["ClaudeCode".into()], true);
+        // Then: 削除の失敗を報告し、hook は変更しない
+        assert_eq!(reports[0]["error"], "harness", "{reports:?}");
+        assert_eq!(reports[0]["message"], "permission denied while removing MCP");
+        assert_eq!(std::fs::read_to_string(f.settings_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn install_continues_after_cleanup_failure_when_add_succeeds() {
+        // Given: 既存登録の削除には失敗するが、追加には成功する CLI
+        let f = Fixture::new();
+        let run = |_: &str, args: &[String]| {
+            f.calls.borrow_mut().push(args[1].clone());
+            if args[1] == "remove" { Err("no such MCP server".into()) } else { Ok(()) }
+        };
+        let env = Env { home: f.home.path().to_path_buf(), exe: PathBuf::from(EDO), run: &run };
+        // When: ハーネスに edo を入れる
+        let reports = init(&env, &["ClaudeCode".into()], false);
+        // Then: 追加の成功を報告し、hook も入る
+        assert_eq!(reports[0]["ok"], true, "{reports:?}");
+        assert_eq!(*f.calls.borrow(), ["remove", "add"]);
+        assert_eq!(f.commands("PreToolUse"), [format!("{EDO} hook ClaudeCode:PreToolUse")]);
+    }
+
+    #[test]
+    fn failed_mcp_add_reports_error_and_keeps_hooks() {
+        // Given: edo を入れたハーネスと、見つからない CLI
+        let f = Fixture::new();
+        f.init(EDO, &["ClaudeCode"], false);
+        let before = std::fs::read_to_string(f.settings_path()).unwrap();
+        let run = |_: &str, _: &[String]| Err("claude: executable not found".into());
+        let env = Env { home: f.home.path().to_path_buf(), exe: PathBuf::from("/new/bin/edo"), run: &run };
+        // When: 別の edo を入れ直そうとして MCP の追加に失敗する
+        let reports = init(&env, &["ClaudeCode".into()], false);
+        // Then: 失敗を報告し、既存の hook は変更しない
+        assert_eq!(reports[0]["error"], "harness", "{reports:?}");
+        assert_eq!(reports[0]["message"], "claude: executable not found");
+        assert_eq!(std::fs::read_to_string(f.settings_path()).unwrap(), before);
     }
 
     #[test]

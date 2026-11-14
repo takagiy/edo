@@ -1,6 +1,5 @@
 use std::collections::HashSet;
-use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::diagnostic::{Hunk, new_errors};
 use crate::edit::{self, Place};
@@ -286,6 +285,18 @@ impl Check for () {
     }
 }
 
+/// The file `path` names, the same however the path is spelled: the canonical path of the file, or, for a file
+/// to be created, of the directory it goes in. Hard links to one file stay apart.
+fn identity(path: &str) -> PathBuf {
+    let path = Path::new(path);
+    let in_dir = || {
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        std::fs::canonicalize(dir).map(|d| d.join(path.file_name().unwrap_or_default()))
+    };
+    std::fs::canonicalize(path)
+        .or_else(|_| in_dir())
+        .unwrap_or_else(|_| std::path::absolute(path).unwrap_or(path.into()))
+}
 fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: &mut dyn Check) -> Vec<Value> {
     let several = reqs.len() > 1;
     let mut plans: Vec<Plan> = vec![];
@@ -307,9 +318,10 @@ fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: &mut dyn Chec
         });
         let mut found = false;
         for file in files {
-            let at = match plans.iter().position(|p| p.path == file) {
+            let id = identity(&file);
+            let at = match plans.iter().position(|p| p.id == id) {
                 Some(at) => Ok(at),
-                None => Plan::open(langs, file, req).map(|p| {
+                None => Plan::open(langs, file, id, req).map(|p| {
                     plans.push(p);
                     plans.len() - 1
                 }),
@@ -356,31 +368,32 @@ fn write_requests(langs: &Languages, reqs: &[WriteRequest], check: &mut dyn Chec
     reports
 }
 
-/// One place in a file to put a request's `after`.
-struct Target<'a> {
-    range: Range<usize>,
-    after: &'a str,
-    place: Place,
-    /// The request's index.
+/// One prepared replacement and the request that owns it.
+struct Target {
+    edit: edit::Prepared,
     item: usize,
 }
 
 /// A file to write: its text before the call and the targets the requests found in it.
 struct Plan<'a> {
+    /// The path as first given, for the report.
     path: String,
+    /// The file the path names, however it is spelled (see `identity`).
+    id: PathBuf,
     src: Source<'a>,
-    targets: Vec<Target<'a>>,
+    targets: Vec<Target>,
 }
 
 impl<'a> Plan<'a> {
-    /// Opens `path` for `req`; writing a whole file that does not exist yet is writing over an empty one.
-    fn open(langs: &'a Languages, path: String, req: &WriteRequest) -> Result<Plan<'a>, Value> {
+    /// Opens `path`, the file `id`, for `req`; writing a whole file that does not exist yet is writing over an empty
+    /// one.
+    fn open(langs: &'a Languages, path: String, id: PathBuf, req: &WriteRequest) -> Result<Plan<'a>, Value> {
         let file = Path::new(&path);
         let creating = !file.exists() && req.scope.is_none() && req.before.is_none();
         let src = language(langs, file)
             .and_then(|lang| Ok(Source::new(lang, if creating { String::new() } else { read_text(file)? })))
             .map_err(|e| failure(&path, e))?;
-        Ok(Plan { path, src, targets: vec![] })
+        Ok(Plan { path, id, src, targets: vec![] })
     }
 
     /// Adds the targets `req` finds in the file, or reports why it found none, or too many.
@@ -421,7 +434,7 @@ impl<'a> Plan<'a> {
             let matches: Vec<Value> = hits.iter().map(|t| candidate(src, t)).collect();
             return Err(json!({"ok": false, "file": path, "error": "ambiguous", "matches": matches}));
         }
-        let target = |h: Hit| Target { range: h.range, after: req.after, place: req.place, item };
+        let target = |h: Hit| Target { edit: edit::prepare(src.lang, &src.text, h.range, req.after, req.place), item };
         self.targets.extend(hits.into_iter().map(target));
         Ok(())
     }
@@ -429,20 +442,20 @@ impl<'a> Plan<'a> {
     /// Reports each target that writes over text an earlier one writes, or at the same point, with the requests
     /// of both, sorting the targets by place.
     fn overlaps(&mut self, several: bool) -> Vec<(Value, [usize; 2])> {
-        self.targets.sort_by_key(|t| t.range.start);
+        self.targets.sort_by_key(|t| t.edit.range.start);
         let mut found = vec![];
         // The target reaching furthest so far, which any later target starting before its end overlaps.
         let mut reach: Option<&Target> = None;
         for t in &self.targets {
             match reach {
-                Some(r) if t.range.start < r.range.end.max(r.range.start + 1) => {
+                Some(r) if t.edit.range.start < r.edit.range.end.max(r.edit.range.start + 1) => {
                     let message = format!("items {} and {} write over the same text", r.item + 1, t.item + 1);
                     let mut report = json!({"ok": false, "file": self.path, "error": "overlap", "message": message});
                     if several {
                         report["item"] = (t.item + 1).into();
                     }
                     found.push((report, [r.item, t.item]));
-                    if t.range.end > r.range.end {
+                    if t.edit.range.end > r.edit.range.end {
                         reach = Some(t);
                     }
                 }
@@ -456,25 +469,21 @@ impl<'a> Plan<'a> {
     /// each now holds in the order of the requests, with the lines formatting changed.
     fn write(&self, check: &mut dyn Check) -> Result<Value, Error> {
         let (src, path, file) = (&self.src, &self.path, Path::new(&self.path));
-        // Apply from the last target so earlier ranges stay valid, then shift each one's lines by the edits before it.
+        // Prepared ranges refer to the original file; applying from the end keeps them valid.
         let mut text = src.text.clone();
-        let mut done: Vec<(edit::Outcome, isize)> = vec![];
         for t in self.targets.iter().rev() {
-            let out = edit::edit(src.lang, &text, t.range.clone(), t.after, t.place);
-            let grown = out.text.matches('\n').count() as isize - text.matches('\n').count() as isize;
-            text = out.text.clone();
-            done.push((out, grown));
+            text.replace_range(t.edit.range.clone(), &t.edit.after);
         }
-        done.reverse();
-        // Each edit's lines after it are counted in a text without the edits before it, so shift them past those.
         let mut shift = 0;
         let mut replaced = vec![];
         let mut hunks = vec![];
-        for (t, (out, grown)) in self.targets.iter().zip(done) {
+        for t in &self.targets {
+            let out = &t.edit;
             let at = |line: usize| (line as isize + shift) as usize;
             replaced.push((t.item, (at(out.lines.0), at(out.lines.1))));
-            hunks.push(Hunk { old: out.hunk.old, new: at(out.hunk.new.start)..at(out.hunk.new.end) });
-            shift += grown;
+            hunks.push(Hunk { old: out.hunk.old.clone(), new: at(out.hunk.new.start)..at(out.hunk.new.end) });
+            shift +=
+                out.after.matches('\n').count() as isize - src.text[out.range.clone()].matches('\n').count() as isize;
         }
         let written = |after, formatted| Written {
             lang: src.lang,
@@ -527,7 +536,7 @@ fn failure(file: &str, e: Error) -> Value {
     json!({"ok": false, "file": file, "error": e.code, "message": e.message})
 }
 fn line_of(text: &str, byte: usize) -> usize {
-    text[..byte].matches('\n').count() + 1
+    text.as_bytes()[..byte].iter().filter(|&&b| b == b'\n').count() + 1
 }
 
 /// A line range as `scope` spells it, so the agent can pass it back as is.
@@ -1006,6 +1015,52 @@ mod tests {
     /// A replace of `before` with `after` in `path`.
     fn swap<'a>(path: &'a str, before: &'a str, after: &'a str) -> WriteRequest<'a> {
         WriteRequest { path, before: Some(before), after, ..Default::default() }
+    }
+    #[test]
+    fn alias_paths_share_one_file_plan() {
+        // Given: 同じファイルを指す通常のパスと . を含むパス
+        let dir = dir_with(&[("a.rs", "fn a() { x(); y(); }\n")]);
+        let path = at(&dir, "a.rs");
+        let alias = format!("{}/./a.rs", dir.path().to_string_lossy().replace('\\', "/"));
+        // When: 別表記を使って同じファイルの 2 か所を書き換える
+        let reports = write_all(&[swap(&path, "x();", "v();"), swap(&alias, "y();", "w();")]);
+        // Then: どちらも失われず、最初の表記で 1 ファイルとして報告する
+        assert_eq!(content(&dir, "a.rs"), "fn a() { v(); w(); }\n");
+        assert_eq!(reports, [json!({"ok": true, "file": path, "replaced": ["1-1", "1-1"]})]);
+    }
+    #[test]
+    fn same_line_replacement_and_insertion_use_original_positions() {
+        // Given: 同じ行に呼び出しが 2 つある関数
+        let dir = dir_with(&[("a.rs", "fn a() { x(); y(); }\n")]);
+        let path = at(&dir, "a.rs");
+        // When: 前の呼び出しを複数行に置換し、後ろの呼び出しの行の前に挿入する
+        let reports = write_all(&[
+            swap(&path, "x();", "v();\nw();"),
+            WriteRequest {
+                path: &path,
+                before: Some("y();"),
+                after: "fn b() {}",
+                place: Place::InsertBefore,
+                ..Default::default()
+            },
+        ]);
+        // Then: 挿入は元の行頭、置換は元の呼び出しに適用され、行番号は最終結果を指す
+        assert_eq!(content(&dir, "a.rs"), "fn b() {}\nfn a() { v();\nw(); y(); }\n");
+        assert_eq!(reports, [json!({"ok": true, "replaced": ["2-3", "1-1"]})]);
+    }
+    #[test]
+    fn ambiguous_multibyte_matches_report_candidates_without_writing() {
+        // Given: 同じ日本語が複数ある関数
+        let src = "fn a() { f(\"あ\"); g(\"あ\"); }\n";
+        let dir = dir_with(&[("a.rs", src)]);
+        // When: 複数バイトの文字で終わる範囲を書き換える
+        let reports = write_all(&[swap(&at(&dir, "a.rs"), "あ", "い")]);
+        // Then: 内部エラーではなく候補付きの ambiguous が返り、内容は変わらない
+        assert_eq!(reports[0]["error"], "ambiguous");
+        let candidates = reports[0]["matches"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|c| c["range"] == "1-1"));
+        assert_eq!(content(&dir, "a.rs"), src);
     }
 
     #[test]

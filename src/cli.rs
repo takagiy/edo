@@ -169,7 +169,10 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages,
             if input.as_deref() == Some("") {
                 return usage("stdin is empty".into());
             }
-            let blocks = input.as_deref().map(split_conflict).unwrap_or_default();
+            let blocks = match input.as_deref().map(split_conflict).transpose() {
+                Ok(blocks) => blocks.unwrap_or_default(),
+                Err(message) => return usage(message.into()),
+            };
             let texts: Vec<String> =
                 texts.into_iter().map(|t| if t == "-" { input.clone().unwrap() } else { t }).collect();
             let edits: Vec<(Option<String>, String)> = match texts.as_slice() {
@@ -205,19 +208,31 @@ pub fn run(args: &[String], stdin: &mut dyn FnMut() -> String, langs: Languages,
 }
 
 /// The `<<<<<<< before` / `=======` / `>>>>>>> after` blocks as (before, after); markers count only as whole lines.
-fn split_conflict(input: &str) -> Vec<(String, String)> {
+fn split_conflict(input: &str) -> Result<Vec<(String, String)>, &'static str> {
     let lines: Vec<&str> = input.lines().collect();
-    let at = |from: usize, marker: &str| lines[from..].iter().position(|l| l.trim_end() == marker).map(|i| from + i);
+    let Some(first) = lines.iter().position(|line| line.trim_end() == "<<<<<<< before") else {
+        return Ok(vec![]);
+    };
+    let mut markers = lines.iter().enumerate().skip(first).filter_map(|(i, line)| {
+        let marker = line.trim_end();
+        matches!(marker, "<<<<<<< before" | "=======" | ">>>>>>> after").then_some((i, marker))
+    });
     let mut blocks = vec![];
-    let mut from = 0;
-    while let Some(open) = at(from, "<<<<<<< before")
-        && let Some(mid) = at(open, "=======")
-        && let Some(close) = at(mid, ">>>>>>> after")
-    {
+    while let Some((open, marker)) = markers.next() {
+        if marker != "<<<<<<< before" {
+            return Err("expected <<<<<<< before in conflict block");
+        }
+        let (mid, marker) = markers.next().ok_or("expected ======= in conflict block")?;
+        if marker != "=======" {
+            return Err("expected ======= in conflict block");
+        }
+        let (close, marker) = markers.next().ok_or("expected >>>>>>> after in conflict block")?;
+        if marker != ">>>>>>> after" {
+            return Err("expected >>>>>>> after in conflict block");
+        }
         blocks.push((lines[open + 1..mid].join("\n"), lines[mid + 1..close].join("\n")));
-        from = close + 1;
     }
-    blocks
+    Ok(blocks)
 }
 
 fn usage(message: String) -> (String, i32) {
@@ -314,6 +329,50 @@ mod tests {
         edo(&["write", &path, "-"], input);
         // Then: 組ごとに置き換わる
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    v();\n    w();\n}\n");
+    }
+
+    #[test]
+    fn incomplete_or_out_of_order_conflict_blocks_write_nothing() {
+        // Given: 完全な組の後ろなどでマーカーが欠けたり順番が違ったりする標準入力
+        let complete = "<<<<<<< before\nx();\n=======\nv();\n>>>>>>> after\n";
+        for input in [
+            format!("{complete}<<<<<<< before\ny();\n"),
+            format!("{complete}<<<<<<< before\ny();\n=======\nw();\n"),
+            "<<<<<<< before\nx();\n".into(),
+            format!("<<<<<<< before\nx();\n{complete}"),
+            "<<<<<<< before\nx();\n>>>>>>> after\n=======\nv();\n".into(),
+            format!("{complete}=======\n"),
+        ] {
+            let original = "fn a() {\n    x();\n    y();\n}\n";
+            let (_dir, path) = file(original);
+            // When: マーカー付きの標準入力で書き込む
+            let (out, code) = edo(&["write", &path, "-"], &input);
+            // Then: usage エラーで終了し、完全な組の部分も書かれない
+            assert_eq!(code, 2, "{input:?}: {out}");
+            assert!(out.contains("error=usage"), "{out}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn conflict_blocks_keep_crlf_framing_and_empty_after() {
+        // Given: 前後に説明があり、CRLF とマーカー末尾の空白を含む、空の after の組
+        let input = "description\r\n<<<<<<< before  \r\nx();\r\n=======\r\n>>>>>>> after\t\r\nend\r\n";
+        // When: 標準入力を分割する
+        let blocks = split_conflict(input);
+        // Then: 説明とマーカーの改行を含めず、空の after として分割する
+        assert_eq!(blocks, Ok(vec![("x();".into(), String::new())]));
+    }
+
+    #[test]
+    fn stdin_without_whole_line_opening_marker_stays_raw() {
+        // Given: 単独の区切りや、行の途中の開始マーカーを含む標準入力
+        for input in ["=======\n>>>>>>> after\n", "text <<<<<<< before\n=======\n>>>>>>> after\n"] {
+            // When: 標準入力を分割する
+            let blocks = split_conflict(input);
+            // Then: マーカーの組として扱わず、そのまま after に渡せる
+            assert_eq!(blocks, Ok(vec![]));
+        }
     }
 
     #[test]
