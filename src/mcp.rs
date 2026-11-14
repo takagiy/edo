@@ -13,15 +13,16 @@ use crate::language::Languages;
 use crate::lsp::Servers;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
+// Unknown arguments are rejected by `Numbered`, which takes every argument the others do not.
+#[schemars(extend("additionalProperties" = false))]
 pub struct ReadParams {
     /// File path or glob.
     pub path: Option<String>,
     /// Identifier path (Foo.bar or Foo::bar) or line range (N or N-M), or several separated by commas.
     pub scope: Option<String>,
-    /// More to read in the same call, after `path`.
-    #[serde(default)]
-    pub reads: Vec<ReadTarget>,
+    /// More to read, given by number as `path_0`, `scope_0` and so on, after `path`.
+    #[serde(flatten)]
+    pub numbered: Numbered<ReadTarget>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -51,12 +52,9 @@ pub struct WriteParams {
     /// What to do with each match (or with the whole target when `before` is omitted).
     #[serde(default)]
     pub mode: Mode,
-    /// More edits in the same call, after the one given by `path`.
-    #[serde(default)]
-    pub edits: Vec<EditParams>,
-    /// More edits given by number, as `path_0`, `before_0` and so on; they come after `path` and before `edits`.
+    /// More edits, given by number as `path_0`, `before_0` and so on, after the one given by `path`.
     #[serde(flatten)]
-    pub numbered: Numbered,
+    pub numbered: Numbered<EditParams>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -91,52 +89,57 @@ impl EditParams {
     }
 }
 
-/// Edits given as `path_0`, `before_0` and so on, by number. A client that writes string arguments
-/// without JSON, such as Claude Code, can then pass code without escaping its line breaks and quotes.
-#[derive(Debug, Default)]
-pub struct Numbered(BTreeMap<u64, Map<String, Value>>);
+/// Items given by number, as `path_0`, `scope_0` and so on, each with the fields of `T`. A client that writes
+/// string arguments without JSON, such as Claude Code, can then pass code without escaping its line breaks and quotes.
+#[derive(Debug)]
+pub struct Numbered<T>(Vec<T>);
 
-impl<'de> Deserialize<'de> for Numbered {
+/// The properties of `T`'s schema: its fields by name.
+fn fields<T: schemars::JsonSchema>() -> Map<String, Value> {
+    let schema = schemars::schema_for!(T);
+    schema.get("properties").and_then(Value::as_object).cloned().unwrap_or_default()
+}
+
+impl<'de, T: serde::de::DeserializeOwned + schemars::JsonSchema> Deserialize<'de> for Numbered<T> {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let mut edits: BTreeMap<u64, Map<String, Value>> = BTreeMap::new();
+        use serde::de::Error;
+        let fields = fields::<T>();
+        let mut items: BTreeMap<u64, Map<String, Value>> = BTreeMap::new();
         for (key, value) in Map::<String, Value>::deserialize(d)? {
             let numbered = key.rsplit_once('_').and_then(|(field, n)| Some((field, n.parse().ok()?)));
             let Some((field, n)) = numbered else {
-                const FIELDS: &[&str] = &["path", "scope", "before", "after", "all_matches", "mode", "edits"];
-                return Err(serde::de::Error::unknown_field(&key, FIELDS));
+                let names: Vec<String> = fields.keys().map(|f| format!("`{f}`")).collect();
+                let expected =
+                    format!("expected one of {}, or one of them with a number as in `path_0`", names.join(", "));
+                return Err(D::Error::custom(format!("unknown field `{key}`, {expected}")));
             };
-            // A client that sends arguments missing from `properties` as strings sends `true` as "true".
-            let value = match (field, value) {
-                ("all_matches", Value::String(s)) if s == "true" || s == "false" => Value::Bool(s == "true"),
-                (_, value) => value,
+            // A client sends an argument missing from `properties` as a string, so `true` comes as "true".
+            let boolean = fields.get(field).is_some_and(|s| s["type"] == "boolean");
+            let value = match value {
+                Value::String(s) if boolean && (s == "true" || s == "false") => Value::Bool(s == "true"),
+                value => value,
             };
-            edits.entry(n).or_default().insert(field.to_string(), value);
+            items.entry(n).or_default().insert(field.to_string(), value);
         }
-        Ok(Numbered(edits))
+        let item = |(n, fields)| {
+            serde_json::from_value(Value::Object(fields))
+                .map_err(|e| D::Error::custom(format!("in the arguments ending in _{n}: {e}")))
+        };
+        Ok(Numbered(items.into_iter().map(item).collect::<Result<_, _>>()?))
     }
 }
 
-impl schemars::JsonSchema for Numbered {
+impl<T: schemars::JsonSchema> schemars::JsonSchema for Numbered<T> {
     fn schema_name() -> std::borrow::Cow<'static, str> {
-        "Numbered".into()
+        format!("Numbered{}", T::schema_name()).into()
     }
 
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        let edit = EditParams::json_schema(generator);
-        let fields = edit.get("properties").and_then(Value::as_object).cloned().unwrap_or_default();
+        let item = T::json_schema(generator);
+        let fields = item.get("properties").and_then(Value::as_object).cloned().unwrap_or_default();
         let patterns: Map<String, Value> =
             fields.into_iter().map(|(name, s)| (format!("^{name}_[0-9]+$"), s)).collect();
         schemars::json_schema!({ "type": "object", "patternProperties": patterns, "additionalProperties": false })
-    }
-}
-
-impl Numbered {
-    fn edits(self) -> Result<Vec<EditParams>, crate::Error> {
-        let edit = |(n, fields)| {
-            serde_json::from_value(Value::Object(fields))
-                .map_err(|e| crate::Error::new("usage", format!("in the arguments ending in _{n}: {e}")))
-        };
-        self.0.into_iter().map(edit).collect()
     }
 }
 
@@ -186,14 +189,14 @@ impl Server {
         hidden: they leave gaps in the line numbers, or show as `...` when they share a line with other code.\n\n\
         To see more, pass `scope`: an identifier such as `Foo.bar` or `Foo::bar` (a function shows in full; a class \
         shows its members with bodies hidden), or a line range `N` or `N-M` (shown in full). Separate several scopes with commas; parts not found are listed in `scope_errors`. `path` may be a glob with `*` and `?`.\n\n\
-        To read several things in one call, list them in `reads` as `{path, scope}`; each one's text follows its \
-        path. One that fails has its error there instead, and the others are still read.")]
+To read several things in one call, give each a `path` and `scope` with its own number, as `path_0`, \
+        `scope_0`, `path_1` and so on; each one's text follows its path. One that fails has its error there instead, and the others are still read.")]
     fn read(&self, Parameters(p): Parameters<ReadParams>) -> CallToolResult {
         let first = p.path.as_deref().map(|path| command::ReadItem { path, scope: p.scope.as_deref() });
-        let rest = p.reads.iter().map(|r| command::ReadItem { path: &r.path, scope: r.scope.as_deref() });
+        let rest = p.numbered.0.iter().map(|r| command::ReadItem { path: &r.path, scope: r.scope.as_deref() });
         let items: Vec<command::ReadItem> = first.into_iter().chain(rest).collect();
         if items.is_empty() {
-            return error(crate::Error::new("usage", "give path, or reads"));
+            return error(crate::Error::new("usage", "give path, or numbered ones such as path_0"));
         }
         let command::Read { mut text, files, ok } = command::read(&self.langs, &items);
         files.iter().for_each(|f| self.remember(f));
@@ -218,8 +221,7 @@ impl Server {
         the target.\n\n\
         On success, `replaced` gives the line ranges that now hold `after`; there is no need to read the file back.\n\n\
         To make several edits in one call, give each the same fields with its own number, as `path_0`, `before_0`, \
-        `after_0`, `path_1` and so on, or list them in `edits`. All of them are matched \
-        against the files as they are now. One that is not found, is ambiguous or overlaps another is reported and \
+`after_0`, `path_1` and so on. All of them are matched against the files as they are now. One that is not found, is ambiguous or overlaps another is reported and \
         written nowhere; the others are written.")]
     fn write(&self, Parameters(p): Parameters<WriteParams>) -> CallToolResult {
         let first = match (p.path, p.after) {
@@ -234,13 +236,12 @@ impl Server {
             (None, None) => None,
             _ => return error(crate::Error::new("usage", "give path and after together")),
         };
-        let numbered = match p.numbered.edits() {
-            Ok(numbered) => numbered,
-            Err(e) => return error(e),
-        };
-        let edits: Vec<&EditParams> = first.iter().chain(&numbered).chain(&p.edits).collect();
+        let edits: Vec<&EditParams> = first.iter().chain(&p.numbered.0).collect();
         if edits.is_empty() {
-            return error(crate::Error::new("usage", "give path and after, or edits"));
+            return error(crate::Error::new(
+                "usage",
+                "give path and after, or numbered ones such as path_0 and after_0",
+            ));
         }
         let reqs: Vec<WriteRequest> = edits.iter().map(|e| e.request()).collect();
         // Line numbers in a line range scope may be wrong in a file that changed since it was last read.
@@ -368,15 +369,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_tool_reads_each_of_reads_after_path() {
-        // Given: 関数が 2 つあるファイル
-        let (_dir, path) = file("fn a() {}\nfn b() {}\n");
+    async fn read_tool_reads_numbered_items_after_path() {
+        // Given: 関数が 3 つあるファイル
+        let (_dir, path) = file("fn a() {}\nfn b() {}\nfn c() {}\n");
         let client = connect().await;
-        // When: path と scope に加えて、reads にもう 1 つ渡して read を呼ぶ
-        let args = json!({"path": path, "scope": "a", "reads": [{"path": path, "scope": "b"}]});
+        // When: path と scope に加えて、_1 と _0 の番号付きの引数で読む
+        let args = json!({"path": path, "scope": "a", "path_1": path, "scope_1": "c", "path_0": path, "scope_0": "b"});
         let (text, _) = tool(&client, "read", args).await;
-        // Then: path の分、reads の分の順に、それぞれパスの行の後に並ぶ
-        assert_eq!(text, format!("{path}\n1\tfn a() {{}}\n{path}\n2\tfn b() {{}}\n"));
+        // Then: path の分、_0 の分、_1 の分の順に、それぞれパスの行の後に並ぶ
+        assert_eq!(text, format!("{path}\n1\tfn a() {{}}\n{path}\n2\tfn b() {{}}\n{path}\n3\tfn c() {{}}\n"));
     }
 
     #[tokio::test]
@@ -385,7 +386,7 @@ mod tests {
         let (_dir, path) = file("fn a() {}\n");
         let client = connect().await;
         // When: ない定義と、ファイル全体を、1 回で読む
-        let args = json!({"path": path, "scope": "zzz", "reads": [{"path": path}]});
+        let args = json!({"path": path, "scope": "zzz", "path_0": path});
         let (text, is_error) = tool(&client, "read", args).await;
         // Then: ファイル全体の内容と not_found のエラーが返り、isError が立つ
         assert!(is_error, "{text}");
@@ -402,19 +403,6 @@ mod tests {
         tool(&client, "write", args).await;
         // Then: 一致の後ろの行に入る
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    x();\n    y();\n}\n");
-    }
-
-    #[tokio::test]
-    async fn write_tool_writes_each_of_edits_after_path() {
-        // Given: 呼び出しが 2 つある関数
-        let (_dir, path) = file("fn a() {\n    x();\n    y();\n}\n");
-        let client = connect().await;
-        // When: path と before と after に加えて、edits にもう 1 つ渡して write を呼ぶ
-        let args = json!({"path": path, "before": "x();", "after": "v();", "edits": [{"path": path, "before": "y();", "after": "w();"}]});
-        let (text, _) = tool(&client, "write", args).await;
-        // Then: どちらも書かれ、replaced は path の分、edits の分の順に並ぶ
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    v();\n    w();\n}\n");
-        assert_eq!(text, format!("ok=true file={path} replaced=2-2,3-3"));
     }
 
     #[tokio::test]
@@ -451,22 +439,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_argument_in_edits_or_reads_is_an_error() {
+    async fn unknown_field_of_numbered_argument_is_an_error_naming_it() {
         // Given: 関数が 1 つあるファイル
         let (_dir, path) = file("fn a() {}\n");
         let client = connect().await;
-        // When: edits と reads の要素に知らない引数を付けて呼ぶ
-        let (write, write_failed) = tool(
-            &client,
-            "write",
-            json!({"path": path, "after": "x", "edits": [{"path": path, "after": "y", "lines": "1"}]}),
-        )
-        .await;
-        let (read, read_failed) =
-            tool(&client, "read", json!({"path": path, "reads": [{"path": path, "range": "1"}]})).await;
+        // When: 知らないフィールド名に番号を付けた引数 (lines_0, range_0) で呼ぶ
+        let args = json!({"path_0": path, "after_0": "x", "lines_0": "1"});
+        let (write, write_failed) = tool(&client, "write", args).await;
+        let (read, read_failed) = tool(&client, "read", json!({"path_0": path, "range_0": "1"})).await;
         // Then: どちらもその名前を挙げたエラーになり、ファイルはそのまま
         assert!(write_failed && write.contains("lines"), "{write}");
         assert!(read_failed && read.contains("range"), "{read}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {}\n");
+    }
+
+    #[tokio::test]
+    async fn edits_and_reads_arrays_are_unknown_arguments() {
+        // Given: 関数が 1 つあるファイル
+        let (_dir, path) = file("fn a() {}\n");
+        let client = connect().await;
+        // When: 配列の edits と reads で呼ぶ
+        let args = json!({"path": path, "after": "x", "edits": [{"path": path, "after": "y"}]});
+        let (write, write_failed) = tool(&client, "write", args).await;
+        let (read, read_failed) = tool(&client, "read", json!({"path": path, "reads": [{"path": path}]})).await;
+        // Then: どちらもその名前を挙げたエラーになり、ファイルはそのまま
+        assert!(write_failed && write.contains("edits"), "{write}");
+        assert!(read_failed && read.contains("reads"), "{read}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {}\n");
     }
 
@@ -515,19 +513,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_schema_shows_numbered_names_of_each_edit_field_as_patterns() {
+    async fn schemas_show_numbered_names_of_each_field_as_patterns() {
         // Given: MCP サーバーにつないだクライアント
         let client = connect().await;
-        // When: write ツールのスキーマを見る
+        // When: read と write のスキーマを見る
         let tools = client.list_all_tools().await.unwrap();
-        let write = tools.iter().find(|t| t.name == "write").unwrap();
-        let schema = Value::Object(write.input_schema.as_ref().clone());
-        let patterns = schema["patternProperties"].as_object().cloned().unwrap_or_default();
-        // Then: edits の各フィールドに、その名前の番号付きの形を示すパターンがあり、ほかの名前は許さない
-        for field in ["path", "scope", "before", "after", "all_matches", "mode"] {
-            assert!(patterns.keys().any(|p| p.contains(field)), "{field}: {patterns:?}");
+        let fields =
+            [("read", &["path", "scope"][..]), ("write", &["path", "scope", "before", "after", "all_matches", "mode"])];
+        for (name, fields) in fields {
+            let tool = tools.iter().find(|t| t.name == name).unwrap();
+            let schema = Value::Object(tool.input_schema.as_ref().clone());
+            let patterns = schema["patternProperties"].as_object().cloned().unwrap_or_default();
+            // Then: 各フィールドに、その名前の番号付きの形を示すパターンがあり、ほかの名前は許さない
+            for field in fields {
+                assert!(patterns.keys().any(|p| p.contains(field)), "{name} {field}: {patterns:?}");
+            }
+            assert_eq!(schema["additionalProperties"], json!(false), "{name}: {schema}");
         }
-        assert_eq!(schema["additionalProperties"], json!(false), "{schema}");
     }
 
     #[tokio::test]
