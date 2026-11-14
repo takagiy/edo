@@ -12,7 +12,42 @@ pub struct Hit {
     pub def: Option<usize>,
 }
 
+/// Resolves every part of `spec` (see `parts`), failing with the errors of all parts that do not resolve.
 pub fn resolve(spec: &str, defs: &[Definition], src: &str) -> Result<Vec<Hit>, Error> {
+    let (mut hits, mut errors) = (vec![], vec![]);
+    for (_, found) in resolve_each(spec, defs, src) {
+        match found {
+            Ok(h) => hits.extend(h),
+            Err(e) => errors.push(e),
+        }
+    }
+    joined(errors).map_or(Ok(hits), Err)
+}
+
+/// One error for the failed parts of a scope, with the first one's code and the messages of all, or `None`
+/// when no part failed.
+pub fn joined(errors: impl IntoIterator<Item = Error>) -> Option<Error> {
+    let mut errors = errors.into_iter();
+    let first = errors.next()?;
+    let message = std::iter::once(first.message.clone()).chain(errors.map(|e| e.message)).collect::<Vec<_>>();
+    Some(Error { message: message.join("; "), ..first })
+}
+
+/// Resolves each part of `spec` on its own, in order.
+pub fn resolve_each<'s>(spec: &'s str, defs: &[Definition], src: &str) -> Vec<(&'s str, Result<Vec<Hit>, Error>)> {
+    parts(spec, defs).into_iter().map(|part| (part, resolve_one(part, defs, src))).collect()
+}
+
+/// The scopes separated by commas in `spec`, or `spec` itself when a definition is named by all of it,
+/// as a Markdown heading may be.
+pub fn parts<'s>(spec: &'s str, defs: &[Definition]) -> Vec<&'s str> {
+    if defs.iter().any(|d| d.name == spec) {
+        return vec![spec];
+    }
+    spec.split(',').map(str::trim).collect()
+}
+
+fn resolve_one(spec: &str, defs: &[Definition], src: &str) -> Result<Vec<Hit>, Error> {
     if let Some((n, m)) = parse_lines(spec) {
         let lines = src.lines().count();
         if n == 0 || m < n || m > lines {
@@ -119,6 +154,53 @@ mod tests {
         // Then: 区切らずに見出し "v1.0" にだけ一致する
         let names: Vec<_> = hits.iter().map(|h| defs[h.def.unwrap()].name.as_str()).collect();
         assert_eq!(names, ["v1.0"]);
+    }
+
+    #[test]
+    fn comma_separated_scope_points_at_each_part_in_its_order() {
+        // Given: 関数が 3 つあるファイル
+        let src = "fn a() {}\nfn b() {}\nfn c() {}\n";
+        // When: 名前 c、行 2、名前 a を、空白付きの , で区切ったスコープを解決する
+        let hits = names("c, 2,a", src);
+        // Then: 区切った順に、c、2 行目、a を指す
+        assert_eq!(hits, ["fn c() {}", "fn b() {}", "fn a() {}"]);
+    }
+
+    #[test]
+    fn definition_named_by_whole_scope_with_comma_wins_over_splitting() {
+        // Given: 見出し "a, b" と、見出し "a" と "b" がある Markdown
+        let manifest =
+            "[package]\nname = \"md\"\nextensions = [\"md\"]\n[package.syntax]\nmodule = \"builtin:markdown\"\n";
+        let query = "(section (atx_heading heading_content: (inline) @name)) @definition.section";
+        let lang = crate::language::Language::load(manifest, query, None).unwrap();
+        let src = "# a, b\n\n# a\n\n# b\n";
+        let defs = defs(&lang, src);
+        // When: スコープ "a, b" を解決する
+        let hits = resolve("a, b", &defs, src).unwrap();
+        // Then: 区切らずに見出し "a, b" にだけ一致する
+        let names: Vec<_> = hits.iter().map(|h| defs[h.def.unwrap()].name.as_str()).collect();
+        assert_eq!(names, ["a, b"]);
+    }
+
+    #[test]
+    fn comma_separated_scope_with_unresolved_part_is_error_naming_it() {
+        // Given: 関数 a だけがあるファイル
+        let src = "fn a() {}\n";
+        // When: a と、ない名前 zzz を , で区切ったスコープを解決する
+        let err = resolve("a, zzz", &defs(&rust(QUERY), src), src).unwrap_err();
+        // Then: zzz を挙げた not_found のエラーになる
+        assert_eq!(err.code, "not_found");
+        assert!(err.message.contains("zzz"), "{}", err.message);
+    }
+
+    #[test]
+    fn comma_separated_scope_with_several_unresolved_parts_is_error_naming_each() {
+        // Given: 関数 a だけがあるファイル
+        let src = "fn a() {}\n";
+        // When: a と、ない名前 yyy と zzz を , で区切ったスコープを解決する
+        let err = resolve("yyy, a, zzz", &defs(&rust(QUERY), src), src).unwrap_err();
+        // Then: yyy と zzz の両方を挙げたエラーになる
+        assert!(err.message.contains("yyy") && err.message.contains("zzz"), "{}", err.message);
     }
 
     fn texts(spec: &str, src: &str) -> Vec<String> {

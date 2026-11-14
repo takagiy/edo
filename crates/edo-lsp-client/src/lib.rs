@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 use lsp_server::{Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     ClientCapabilities, DiagnosticClientCapabilities, DiagnosticWorkspaceClientCapabilities,
-    DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams, DidOpenTextDocumentParams, DocumentDiagnosticParams,
-    InitializeParams, PublishDiagnosticsClientCapabilities, PublishDiagnosticsParams, TextDocumentClientCapabilities,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, Url, VersionedTextDocumentIdentifier,
-    WorkspaceClientCapabilities, WorkspaceFolder, WorkspaceFoldersChangeEvent,
+    DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentDiagnosticParams, InitializeParams, PublishDiagnosticsClientCapabilities, PublishDiagnosticsParams,
+    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, Url,
+    VersionedTextDocumentIdentifier, WorkspaceClientCapabilities, WorkspaceFolder, WorkspaceFoldersChangeEvent,
 };
 use serde_json::Value;
 
@@ -27,12 +27,8 @@ const INITIALIZE: i32 = 1;
 
 /// What the reading thread passes on from the server.
 enum Event {
-    /// The server answered `initialize`; `pulls` when it answers diagnostic requests, and `folders` when it
-    /// takes changes to its workspace folders.
-    Ready {
-        pulls: bool,
-        folders: bool,
-    },
+    /// The server answered `initialize` with these capabilities.
+    Ready(Value),
     Published(PublishDiagnosticsParams),
     /// The answer to a diagnostic request: its items, or `None` when it holds none to take.
     Answered(RequestId, Option<Vec<Diagnostic>>),
@@ -51,11 +47,11 @@ pub enum Unavailable {
     /// The server has exited.
     Closed,
 }
-/// A document as the server has it: the text last sent, its version, and its diagnostics once published.
+/// A document as the server has it: the text last sent, its version, and the server's answer for it once asked.
 struct Document {
     version: i32,
     text: String,
-    diagnostics: Option<Vec<Diagnostic>>,
+    answered: Option<Vec<Diagnostic>>,
 }
 
 pub struct Client {
@@ -66,6 +62,8 @@ pub struct Client {
     takes_folders: bool,
     /// The workspace folders the server was given: the one it started in first.
     folders: Vec<PathBuf>,
+    /// The server asks to hear of saves: `Some(true)` when it wants the saved text with them.
+    saves: Option<bool>,
     /// The registrations under which the server answers diagnostic requests, so they are asked for, not waited
     /// for: `initialize` for its initialize answer, and the ids it registered later.
     pull_ids: HashSet<String>,
@@ -75,6 +73,9 @@ pub struct Client {
     language_id: String,
     /// Keyed by `key`, since a server may spell a document's URI differently from the client.
     documents: HashMap<String, Document>,
+    /// What the server last published for each file, open or not, as cargo check reports a whole workspace;
+    /// a document whose text changed drops its own until the server publishes again.
+    published: HashMap<String, Vec<Diagnostic>>,
     /// The server process, killed with the client.
     child: Option<Child>,
 }
@@ -139,11 +140,13 @@ impl Client {
             ready: false,
             takes_folders: false,
             folders,
+            saves: None,
             pull_ids: HashSet::new(),
             asked: HashMap::new(),
             next_id: INITIALIZE + 1,
             language_id: language_id.into(),
             documents: HashMap::new(),
+            published: HashMap::new(),
             child: None,
         }
     }
@@ -165,7 +168,8 @@ impl Client {
             Some(document) => {
                 document.version += 1;
                 document.text = text.into();
-                document.diagnostics = None;
+                document.answered = None;
+                self.published.remove(&key);
                 let change = TextDocumentContentChangeEvent { range: None, range_length: None, text: text.into() };
                 let params = DidChangeTextDocumentParams {
                     text_document: VersionedTextDocumentIdentifier { uri: uri.clone(), version: document.version },
@@ -177,16 +181,53 @@ impl Client {
                 let item = TextDocumentItem::new(uri.clone(), self.language_id.clone(), 1, text.into());
                 let params = DidOpenTextDocumentParams { text_document: item };
                 send(&self.writer, Notification::new("textDocument/didOpen".into(), params));
-                self.documents.insert(key.clone(), Document { version: 1, text: text.into(), diagnostics: None });
+                self.documents.insert(key.clone(), Document { version: 1, text: text.into(), answered: None });
             }
         }
         // Asked in the loop, as a server may register diagnostic requests, or refresh, while the client waits.
         loop {
-            if let Some(diagnostics) = &self.documents[&key].diagnostics {
-                return Ok(diagnostics.clone());
+            if let Some(found) = self.found(&key) {
+                return Ok(found);
             }
             self.ask(&key, &uri);
             self.next(deadline)?;
+        }
+    }
+
+    /// What the server has said of `path` so far, without waiting: its answer for the text last asked about, with
+    /// what it published for the file, which may be about a file never opened.
+    pub fn known(&mut self, path: &Path) -> Vec<Diagnostic> {
+        while let Ok(event) = self.events.try_recv() {
+            self.take(event);
+        }
+        let Some(key) = Url::from_file_path(path).ok().and_then(|uri| key(&uri)) else { return vec![] };
+        let answered = self.documents.get(&key).and_then(|d| d.answered.clone()).unwrap_or_default();
+        merged(answered, self.published.get(&key))
+    }
+    /// What the server said of the document's current text: its answer, with what it published for the file.
+    /// `None` until an answer has come, or, from a server that does not answer, a publish.
+    fn found(&self, key: &str) -> Option<Vec<Diagnostic>> {
+        let published = self.published.get(key);
+        let answered = match (&self.documents[key].answered, published) {
+            (Some(answered), _) => answered.clone(),
+            (None, Some(_)) if self.pull_ids.is_empty() => vec![],
+            _ => return None,
+        };
+        Some(merged(answered, published))
+    }
+
+    /// Tells a server that asks to hear of saves that `path` was saved holding `text`, the text last asked about.
+    pub fn saved(&mut self, path: &Path, text: &str) {
+        let Some(include_text) = self.saves else { return };
+        let Some((uri, key)) = Url::from_file_path(path).ok().and_then(|uri| key(&uri).map(|k| (uri, k))) else {
+            return;
+        };
+        if self.documents.get(&key).is_some_and(|d| d.text == text) {
+            let params = DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri },
+                text: include_text.then(|| text.to_string()),
+            };
+            send(&self.writer, Notification::new("textDocument/didSave".into(), params));
         }
     }
 
@@ -247,37 +288,44 @@ impl Client {
     }
 
     fn take(&mut self, event: Event) {
-        let (key, version, diagnostics) = match event {
-            Event::Ready { pulls, folders } => {
-                (self.ready, self.takes_folders) = (true, folders);
-                if pulls {
+        // Diagnostics for an older version of an open document's text are about a text no longer asked about.
+        let current = |documents: &HashMap<String, Document>, key: &str, version: Option<i32>| {
+            documents.get(key).is_none_or(|d| version.is_none_or(|v| v == d.version))
+        };
+        match event {
+            Event::Ready(capabilities) => {
+                self.ready = true;
+                if !capabilities["diagnosticProvider"].is_null() {
                     self.pull_ids.insert("initialize".into());
                 }
-                return;
+                // `changeNotifications` is `true`, or the id the server registers the notification under.
+                let changes = &capabilities["workspace"]["workspaceFolders"]["changeNotifications"];
+                self.takes_folders = changes == true || changes.is_string();
+                let save = &capabilities["textDocumentSync"]["save"];
+                self.saves = (save == true || save.is_object()).then(|| save["includeText"] == true);
             }
             Event::Registered(id) => {
                 self.pull_ids.insert(id);
-                return;
             }
             Event::Unregistered(id) => {
                 self.pull_ids.remove(&id);
-                return;
             }
-            Event::Refresh => {
-                self.documents.values_mut().for_each(|document| document.diagnostics = None);
-                return;
+            Event::Refresh => self.documents.values_mut().for_each(|document| document.answered = None),
+            Event::Published(published) => {
+                if let Some(key) = key(&published.uri)
+                    && current(&self.documents, &key, published.version)
+                {
+                    self.published.insert(key, published.diagnostics);
+                }
             }
-            Event::Published(published) => (key(&published.uri), published.version, Some(published.diagnostics)),
-            Event::Answered(id, diagnostics) => match self.asked.remove(&id) {
-                Some((key, version)) => (Some(key), Some(version), diagnostics),
-                None => return,
-            },
-        };
-        // Diagnostics for an older version of the text are about a text no longer asked about.
-        if let (Some(document), Some(diagnostics)) = (key.and_then(|k| self.documents.get_mut(&k)), diagnostics)
-            && version.is_none_or(|v| v == document.version)
-        {
-            document.diagnostics = Some(diagnostics);
+            Event::Answered(id, answered) => {
+                if let Some((key, version)) = self.asked.remove(&id)
+                    && current(&self.documents, &key, Some(version))
+                    && let Some(document) = self.documents.get_mut(&key)
+                {
+                    document.answered = answered;
+                }
+            }
         }
     }
 }
@@ -290,6 +338,17 @@ impl Drop for Client {
             let _ = child.kill();
         }
     }
+}
+
+/// An answer with the published diagnostics it does not hold already, as a server that answers may publish the
+/// same ones too, as pyright does.
+fn merged(mut answered: Vec<Diagnostic>, published: Option<&Vec<Diagnostic>>) -> Vec<Diagnostic> {
+    for d in published.into_iter().flatten() {
+        if !answered.contains(d) {
+            answered.push(d.clone());
+        }
+    }
+    answered
 }
 
 /// `root` as a workspace folder, named after its last component.
@@ -324,12 +383,7 @@ fn events_of(message: Message, writer: &Writer) -> Vec<Event> {
     match message {
         Message::Response(r) if r.id == INITIALIZE.into() => {
             send(writer, Notification::new("initialized".into(), serde_json::json!({})));
-            let none = Value::Null;
-            let capabilities = r.response_result.as_ref().map_or(&none, |result| &result["capabilities"]);
-            // `changeNotifications` is `true`, or the id the server registers the notification under.
-            let changes = &capabilities["workspace"]["workspaceFolders"]["changeNotifications"];
-            let folders = changes == true || changes.is_string();
-            vec![Event::Ready { pulls: !capabilities["diagnosticProvider"].is_null(), folders }]
+            vec![Event::Ready(r.response_result.map_or(Value::Null, |result| result["capabilities"].clone()))]
         }
         // Only diagnostic requests are sent after initialize. A full report holds `items`; an error or an
         // unchanged report, which needs a previous result id never sent, holds none.
@@ -789,6 +843,92 @@ mod tests {
         let all = all_received(&mut client, &received);
         let sent = all.iter().filter(|m| *m == "workspace/didChangeWorkspaceFolders").count();
         assert_eq!(sent, 1);
+    }
+
+    /// Like `echo`, but answers initialize with `capabilities`.
+    fn echo_with(capabilities: Value) -> Handler {
+        let mut echo = echo();
+        Box::new(move |m| match m {
+            Message::Request(r) if r.method == "initialize" => {
+                vec![Response::new_ok(r.id.clone(), json!({ "capabilities": capabilities })).into()]
+            }
+            _ => echo(m),
+        })
+    }
+
+    #[test]
+    fn saving_is_told_to_server_that_asks_for_it() {
+        // Given: 保存の通知を求めるサーバーに、問い合わせた文書
+        let (mut client, received) = fake(echo_with(json!({"textDocumentSync": {"save": true}})));
+        let _ = client.diagnostics(&doc(), "x", LONG);
+        // When: その内容を保存したと伝える
+        client.saved(&doc(), "x");
+        // Then: didSave を送る
+        assert!(all_received(&mut client, &received).contains(&"textDocument/didSave".to_string()));
+    }
+
+    #[test]
+    fn saving_is_not_told_to_server_that_does_not_ask() {
+        // Given: 保存の通知を求めないサーバーに、問い合わせた文書
+        let (mut client, received) = fake(echo());
+        let _ = client.diagnostics(&doc(), "x", LONG);
+        // When: その内容を保存したと伝える
+        client.saved(&doc(), "x");
+        // Then: didSave を送らない
+        assert!(!all_received(&mut client, &received).contains(&"textDocument/didSave".to_string()));
+    }
+
+    #[test]
+    fn answers_and_published_diagnostics_are_returned_together() {
+        // Given: 診断の要求に答え、開かれた文書に別の診断（cargo check の結果のようなもの）も送るサーバー
+        let mut puller = puller();
+        let (mut client, _) = fake(Box::new(move |m| {
+            let mut out = vec![];
+            if let Message::Notification(n) = m
+                && n.method == "textDocument/didOpen"
+            {
+                out.push(publish(&n.params["textDocument"]["uri"], &json!("pushed")));
+            }
+            out.extend(puller(m));
+            out
+        }));
+        // When: 診断を問い合わせる
+        let found = messages(client.diagnostics(&doc(), "x", LONG));
+        // Then: 要求への答えと、送られてきた診断を合わせて返す
+        assert_eq!(found, Ok(vec!["1".to_string(), "pushed".to_string()]));
+    }
+
+    #[test]
+    fn diagnostics_published_for_unopened_document_are_known() {
+        // Given: initialized を受けると、開かれていない b.rs の診断を送るサーバー
+        let b = std::env::temp_dir().join("b.rs");
+        let uri = json!(Url::from_file_path(&b).unwrap().to_string());
+        let mut echo = echo();
+        let (mut client, _) = fake(Box::new(move |m| match m {
+            Message::Notification(n) if n.method == "initialized" => vec![publish(&uri, &json!("checked"))],
+            _ => echo(m),
+        }));
+        let _ = client.diagnostics(&doc(), "x", LONG);
+        // When: b.rs について分かっていることを求める
+        let known: Vec<String> = client.known(&b).into_iter().map(|d| d.message).collect();
+        // Then: 送られてきた診断を、待たずに返す
+        assert_eq!(known, ["checked"]);
+    }
+
+    #[test]
+    fn diagnostics_published_for_older_text_are_dropped() {
+        // Given: 開かれた文書にだけ、その内容を診断として送るサーバーに、問い合わせた文書
+        let (mut client, _) = fake(Box::new(|m| match m {
+            Message::Notification(n) if n.method == "textDocument/didOpen" => {
+                vec![publish(&n.params["textDocument"]["uri"], &n.params["textDocument"]["text"])]
+            }
+            _ => initialize_answer(m).into_iter().collect(),
+        }));
+        let _ = client.diagnostics(&doc(), "x", LONG);
+        // When: 違う内容で問い合わせる
+        let _ = client.diagnostics(&doc(), "y", SHORT);
+        // Then: 前の内容に送られてきた診断は、もう分かっていることに入らない
+        assert!(client.known(&doc()).is_empty());
     }
 
     #[test]
