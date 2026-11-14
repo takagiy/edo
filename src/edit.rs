@@ -91,6 +91,10 @@ fn newline(src: &str) -> &'static str {
 /// Any other target is a span of text inside a line.
 fn apply(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Place) -> (String, Range<usize>) {
     let base = indent_of_line_at(src, range.start);
+    // Where the replaced text's shallowest later line sits, which may be deeper than its first line, as a
+    // method chain's or a string's continuation lines are; `after`'s shallowest later line goes there too.
+    let replaced_later = indents(src[range.clone()].lines().skip(1)).into_iter().min_by_key(|i| i.len());
+    let anchor = if place == Place::Replace { replaced_later.unwrap_or(base) } else { base };
     let nl = newline(src);
     let unit = indent_unit(&indents(src.lines()));
     let after = after.replace("\r\n", "\n");
@@ -103,7 +107,7 @@ fn apply(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Pl
     };
     // Builds the text with `after` reindented (keeping `protected` lines) and where `after` landed in it.
     let build = |protected: &[usize]| -> (String, Range<usize>) {
-        let body = reindent(&after, base, unit.clone(), protected);
+        let body = reindent(&after, base, anchor, unit.clone(), protected);
         let span = lines.clone().unwrap_or(range.clone());
         let (head, tail) = (&src[..span.start], &src[span.end..]);
         if lines.is_none() {
@@ -203,12 +207,12 @@ fn indent_unit(indents: &[&str]) -> Option<String> {
     Some(" ".repeat(step))
 }
 
-/// Puts the first line as is and each later line at `base` plus its depth relative to a reference line,
-/// converting `after`'s indent unit to the file's. The reference is the first line when it is indented;
-/// an unindented first line may have been cut from the middle of a line, so then it is the shallowest
-/// later line. A later line shallower than the reference goes shallower than `base`.
+/// Puts the first line as is and each later line at the depth of its reference line plus its depth relative to
+/// that line, converting `after`'s indent unit to the file's. The reference is the first line, at `base`, when
+/// it is indented; an unindented first line may have been cut from the middle of a line, so then it is the
+/// shallowest later line, at `anchor`. A later line shallower than the reference goes shallower than that.
 /// Lines listed in `protected` (by index in `after`) are kept as written.
-fn reindent(after: &str, base: &str, file_unit: Option<String>, protected: &[usize]) -> String {
+fn reindent(after: &str, base: &str, anchor: &str, file_unit: Option<String>, protected: &[usize]) -> String {
     let first_indent = leading_ws(after);
     let mut lines = after[first_indent.len()..].split('\n');
     let first = lines.next().unwrap_or("");
@@ -216,7 +220,8 @@ fn reindent(after: &str, base: &str, file_unit: Option<String>, protected: &[usi
     let free = rest.iter().enumerate().filter(|(k, _)| !protected.contains(&(k + 1))).map(|(_, l)| *l);
     let rest_indents = indents(free);
     let shallowest = rest_indents.iter().min_by_key(|i| i.len()).copied().unwrap_or("");
-    let reference = if first_indent.is_empty() || first.trim().is_empty() { shallowest } else { first_indent };
+    let (reference, at) =
+        if first_indent.is_empty() || first.trim().is_empty() { (shallowest, anchor) } else { (first_indent, base) };
     // The reference is level 0, so a step from it to a later line counts too.
     let after_unit = indent_unit(&[&[reference], &rest_indents[..]].concat());
     let convert = |n: usize| match (&after_unit, &file_unit) {
@@ -232,13 +237,13 @@ fn reindent(after: &str, base: &str, file_unit: Option<String>, protected: &[usi
             let indent = leading_ws(line);
             match indent.len().checked_sub(reference.len()) {
                 Some(n) => {
-                    out.push_str(base);
+                    out.push_str(at);
                     out.push_str(&convert(n).unwrap_or_else(|| indent[reference.len()..].to_string()));
                 }
                 None => {
                     let n = reference.len() - indent.len();
                     let drop = convert(n).map_or(n, |d| d.len());
-                    out.push_str(&base[..base.len().saturating_sub(drop)]);
+                    out.push_str(&at[..at.len().saturating_sub(drop)]);
                 }
             }
             out.push_str(line.trim_start_matches([' ', '\t']));
@@ -285,6 +290,49 @@ mod tests {
         let out = replace(src, "fn a() {\n        x();\n    }", "fn b() {\n    y();\n}");
         // Then: 最も浅い行が関数の先頭行と同じ深さになり、相対的な深さは保たれる
         assert_eq!(out, "impl A {\n    fn b() {\n        y();\n    }\n}\n");
+    }
+
+    #[test]
+    fn deeper_continuation_lines_of_target_keep_their_depth() {
+        // Given: 続きの行が先頭行より 1 段深いメソッドチェーン
+        let src = "fn a() {\n    let x = a\n        .b()\n        .c();\n}\n";
+        // When: 行の途中から始まる範囲を、2 行目を浅く書いた after で置き換える
+        let out = replace(src, "a\n        .b()", "a\n    .d()");
+        // Then: 2 行目は置換範囲の 2 行目と同じ深さに入る
+        assert_eq!(out, "fn a() {\n    let x = a\n        .d()\n        .c();\n}\n");
+    }
+
+    #[test]
+    fn continuation_lines_of_string_keep_their_depth() {
+        // Given: 行末の \ で続く、続きの行が先頭行より深い文字列
+        let src = "fn a() {\n    f(\"one \\\n        two \\\n        three\");\n}\n";
+        // When: 文字列の途中から始まる範囲を置き換える
+        let out = replace(src, "\"one \\\n        two", "\"uno \\\n        dos");
+        // Then: 続きの行は元の深さのまま
+        assert_eq!(out, "fn a() {\n    f(\"uno \\\n        dos \\\n        three\");\n}\n");
+    }
+
+    #[test]
+    fn later_lines_of_after_replacing_one_line_align_with_its_line() {
+        // Given: 1 行の式
+        let src = "fn a() {\n    let x = y;\n}\n";
+        // When: 行の途中の y を、複数行の after で置き換える
+        let out = replace(src, "y", "f(\n    1,\n)");
+        // Then: after の最も浅い行が、置換範囲の行と同じ深さになる
+        assert_eq!(out, "fn a() {\n    let x = f(\n        1,\n    );\n}\n");
+    }
+
+    #[test]
+    fn python_method_body_keeps_its_depth() {
+        // Given: クラスの中の Python のメソッド。閉じ括弧がないので、続きの行はすべて先頭行より深い
+        let langs = crate::language::Languages::builtin();
+        let python = langs.for_path(std::path::Path::new("a.py")).unwrap();
+        let src = "class A:\n    def a(self):\n        return 1\n";
+        let start = src.find("def").unwrap();
+        // When: メソッドを、本体を 1 段だけ字下げした after で置き換える
+        let out = edit(python, src, start..src.len() - 1, "def b(self):\n    return 2", Place::Replace).text;
+        // Then: 本体は def より 1 段深いまま
+        assert_eq!(out, "class A:\n    def b(self):\n        return 2\n");
     }
 
     #[test]
