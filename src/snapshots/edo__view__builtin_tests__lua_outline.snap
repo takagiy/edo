@@ -1,0 +1,35 @@
+---
+source: src/view.rs
+expression: "builtin_outline(\"tests/fixtures/outline/sample.lua\")"
+---
+1	local M = {}
+2	
+3	---@class Point
+4	---@field x number
+5	local Point = {}
+6	
+7	---@param x number
+8	---@return Point
+9	function Point.new(x)
+11	end
+12	
+13	-- The length.
+14	function Point:len() … end
+15	
+16	local function helper(a, b)
+18	end
+19	
+20	---@param event string
+21	local handler = function (event)
+23	end
+24	
+25	M.zero = function ()
+27	end
+28	
+29	function M.noop() end
+30	
+31	vim.keymap.set("n", "x", function ()
+32	    handler(helper(1, 2))
+33	end)
+34	
+35	return M

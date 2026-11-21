@@ -16,7 +16,7 @@ LSP サーバーは起動とプロジェクトの読み込みに時間がかか�
 - 「新しく増えた」は、前の診断を書き込み後の行に移し、「文と行」の組で後にだけあるものとする。行の移し方は、書き込みが書き換えた箇所ごとに作る `Hunk`（前の行の範囲 → 後の行の範囲）から求め、書き換えた行にあった前のエラーは比較から外す。構文エラーも、文が `syntax error` のエラーとして同じ関数で判定する（報告の形 `new_syntax_errors` は変えない）。
 - 前の診断は「ある内容に対する診断」の覚え書きから取る。ファイルごとに、サーバーに最後に渡した内容と、その診断を 1 組覚えておき、同じ内容なら待たずに使う。edo の外で書き換えられた後の最初の書き込みだけ、前と後の 2 回を待つ。edo の外の変更で増えたエラーは報告しない。
 - LSP のクライアントの中心は workspace の `crates/edo-lsp-client` に置く。edo の言語パッケージのことは知らない。`lsp-types` と、`lsp-server` のメッセージの読み書きを使い、テストは同じプロセスの中の偽のサーバーとつなぐ。
-- 組み込みの言語には、Rust（rust-analyzer）、TypeScript・TSX・JavaScript（typescript-language-server）、Python（pyright）、Go（gopls）を書く。
+- 組み込みの言語には、Rust（rust-analyzer）、TypeScript・TSX・JavaScript（typescript-language-server）、Python（pyright）、Go（gopls）を書く。Lua には書かない。emmylua_ls 0.25.1 は、edo がファイルを書いた直後の要求に、次のファイルの変更まで応答しないことがあり、確かめた書き込み 25 件のうち 21 件で診断が返らなかった。
 
 ## 結果
 

@@ -280,4 +280,10 @@ mod builtin_tests {
         // Given: Markdown のサンプル / When: 表示する / Then: スナップショットどおりのアウトラインになる
         insta::assert_snapshot!(builtin_outline("tests/fixtures/outline/sample.md"));
     }
+
+    #[test]
+    fn lua_outline() {
+        // Given: Lua のサンプル / When: 表示する / Then: スナップショットどおりのアウトラインになる
+        insta::assert_snapshot!(builtin_outline("tests/fixtures/outline/sample.lua"));
+    }
 }

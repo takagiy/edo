@@ -19,3 +19,4 @@
 - [x] Java のアウトライン
 - [x] Kotlin のアウトライン
 - [x] Markdown のアウトライン
+- [x] When the Lua sample is shown, the view can give its outline with the annotations kept and the function bodies left out.

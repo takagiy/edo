@@ -13,3 +13,7 @@
 - [x] 組み込みの Rust は、型引数付きの型の impl を型引数を除いた名前にする
 - [x] 組み込みの Rust、TypeScript、TSX、JavaScript、Python、Go には LSP サーバーの設定がある
 - [x] 組み込みの TSX の LSP の language_id は typescriptreact になる
+- [x] When a file has the `lua` extension, the builtin languages can choose the lua package.
+- [x] When a Lua function is declared or assigned to a name, the builtin lua package can name it as it is written, such as `M.setup` or `Point:len`.
+- [x] When a function is assigned to a local, the builtin lua package can take the `local` keyword and the annotations above it into the definition.
+- [x] When Lua code is matched, the builtin lua package can take either quote for a string, skip a `;` between statements and skip a table's trailing comma.

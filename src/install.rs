@@ -457,7 +457,10 @@ mod tests {
         // When: パッケージを列挙する
         let names: Vec<String> = packages_in(root).unwrap().into_iter().map(|(name, _)| name).collect();
         // Then: languages/ の下のパッケージが並ぶ
-        assert_eq!(names, ["go", "java", "javascript", "kotlin", "markdown", "python", "rust", "tsx", "typescript"]);
+        assert_eq!(
+            names,
+            ["go", "java", "javascript", "kotlin", "lua", "markdown", "python", "rust", "tsx", "typescript"]
+        );
     }
 
     fn registry(files: &[(&str, &str)]) -> tempfile::TempDir {

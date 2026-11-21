@@ -1,0 +1,6 @@
+[package]
+name = "lua"
+extensions = ["lua"]
+
+[package.syntax]
+module = "builtin:lua"
