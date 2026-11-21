@@ -51,7 +51,7 @@ macro_rules! builtin {
     };
 }
 
-const BUILTINS: [(&str, &str); 9] = [
+const BUILTINS: [(&str, &str); 10] = [
     builtin!("rust"),
     builtin!("typescript"),
     builtin!("tsx"),
@@ -61,6 +61,7 @@ const BUILTINS: [(&str, &str); 9] = [
     builtin!("java"),
     builtin!("kotlin"),
     builtin!("markdown"),
+    builtin!("lua"),
 ];
 
 fn builtin_grammar(name: &str) -> Option<tree_sitter::Language> {
@@ -74,6 +75,7 @@ fn builtin_grammar(name: &str) -> Option<tree_sitter::Language> {
         "java" => tree_sitter_java::LANGUAGE.into(),
         "kotlin" => edo_tree_sitter_kotlin::LANGUAGE.into(),
         "markdown" => tree_sitter_md::LANGUAGE.into(),
+        "lua" => tree_sitter_lua::LANGUAGE.into(),
         _ => return None,
     })
 }
@@ -170,6 +172,7 @@ mod tests {
             ("a.kt", "kotlin"),
             ("a.kts", "kotlin"),
             ("a.md", "markdown"),
+            ("a.lua", "lua"),
         ] {
             // When: 拡張子から言語を選ぶ
             let lang = langs.for_path(Path::new(file));
@@ -386,5 +389,48 @@ command = [\"rust-analyzer\"]
         let lsp = langs.for_path(Path::new("a.tsx")).unwrap().lsp.as_ref().unwrap();
         // Then: language_id は typescriptreact になる
         assert_eq!(lsp.language_id.as_deref(), Some("typescriptreact"));
+    }
+
+    #[test]
+    fn builtin_lua_names_functions_as_written() {
+        // Given: 組み込みの Lua と、宣言した関数、名前に代入した関数
+        let langs = Languages::builtin();
+        let lang = langs.for_path(Path::new("a.lua")).unwrap();
+        let src = "function M.setup() end\nfunction Point:len() end\nlocal function helper() end\n\
+                   local handler = function () end\nM.zero = function () end\nupdate = function () end\n";
+        // When: 定義を抽出する
+        let tree = lang.parser().parse(src, None).unwrap();
+        let names: Vec<String> = crate::outline::outline(lang, &tree, src).into_iter().map(|d| d.name).collect();
+        // Then: 書いたとおりの名前になる
+        assert_eq!(names, ["M.setup", "Point:len", "helper", "handler", "M.zero", "update"]);
+    }
+
+    #[test]
+    fn builtin_lua_takes_local_and_annotations_into_assigned_function() {
+        // Given: 組み込みの Lua と、アノテーションの付いた、local に代入した関数
+        let langs = Languages::builtin();
+        let lang = langs.for_path(Path::new("a.lua")).unwrap();
+        let src = "local x = 1\n\n---@param event string\nlocal handler = function (event) end\n";
+        // When: 定義を抽出する
+        let tree = lang.parser().parse(src, None).unwrap();
+        let defs = crate::outline::outline(lang, &tree, src);
+        // Then: 定義の範囲はアノテーションと local を含む
+        let ranges: Vec<&str> = defs.iter().map(|d| &src[d.range.clone()]).collect();
+        assert_eq!(ranges, ["---@param event string\nlocal handler = function (event) end"]);
+    }
+
+    #[test]
+    fn builtin_lua_relaxes_quotes_semicolons_and_trailing_commas() {
+        // Given: 組み込みの Lua と、' の文字列、文の間の ;、テーブルの末尾のカンマを持つコード
+        let langs = Languages::builtin();
+        let lang = langs.for_path(Path::new("a.lua")).unwrap();
+        let src = "local t = { 'a', 'b', }; print(t)\n";
+        // When: " の文字列で、; と末尾のカンマのない before で照合する
+        let tree = lang.parser().parse(src, None).unwrap();
+        let leaves = crate::matcher::leaves(lang, &tree, src);
+        let found = crate::matcher::find(src, &leaves, 0..src.len(), "local t = { \"a\", \"b\" } print(t)");
+        // Then: 一致する
+        let matched: Vec<&str> = found.matches.iter().map(|r| &src[r.clone()]).collect();
+        assert_eq!(matched, ["local t = { 'a', 'b', }; print(t)"]);
     }
 }
