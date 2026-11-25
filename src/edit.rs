@@ -125,7 +125,7 @@ fn apply(lang: &Language, src: &str, range: Range<usize>, after: &str, place: Pl
     };
     // Builds the text with `after` reindented (keeping `protected` lines) and where `after` landed in it.
     let build = |protected: &[usize]| -> (String, Range<usize>) {
-        let body = reindent(&after, base, anchor, unit.clone(), protected);
+        let body = reindent(&after, base, anchor, lines.is_none(), unit.clone(), protected);
         let span = lines.clone().unwrap_or(range.clone());
         let (head, tail) = (&src[..span.start], &src[span.end..]);
         if lines.is_none() {
@@ -233,10 +233,18 @@ pub fn indent_unit(indents: &[&str]) -> Option<String> {
 
 /// Puts the first line as is and each later line at the depth of its reference line plus its depth relative to
 /// that line, converting `after`'s indent unit to the file's. The reference is the first line, at `base`, when
-/// it is indented; an unindented first line may have been cut from the middle of a line, so then it is the
-/// shallowest later line, at `anchor`. A later line shallower than the reference goes shallower than that.
+/// it is indented or starts a line of its own; an unindented first line of a `mid_line` target may have been cut
+/// from the middle of a line, so then (and when the first line is blank) it is the shallowest later line, at
+/// `anchor`. A later line shallower than the reference goes shallower than that.
 /// Lines listed in `protected` (by index in `after`) are kept as written.
-fn reindent(after: &str, base: &str, anchor: &str, file_unit: Option<String>, protected: &[usize]) -> String {
+fn reindent(
+    after: &str,
+    base: &str,
+    anchor: &str,
+    mid_line: bool,
+    file_unit: Option<String>,
+    protected: &[usize],
+) -> String {
     let first_indent = leading_ws(after);
     let mut lines = after[first_indent.len()..].split('\n');
     let first = lines.next().unwrap_or("");
@@ -244,8 +252,11 @@ fn reindent(after: &str, base: &str, anchor: &str, file_unit: Option<String>, pr
     let free = rest.iter().enumerate().filter(|(k, _)| !protected.contains(&(k + 1))).map(|(_, l)| *l);
     let rest_indents = indents(free);
     let shallowest = rest_indents.iter().min_by_key(|i| i.len()).copied().unwrap_or("");
-    let (reference, at) =
-        if first_indent.is_empty() || first.trim().is_empty() { (shallowest, anchor) } else { (first_indent, base) };
+    let (reference, at) = if (first_indent.is_empty() && mid_line) || first.trim().is_empty() {
+        (shallowest, anchor)
+    } else {
+        (first_indent, base)
+    };
     // The reference is level 0, so a step from it to a later line counts too.
     let after_unit = indent_unit(&[&[reference], &rest_indents[..]].concat());
     let convert = |n: usize| match (&after_unit, &file_unit) {
@@ -357,6 +368,32 @@ mod tests {
         let out = edit(python, src, start..src.len() - 1, "def b(self):\n    return 2", Place::Replace).text;
         // Then: 本体は def より 1 段深いまま
         assert_eq!(out, "class A:\n    def b(self):\n        return 2\n");
+    }
+
+    #[test]
+    fn after_inserted_at_column_zero_keeps_depth_relative_to_first_line() {
+        // Given: トップレベルに 2 つの関数がある Python のファイル
+        let langs = crate::language::Languages::builtin();
+        let python = langs.for_path(std::path::Path::new("a.py")).unwrap();
+        let src = "def a():\n    return 1\n\n\ndef b():\n    return 2\n";
+        let start = src.find("def b").unwrap();
+        // When: 本体を字下げした関数を b の前に挿入する
+        let after = "def new():\n    # comment\n    x = 1\n    return x\n";
+        let out = edit(python, src, start..start + 8, after, Place::InsertBefore).text;
+        // Then: 本体は def より 1 段深いまま
+        assert!(out.contains("def new():\n    # comment\n    x = 1\n    return x\ndef b():"), "{out}");
+    }
+
+    #[test]
+    fn after_replacing_column_zero_lines_keeps_depth_relative_to_first_line() {
+        // Given: トップレベルの 2 行
+        let langs = crate::language::Languages::builtin();
+        let python = langs.for_path(std::path::Path::new("a.py")).unwrap();
+        let src = "x = 1\ny = 2\n";
+        // When: 2 行を、本体を字下げした関数で置き換える
+        let out = edit(python, src, 0..src.len() - 1, "def f():\n    x = 1\n    return x", Place::Replace).text;
+        // Then: 本体は def より 1 段深いまま
+        assert_eq!(out, "def f():\n    x = 1\n    return x\n");
     }
 
     #[test]
